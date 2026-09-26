@@ -5,6 +5,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
 import { exactTokens, formatTokens, shareOf } from "../format";
 import type { AccountTokenUsage } from "../types";
+import { usePreferences } from "../preferences";
 
 /** Rows collapse to a model breakdown on click; more than this and the table dominates the card. */
 const VISIBLE_ROWS = 8;
@@ -38,6 +39,7 @@ function toRows(usage: AccountTokenUsage): Row[] {
 }
 
 function AccountRow({ row, total }: { row: Row; total: number }) {
+  const { t } = usePreferences();
   const [expanded, setExpanded] = useState(false);
   const share = shareOf(row.totalTokens, total);
 
@@ -63,7 +65,7 @@ function AccountRow({ row, total }: { row: Row; total: number }) {
             <>
               <span className="truncate font-mono text-xs">{row.account}</span>
               {/* No email was ever polled for this one: say what the bare hash is. */}
-              <span className="text-xs text-muted-foreground">key-only account</span>
+              <span className="text-xs text-muted-foreground">{t("tokens.keyOnly")}</span>
             </>
           )}
         </span>
@@ -82,7 +84,7 @@ function AccountRow({ row, total }: { row: Row; total: number }) {
               <span className="shrink-0 tabular-nums" title={exactTokens(model.totalTokens)}>
                 {formatTokens(model.totalTokens)}
               </span>
-              <span className="w-12 shrink-0 text-right tabular-nums">{model.requests.toLocaleString()} req</span>
+              <span className="w-12 shrink-0 text-right tabular-nums">{model.requests.toLocaleString()} {t("tokens.req")}</span>
             </li>
           ))}
         </ul>
@@ -98,6 +100,7 @@ export function AccountTokenPanel({
   accountTokenUsage: AccountTokenUsage;
   isLoading: boolean;
 }) {
+  const { t } = usePreferences();
   const rows = useMemo(() => toRows(accountTokenUsage), [accountTokenUsage]);
   const total = useMemo(() => rows.reduce((sum, row) => sum + row.totalTokens, 0), [rows]);
   const [showAll, setShowAll] = useState(false);
@@ -111,10 +114,9 @@ export function AccountTokenPanel({
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
-        <CardTitle>Token usage by account</CardTitle>
+        <CardTitle>{t("tokens.byAccount")}</CardTitle>
         <CardDescription>
-          What each upstream account has served, measured by this gateway. These are local token estimates, not Kiro&apos;s
-          quota accounting, which counts requests instead.
+          {t("tokens.byAccountDescription")}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex-1">
@@ -123,8 +125,8 @@ export function AccountTokenPanel({
         ) : total === 0 ? (
           <EmptyState
             icon={Coins}
-            title="No tokens recorded yet"
-            description="Usage appears once a request completes through /v1. History from before this was recorded cannot be attributed."
+            title={t("tokens.emptyTitle")}
+            description={t("tokens.emptyAccountDescription")}
           />
         ) : (
           <div className="space-y-4">
@@ -139,31 +141,31 @@ export function AccountTokenPanel({
                 onClick={() => setShowAll((open) => !open)}
                 className="text-xs text-muted-foreground hover:text-foreground"
               >
-                {showAll ? "Show fewer" : `Show all ${rows.length} accounts`}
+                {showAll ? t("tokens.showFewer") : t("tokens.showAll", { n: rows.length })}
               </button>
             )}
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">
               <div>
-                <dt className="text-xs text-muted-foreground">Input</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.input")}</dt>
                 <dd className="tabular-nums" title={exactTokens(rows.reduce((s, r) => s + r.promptTokens, 0))}>
                   {formatTokens(rows.reduce((s, r) => s + r.promptTokens, 0))}
                   <span className="ml-1 text-xs text-muted-foreground">{inputShare.toFixed(0)}%</span>
                 </dd>
               </div>
               <div>
-                <dt className="text-xs text-muted-foreground">Output</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.output")}</dt>
                 <dd className="tabular-nums" title={exactTokens(rows.reduce((s, r) => s + r.completionTokens, 0))}>
                   {formatTokens(rows.reduce((s, r) => s + r.completionTokens, 0))}
                   <span className="ml-1 text-xs text-muted-foreground">{(100 - inputShare).toFixed(0)}%</span>
                 </dd>
               </div>
               <div>
-                <dt className="text-xs text-muted-foreground">Requests</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.requests")}</dt>
                 <dd className="tabular-nums">{rows.reduce((s, r) => s + r.requests, 0).toLocaleString()}</dd>
               </div>
               <div>
-                <dt className="text-xs text-muted-foreground">Accounts used</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.accountsUsed")}</dt>
                 <dd className="tabular-nums">{rows.length}</dd>
               </div>
             </dl>

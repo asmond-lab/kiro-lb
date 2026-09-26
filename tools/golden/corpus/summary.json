@@ -1,0 +1,18 @@
+{
+  "anthropic_to_kiro": 43,
+  "chat_to_responses": 6,
+  "count_tokens": 551,
+  "deduplicate_tool_calls": 119,
+  "get_model_id_for_kiro": 112,
+  "is_claude_code_prompt": 7,
+  "measure_payload": 150,
+  "normalize_model_name": 1302,
+  "openai_to_kiro": 63,
+  "parse_bracket_tool_calls": 65,
+  "parser_feed": 80,
+  "prompt_condense": 4,
+  "responses_to_chat": 35,
+  "sanitize_json_schema": 36,
+  "to_anthropic_stop_reason": 76,
+  "to_openai_finish_reason": 65
+}

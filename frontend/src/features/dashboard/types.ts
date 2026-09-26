@@ -57,6 +57,7 @@ export type Account = {
   quotaOverageEnabled?: boolean | null;
   requests: number;
   failures: number;
+  sessions?: number;
   cooldownSeconds: number;
   deletable: boolean;
   enabled?: boolean;
@@ -127,6 +128,8 @@ export type RequestLogDetail = {
   outputTokens: number | null;
   creditsSpent: number | null;
   modelMultiplier: number | null;
+  generationMs?: number | null;
+  tokensPerSecond?: number | null;
 };
 
 export type DataOverview = {
@@ -228,7 +231,7 @@ export type DeviceLoginFlow = {
   expiresInSeconds: number;
 };
 
-export const TAB_IDS = ["overview", "accounts", "keys", "settings", "info"] as const;
+export const TAB_IDS = ["overview", "accounts", "keys", "settings", "theme", "info"] as const;
 export type TabId = (typeof TAB_IDS)[number];
 
 export interface EndpointOption {
@@ -287,11 +290,22 @@ export interface EndpointPingResponse {
   verdict: string;
 }
 
+export interface ToolShortenStats {
+  toolsSeen: number;
+  toolsShortened: number;
+  bytesBefore: number;
+  bytesAfter: number;
+}
+
 export interface PromptFilterSettings {
   enabled: boolean;
+  shortenTools?: boolean;
+  shortenThreshold?: number;
   identity: string;
   preservedNote: string;
+  shortenNote?: string;
   droppedSections: string[];
+  lastShorten?: ToolShortenStats | null;
 }
 
 export interface AgentModeSettings {

@@ -1,6 +1,7 @@
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { usePreferences } from "../preferences";
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 
@@ -21,15 +22,16 @@ export function PaginationControls({
   onLimitChange,
   onOffsetChange,
 }: PaginationControlsProps) {
+  const { t } = usePreferences();
   const lastPageOffset = total > 0 ? Math.max(0, Math.ceil(total / limit) - 1) * limit : 0;
   const rangeStart = total > 0 ? offset + 1 : 0;
   const rangeEnd = Math.min(offset + limit, total);
 
   return (
     <div className="flex flex-wrap items-center justify-end gap-2 text-xs">
-      <span className="text-muted-foreground">Rows</span>
+      <span className="text-muted-foreground">{t("logs.rows")}</span>
       <Select value={String(limit)} onValueChange={(value) => onLimitChange(Number(value))}>
-        <SelectTrigger size="sm" className="w-20" aria-label="Rows per page">
+        <SelectTrigger size="sm" className="w-20" aria-label={t("logs.rowsPerPage")}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent align="end">
@@ -42,7 +44,7 @@ export function PaginationControls({
       </Select>
 
       <span className="whitespace-nowrap tabular-nums text-muted-foreground">
-        {rangeStart}–{rangeEnd} of {total.toLocaleString()}
+        {t("logs.range", { start: rangeStart, end: rangeEnd, total: total.toLocaleString() })}
       </span>
 
       {/* One wrapper so the four nav buttons wrap as a unit, never mid-group. */}
@@ -53,7 +55,7 @@ export function PaginationControls({
           size="icon-sm"
           disabled={offset <= 0}
           onClick={() => onOffsetChange(0)}
-          aria-label="First page"
+          aria-label={t("logs.firstPage")}
         >
           <ChevronsLeft />
         </Button>
@@ -63,7 +65,7 @@ export function PaginationControls({
           size="icon-sm"
           disabled={offset <= 0}
           onClick={() => onOffsetChange(Math.max(0, offset - limit))}
-          aria-label="Previous page"
+          aria-label={t("logs.previousPage")}
         >
           <ChevronLeft />
         </Button>
@@ -73,7 +75,7 @@ export function PaginationControls({
           size="icon-sm"
           disabled={!hasMore}
           onClick={() => onOffsetChange(offset + limit)}
-          aria-label="Next page"
+          aria-label={t("logs.nextPage")}
         >
           <ChevronRight />
         </Button>
@@ -83,7 +85,7 @@ export function PaginationControls({
           size="icon-sm"
           disabled={!hasMore}
           onClick={() => onOffsetChange(lastPageOffset)}
-          aria-label="Last page"
+          aria-label={t("logs.lastPage")}
         >
           <ChevronsRight />
         </Button>

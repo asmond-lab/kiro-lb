@@ -80,8 +80,8 @@ describe("RoutingStateCell", () => {
 
   it("labels a spent allowance instead of showing it as ready", () => {
     const html = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
-    expect(html).toContain("quota spent");
-    expect(html).not.toContain("ready");
+    expect(html).toContain("Quota Spent");
+    expect(html).not.toContain("Ready");
   });
 
   it("does not advertise a spent account as still being tried", () => {
@@ -110,8 +110,8 @@ describe("RoutingStateCell", () => {
 
     // The id appears several times per row (tooltip, aria-label, visible text),
     // so the normalization has to rewrite every occurrence, not the first.
-    expect(spent.replace("quota spent", "QUOTA").replaceAll(spentAccount.id, "ID")).toBe(
-      exhausted.replace("quota exhausted", "QUOTA").replaceAll(exhaustedAccount.id, "ID")
+    expect(spent.replace("Quota Spent", "QUOTA").replaceAll(spentAccount.id, "ID")).toBe(
+      exhausted.replace("Quota Exhausted", "QUOTA").replaceAll(exhaustedAccount.id, "ID")
     );
   });
 

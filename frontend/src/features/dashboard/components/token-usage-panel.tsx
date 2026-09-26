@@ -12,6 +12,7 @@ import { sliceIdAt, tokenPieConfig, tokenPieRows, type DitherConfig } from "../d
 import { buildSlices, shareLabel, TAIL_LABEL, type Slice } from "../token-slices";
 import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { KeyUsage } from "../types";
+import { usePreferences } from "../preferences";
 
 /** Donut hole as a fraction of the outer radius, leaving room for the total. */
 const INNER_RADIUS = 0.62;
@@ -31,13 +32,14 @@ function Donut({
   focused: string | null;
   onFocus: (sliceId: string | null) => void;
 }) {
+  const { t } = usePreferences();
   return (
     <div
       className="relative size-44 shrink-0"
       role="img"
-      aria-label={`Token share by model. ${slices
-        .map((slice) => `${slice.label}: ${slice.share.toFixed(1)}%`)
-        .join(", ")}.`}
+      aria-label={t("tokens.shareAria", {
+        list: slices.map((slice) => `${slice.label}: ${slice.share.toFixed(1)}%`).join(", "),
+      })}
     >
       <PieChart
         data={rows}
@@ -63,7 +65,7 @@ function Donut({
         <span className="text-xl font-semibold tabular-nums" title={exactTokens(total)}>
           {formatTokens(total)}
         </span>
-        <span className="text-[11px] text-muted-foreground">total tokens</span>
+        <span className="text-[11px] text-muted-foreground">{t("tokens.totalTokens")}</span>
       </div>
     </div>
   );
@@ -127,6 +129,7 @@ function Legend({
 }
 
 export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; isLoading: boolean }) {
+  const { t } = usePreferences();
   const totals = useMemo(() => summarizeUsage(keyUsage), [keyUsage]);
   const slices = useMemo(
     () => buildSlices(totals.models, totals.totalTokens),
@@ -150,10 +153,9 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
-        <CardTitle>Token usage by model</CardTitle>
+        <CardTitle>{t("tokens.byModel")}</CardTitle>
         <CardDescription>
-          Cumulative across every API key, including revoked ones: a revoked key&apos;s history still counts toward what
-          this gateway has consumed.
+          {t("tokens.byModelDescription")}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex-1">
@@ -162,8 +164,8 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
         ) : totals.totalTokens === 0 ? (
           <EmptyState
             icon={Coins}
-            title="No tokens recorded yet"
-            description="Usage appears once a request completes through /v1."
+            title={t("tokens.emptyTitle")}
+            description={t("tokens.emptyDescription")}
           />
         ) : (
           <div className="space-y-4">
@@ -189,7 +191,7 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">
               <div>
-                <dt className="text-xs text-muted-foreground">Input</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.input")}</dt>
                 <dd className="tabular-nums" title={exactTokens(totals.promptTokens)}>
                   {formatTokens(totals.promptTokens)}
                   <span className="ml-1 text-xs text-muted-foreground">
@@ -198,7 +200,7 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
                 </dd>
               </div>
               <div>
-                <dt className="text-xs text-muted-foreground">Output</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.output")}</dt>
                 <dd className="tabular-nums" title={exactTokens(totals.completionTokens)}>
                   {formatTokens(totals.completionTokens)}
                   <span className="ml-1 text-xs text-muted-foreground">
@@ -207,11 +209,11 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
                 </dd>
               </div>
               <div>
-                <dt className="text-xs text-muted-foreground">Requests</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.requests")}</dt>
                 <dd className="tabular-nums">{totals.requests.toLocaleString()}</dd>
               </div>
               <div>
-                <dt className="text-xs text-muted-foreground">Models used</dt>
+                <dt className="text-xs text-muted-foreground">{t("tokens.modelsUsed")}</dt>
                 <dd className="tabular-nums">{totals.models.length}</dd>
               </div>
             </dl>

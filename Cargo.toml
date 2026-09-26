@@ -1,0 +1,66 @@
+[package]
+name = "kiro-lb"
+version = "0.2.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Private Kiro API load balancer. OpenAI and Anthropic compatible."
+
+[[bin]]
+name = "kirolb"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "=0.8.4", default-features = false, features = ["http1", "http2", "tokio", "json", "query"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs"] }
+tokio-util = { version = "=0.7.19", features = ["io"] }
+reqwest = { version = "=0.12.23", default-features = false, features = ["rustls-tls", "http2", "stream", "socks", "json"] }
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+sonic-rs = "=0.5.5"
+mimalloc = { version = "0.1", default-features = false }
+uuid = { version = "1", features = ["v4"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
+async-stream = "0.3"
+tiktoken-rs = "=0.12.1"
+scrypt = { version = "=0.11.0", default-features = false }
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+subtle = "=2.6.1"
+hex = "=0.4.3"
+rand = "=0.8.5"
+parking_lot = "=0.12.5"
+regex = "=1.13.1"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+include_dir = "=0.7.4"
+mime_guess = "=2.0.5"
+dotenvy = "0.15"
+unicode-general-category = "1"
+hostname = "0.4"
+
+[build-dependencies]
+winresource = "=0.1.23"
+
+[dev-dependencies]
+hex = "=0.4.3"
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+strip = "none"
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -22,7 +22,7 @@ describe("TotalRateChart", () => {
     expect(html).toContain("Requests");
     expect(html).toContain("Rejected");
     expect(html).toContain("Failed");
-    expect(html).toContain("Peak is the busiest bucket scaled to a minute");
+    expect(html).not.toContain("Peak is the busiest bucket scaled to a minute");
     expect(html).not.toContain('aria-label="Chart"');
   });
 });

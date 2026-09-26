@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { passwordInputType, passwordToggleLabel } from "../login-visibility";
-import { KiroLogo } from "./shell";
+import { usePreferences } from "../preferences";
+import { KiroLbWordmark } from "./shell";
 
 export function LoginCard({ error, onSignIn }: { error: string; onSignIn: (password: string) => Promise<void> }) {
+  const { t } = usePreferences();
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [passwordVisible, setPasswordVisible] = useState(false);
@@ -25,9 +27,8 @@ export function LoginCard({ error, onSignIn }: { error: string; onSignIn: (passw
     <main className="flex min-h-screen items-center justify-center bg-background p-4">
       <Card className="w-full max-w-md">
         <CardHeader>
-          <KiroLogo size={40} />
-          <CardTitle className="mt-3">Kiro-LB</CardTitle>
-          <CardDescription>Private Kiro router operations console</CardDescription>
+          <KiroLbWordmark height={36} />
+          <CardTitle className="sr-only">KiroLB</CardTitle>
         </CardHeader>
         <CardContent>
           <form
@@ -38,7 +39,7 @@ export function LoginCard({ error, onSignIn }: { error: string; onSignIn: (passw
             }}
           >
             <div className="space-y-2">
-              <Label htmlFor="dashboard-password">Dashboard password</Label>
+              <Label htmlFor="dashboard-password">{t("dashboardPassword")}</Label>
               <div className="relative">
                 <Input
                   id="dashboard-password"
@@ -68,7 +69,7 @@ export function LoginCard({ error, onSignIn }: { error: string; onSignIn: (passw
               </p>
             ) : null}
             <Button type="submit" className="w-full" disabled={submitting}>
-              Sign in
+              {t("signIn")}
             </Button>
           </form>
         </CardContent>

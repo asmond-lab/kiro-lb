@@ -8,6 +8,7 @@ import { dashboardApi } from "../api";
 import { copyCodeAriaLabel, copyUserCode } from "../copy-user-code";
 import type { DeviceLoginFlow, DeviceLoginProvider } from "../types";
 import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
+import { translate, usePreferences } from "../preferences";
 
 const POLL_INTERVAL_MS = 2500;
 
@@ -18,6 +19,7 @@ const PROVIDERS: { id: DeviceLoginProvider; label: string; mark: ComponentType<{
 ];
 
 export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<void> }) {
+  const { t, language } = usePreferences();
   const [flow, setFlow] = useState<DeviceLoginFlow>();
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -65,8 +67,8 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         setMessage({
           tone: "ok",
           text: result.initialized
-            ? `Account ${result.accountId} added and initialized.`
-            : `Account ${result.accountId} added, but it could not be initialized yet.`,
+            ? translate(language, "accounts.login.added", { id: result.accountId })
+            : translate(language, "accounts.login.addedNotInit", { id: result.accountId }),
         });
         setFlow(undefined);
         await onRegistered();
@@ -77,7 +79,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         registering.current = false;
       }
     },
-    [onRegistered],
+    [onRegistered, language],
   );
 
   useEffect(() => {
@@ -96,7 +98,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
           return;
         }
         if (next.status !== "pending") {
-          setMessage({ tone: "error", text: next.detail ?? `Login ${next.status}` });
+          setMessage({ tone: "error", text: next.detail ?? translate(language, "accounts.login.status", { status: next.status }) });
           setFlow(undefined);
           return;
         }
@@ -114,17 +116,16 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [flow, registerApproved]);
+  }, [flow, registerApproved, language]);
 
   useEffect(() => () => window.clearTimeout(copiedTimer.current), []);
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Add an account by signing in</CardTitle>
+        <CardTitle>{t("accounts.login.title")}</CardTitle>
         <CardDescription>
-          Approve in the browser and the account is added here. Only the refresh token is stored; the approval link works
-          once and expires in five minutes.
+          {t("accounts.login.description")}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -133,7 +134,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="space-y-1">
                 <p className="text-sm">
-                  Waiting for approval · code{" "}
+                  {t("accounts.login.waiting")}{" "}
                   <span className="inline-flex items-center gap-1">
                     <span className="font-mono font-medium">{flow.userCode}</span>
                     <Button
@@ -148,7 +149,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                   </span>
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  Expires in {Math.floor(flow.expiresInSeconds / 60)}m {flow.expiresInSeconds % 60}s
+                  {t("accounts.login.expires", { m: Math.floor(flow.expiresInSeconds / 60), s: flow.expiresInSeconds % 60 })}
                 </p>
               </div>
               <Badge variant="secondary">{flow.provider}</Badge>
@@ -157,12 +158,12 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
               <Button asChild size="sm" variant="outline">
                 <a href={flow.verificationUriComplete} target="_blank" rel="noreferrer">
                   <ExternalLink />
-                  Reopen approval link
+                  {t("accounts.login.reopen")}
                 </a>
               </Button>
               <Button size="sm" variant="ghost" onClick={() => void cancel()}>
                 <X />
-                Cancel
+                {t("accounts.cancel")}
               </Button>
             </div>
           </div>
@@ -177,7 +178,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                 className="h-11 justify-center gap-2.5 font-medium"
               >
                 <Mark />
-                Continue with {label}
+                {t("accounts.login.continueWith", { provider: label })}
               </Button>
             ))}
           </div>

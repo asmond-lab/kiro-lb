@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AtSign, Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -15,8 +15,9 @@ import { EmptyState } from "@/components/empty-state";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-import { formatTimestamp, formatUsage } from "../format";
-import { resetHint, usageIndicatorClass } from "../quota-display";
+import { formatDuration, formatTimestamp, formatUsage } from "../format";
+import { usageIndicatorClass } from "../quota-display";
+import { usePreferences } from "../preferences";
 import type { Account, AccountRoutingState } from "../types";
 import { TableSkeleton } from "./skeletons";
 
@@ -40,14 +41,23 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
 
 /** Only "ready" is a routing target; everything else is currently excluded. */
 function RoutingStateCell({ account }: { account: Account }) {
+  const { t } = usePreferences();
   const state = account.routingState;
-  const label = ROUTING_STATE_LABEL[state] ?? state;
+  const label = ROUTING_STATE_LABEL[state] ? t(`accounts.state.${state}`) : state;
   const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
   const suspended = state === "suspended";
   const authDead = state === "auth_dead";
   // The one reset display for the row: the countdown from the router, stated
   // here and nowhere else.
-  const hint = resetHint(account);
+  const quotaGone = state === "quota_exhausted" || state === "quota_depleted";
+  const eta = account.eligibleInSeconds > 0 ? formatDuration(account.eligibleInSeconds) : null;
+  const hint = quotaGone
+    ? eta
+      ? t("accounts.resetsIn", { d: eta })
+      : t("accounts.untilReset")
+    : eta
+      ? t("accounts.backIn", { d: eta })
+      : null;
   return (
     <div className="space-y-1">
       <Badge variant={variant} className={suspended || authDead ? "font-semibold tracking-wide" : undefined}>
@@ -58,9 +68,9 @@ function RoutingStateCell({ account }: { account: Account }) {
       {authDead ? (
         // Names the remedy rather than the symptom: unlike a suspension, this one
         // is fixed by the operator re-registering the account.
-        <p className="text-xs text-destructive">credential rejected; re-login required</p>
+        <p className="text-xs text-destructive">{t("accounts.authDeadHint")}</p>
       ) : suspended ? (
-        <p className="text-xs text-destructive">locked by Kiro; contact support</p>
+        <p className="text-xs text-destructive">{t("accounts.suspendedHint")}</p>
       ) : (
         hint && <p className="text-xs tabular-nums text-muted-foreground">{hint}</p>
       )}
@@ -75,6 +85,7 @@ function RoutingStateCell({ account }: { account: Account }) {
  * aria-label while the visible text truncates with the cell.
  */
 function CopyableAccountId({ id, className }: { id: string; className?: string }) {
+  const { t } = usePreferences();
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
 
@@ -101,7 +112,7 @@ function CopyableAccountId({ id, className }: { id: string; className?: string }
       type="button"
       onClick={copy}
       title={id}
-      aria-label={copied ? `Copied account id ${id}` : `Copy account id ${id}`}
+      aria-label={copied ? t("accounts.copiedId", { id }) : t("accounts.copyId", { id })}
       className={cn(
         "group inline-flex max-w-full cursor-pointer items-center gap-1 font-mono text-xs hover:text-foreground",
         className,
@@ -159,6 +170,7 @@ function UsageErrorCell({ message }: { message: string }) {
 }
 
 function UsageCell({ account }: { account: Account }) {
+  const { t } = usePreferences();
   const usage = account.usage;
   // A failed poll keeps the previous figures, so showing the error instead of
   // them hides information that is still useful. The error becomes a warning
@@ -170,7 +182,7 @@ function UsageCell({ account }: { account: Account }) {
     <div className="min-w-40 space-y-1.5">
       {usage.error && (
         <p title={usage.error} className="line-clamp-1 text-xs text-warning">
-          last check failed
+          {t("accounts.lastCheckFailed")}
         </p>
       )}
       <Progress
@@ -192,33 +204,32 @@ export type AccountsPanelProps = {
 };
 
 export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
+  const { t } = usePreferences();
   const [deleting, setDeleting] = useState<Account | null>(null);
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Accounts &amp; live quota</CardTitle>
-        <CardDescription>
-          Fetched from Kiro getUsageLimits. Tokens, profile ARNs, and raw upstream bodies are never stored.
-        </CardDescription>
+        <CardTitle>{t("accounts.title")}</CardTitle>
       </CardHeader>
       <CardContent>
         {isLoading ? (
           <TableSkeleton rows={2} columns={9} />
         ) : accounts.length === 0 ? (
-          <EmptyState icon={ServerCog} title="No accounts registered" description="Add a credential source below." />
+          <EmptyState icon={ServerCog} title={t("accounts.emptyTitle")} description={t("accounts.emptyDescription")} />
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Account</TableHead>
-                <TableHead>State</TableHead>
+                <TableHead>{t("accounts.col.account")}</TableHead>
+                <TableHead>{t("accounts.col.state")}</TableHead>
                 {/* Low-value columns drop below md so Account/State/Usage fit a phone viewport. */}
-                <TableHead className="hidden md:table-cell">Plan</TableHead>
-                <TableHead className="hidden md:table-cell">Overage</TableHead>
-                <TableHead>Usage</TableHead>
-                <TableHead className="text-right">Requests</TableHead>
-                <TableHead className="text-right">Failures</TableHead>
-                <TableHead className="hidden md:table-cell">Updated</TableHead>
+                <TableHead className="hidden md:table-cell">{t("accounts.col.plan")}</TableHead>
+                <TableHead className="hidden md:table-cell">{t("accounts.col.overage")}</TableHead>
+                <TableHead>{t("accounts.col.usage")}</TableHead>
+                <TableHead className="text-right">{t("accounts.col.requests")}</TableHead>
+                <TableHead className="text-right">{t("accounts.col.failures")}</TableHead>
+                <TableHead className="hidden text-right md:table-cell">{t("accounts.col.sessions")}</TableHead>
+                <TableHead className="hidden md:table-cell">{t("accounts.col.updated")}</TableHead>
                 <TableHead className="w-12" />
               </TableRow>
             </TableHeader>
@@ -237,7 +248,11 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                       "—"
                     ) : (
                       <Badge variant={account.usage.overageStatus === "DISABLED" ? "outline" : "secondary"}>
-                        {account.usage.overageStatus.toLowerCase()}
+                        {account.usage.overageStatus === "DISABLED"
+                          ? t("accounts.overage.disabled")
+                          : account.usage.overageStatus === "ENABLED"
+                            ? t("accounts.overage.enabled")
+                            : account.usage.overageStatus}
                         {account.usage.overageUsed ? ` · ${account.usage.overageUsed.toFixed(2)}` : ""}
                       </Badge>
                     )}
@@ -247,6 +262,9 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                   </TableCell>
                   <TableCell className="text-right tabular-nums">{account.requests.toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{account.failures.toLocaleString()}</TableCell>
+                  <TableCell className="hidden text-right tabular-nums md:table-cell">
+                    {(account.sessions ?? 0).toLocaleString()}
+                  </TableCell>
                   <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
                     {formatTimestamp(account.usage?.updatedAt)}
                   </TableCell>
@@ -260,10 +278,10 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                           disabled={isMutating}
                           title={
                             account.enabled
-                              ? "Stop routing to this account, keeping it and its history"
-                              : "Put this account back in the rotation"
+                              ? t("accounts.disableTitle")
+                              : t("accounts.enableTitle")
                           }
-                          aria-label={`${account.enabled ? "Disable" : "Enable"} account ${account.id}`}
+                          aria-label={t(account.enabled ? "accounts.disableAria" : "accounts.enableAria", { id: account.id })}
                           onClick={() => onToggleAccount(account.id, !account.enabled)}
                         >
                           {account.enabled ? <PauseCircle size={14} /> : <PlayCircle size={14} />}
@@ -275,8 +293,8 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                           variant="ghost"
                           className="text-muted-foreground hover:text-destructive"
                           disabled={isMutating}
-                          title="Delete"
-                          aria-label={`Delete account ${account.id}`}
+                          title={t("accounts.delete")}
+                          aria-label={t("accounts.deleteAria", { id: account.id })}
                           onClick={() => setDeleting(account)}
                         >
                           <Trash2 size={14} />
@@ -294,19 +312,18 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
       <Dialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Delete this account?</DialogTitle>
+            <DialogTitle>{t("accounts.deleteTitle")}</DialogTitle>
             <DialogDescription>
               {deleting ? (
                 <>
-                  Account <span className="font-mono">{deleting.id}</span> and its usage history are removed.
-                  To stop using it without losing it, use the pause button instead.
+                  {t("accounts.deleteBefore")} <span className="font-mono">{deleting.id}</span> {t("accounts.deleteAfter")}
                 </>
               ) : null}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" disabled={isMutating} onClick={() => setDeleting(null)}>
-              Cancel
+              {t("accounts.cancel")}
             </Button>
             <Button
               variant="destructive"
@@ -316,7 +333,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                 setDeleting(null);
               }}
             >
-              Delete
+              {t("accounts.delete")}
             </Button>
           </DialogFooter>
         </DialogContent>

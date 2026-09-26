@@ -12,6 +12,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { API_KEY_NAME_MAX, normalizeKeyName } from "../api-key-display";
+import { usePreferences } from "../preferences";
 
 export type CreateKeyDialogProps = {
   open: boolean;
@@ -26,6 +27,7 @@ export type CreateKeyDialogProps = {
  * only supplies the create action.
  */
 export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialogProps) {
+  const { t } = usePreferences();
   const [name, setName] = useState("");
   const [isPending, setIsPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +58,7 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
     if (isPending) return;
     const normalized = normalizeKeyName(name);
     if (!normalized) {
-      setError("Enter a key name.");
+      setError(t("keys.create.nameRequired"));
       return;
     }
     setIsPending(true);
@@ -65,7 +67,7 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
       setCreatedKey(await onCreate(normalized));
     } catch (err) {
       // Keep the entered name so a retry is one click.
-      setError(err instanceof Error ? err.message : "Failed to create the key.");
+      setError(err instanceof Error ? err.message : t("keys.create.failed"));
     } finally {
       setIsPending(false);
     }
@@ -90,13 +92,13 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
         {createdKey === null ? (
           <form onSubmit={handleSubmit} className="grid gap-4">
             <DialogHeader>
-              <DialogTitle>Create API key</DialogTitle>
+              <DialogTitle>{t("keys.create.title")}</DialogTitle>
               <DialogDescription>
-                The plaintext key is shown once, right after creation.
+                {t("keys.create.description")}
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-2">
-              <Label htmlFor="create-key-name">Key name</Label>
+              <Label htmlFor="create-key-name">{t("keys.create.nameLabel")}</Label>
               <Input
                 id="create-key-name"
                 value={name}
@@ -104,7 +106,7 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
                 required
                 autoFocus
                 autoComplete="off"
-                placeholder="e.g. ci-pipeline"
+                placeholder={t("keys.create.placeholder")}
                 disabled={isPending}
                 aria-invalid={error !== null}
                 aria-describedby={error ? "create-key-error" : undefined}
@@ -121,23 +123,23 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" disabled={isPending} onClick={() => onOpenChange(false)}>
-                Cancel
+                {t("keys.cancel")}
               </Button>
               <Button type="submit" disabled={isPending || normalizeKeyName(name) === null}>
-                {isPending ? "Creating…" : "Create"}
+                {isPending ? t("keys.create.creating") : t("keys.create.create")}
               </Button>
             </DialogFooter>
           </form>
         ) : (
           <div className="grid gap-4">
             <DialogHeader>
-              <DialogTitle>Key created</DialogTitle>
+              <DialogTitle>{t("keys.create.createdTitle")}</DialogTitle>
               <DialogDescription>
-                Copy this key now. It is shown only once and cannot be recovered later.
+                {t("keys.create.createdDescription")}
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-2">
-              <Label htmlFor="created-key-value">API key</Label>
+              <Label htmlFor="created-key-value">{t("keys.create.apiKey")}</Label>
               <div className="flex items-center gap-2">
                 <Input
                   id="created-key-value"
@@ -145,13 +147,13 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
                   value={createdKey}
                   className="font-mono text-xs"
                   onFocus={(event) => event.target.select()}
-                  aria-label="New API key, shown only once"
+                  aria-label={t("keys.create.newKeyAria")}
                 />
                 <Button
                   type="button"
                   variant="outline"
                   size="icon"
-                  aria-label={copied ? "API key copied" : "Copy API key"}
+                  aria-label={copied ? t("keys.create.copied") : t("keys.create.copy")}
                   onClick={handleCopy}
                 >
                   {copied ? <Check className="text-success" /> : <Copy />}
@@ -159,12 +161,12 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
               </div>
               <p className="flex items-center gap-1.5 text-xs text-warning">
                 <TriangleAlert size={13} aria-hidden />
-                Store it somewhere safe; it will not be displayed again.
+                {t("keys.create.storeWarning")}
               </p>
             </div>
             <DialogFooter>
               <Button type="button" onClick={() => onOpenChange(false)}>
-                Done
+                {t("keys.create.done")}
               </Button>
             </DialogFooter>
           </div>

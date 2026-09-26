@@ -42,7 +42,7 @@ x-kiro-app: &kiro-app
     - ./debug_logs:/app/debug_logs
   restart: unless-stopped
   healthcheck:
-    test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
     interval: 5s
     timeout: 5s
     retries: 12
