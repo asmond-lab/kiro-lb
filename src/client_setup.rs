@@ -1411,7 +1411,7 @@ fn conditional_write(
     expected: &ExpectedFile,
     mode: Option<u32>,
 ) -> Result<ExpectedFile, String> {
-    conditional_write_inner(path, content, expected, mode, || {})
+    conditional_write_inner(path, content, expected, mode, || {}, || {})
 }
 
 #[cfg(target_os = "linux")]
@@ -1420,6 +1420,7 @@ fn conditional_write_inner(
     content: &[u8],
     expected: &ExpectedFile,
     mode: Option<u32>,
+    before_mutation: impl FnOnce(),
     after_mutation: impl FnOnce(),
 ) -> Result<ExpectedFile, String> {
     use std::os::fd::AsRawFd;
@@ -1435,6 +1436,7 @@ fn conditional_write_inner(
     }
     let (temporary, staged_identity, staged_mode) = create_staged(&parent, path, content, mode)?;
     let temporary_path = path.with_file_name(temporary.to_string_lossy().as_ref());
+    before_mutation();
     let result = match expected.content.as_deref() {
         None => rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE).map_err(|e| {
             format!(
@@ -1687,6 +1689,7 @@ struct StateLock {
     file_identity: FileIdentity,
     directory: fs::File,
     directory_identity: FileIdentity,
+    journal_expected: std::cell::RefCell<ExpectedFile>,
     _lock_directory: fs::File,
     lock_directory_identity: FileIdentity,
     state_directory: PathBuf,
@@ -1752,11 +1755,18 @@ impl StateLock {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
+        let inspected = read_at(&directory, &state_file)?;
         let lock = Self {
             file,
             file_identity,
             directory,
             directory_identity,
+            journal_expected: std::cell::RefCell::new(ExpectedFile {
+                content: inspected.as_ref().map(|(content, _, _)| content.clone()),
+                parent_identity: directory_identity,
+                file_identity: inspected.as_ref().map(|(_, identity, _)| *identity),
+                file_mode: inspected.map(|(_, _, mode)| mode),
+            }),
             _lock_directory: lock_directory,
             lock_directory_identity,
             state_directory,
@@ -1843,7 +1853,11 @@ impl Drop for StateLock {
 #[cfg(target_os = "linux")]
 fn load_state_locked(lock: &StateLock) -> Result<State, String> {
     lock.verify_directory_path()?;
-    match read_at(&lock.directory, &lock.state_file)? {
+    let current = read_at(&lock.directory, &lock.state_file)?;
+    if !expected_matches(&current, &lock.journal_expected.borrow()) {
+        return Err("client setup restoration state changed while locked".into());
+    }
+    match current {
         Some((content, _, _)) => parse_state(&content),
         None => Ok(State {
             version: 1,
@@ -1854,36 +1868,38 @@ fn load_state_locked(lock: &StateLock) -> Result<State, String> {
 
 #[cfg(target_os = "linux")]
 fn save_state_locked(lock: &StateLock, state: &State) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
+    save_state_locked_inner(lock, state, || {})
+}
 
+#[cfg(target_os = "linux")]
+fn save_state_locked_inner(
+    lock: &StateLock,
+    state: &State,
+    before_mutation: impl FnOnce(),
+) -> Result<(), String> {
     lock.verify_directory_path()?;
-    let target = leaf_name(&lock.state_file)?;
-    if state.clients.is_empty() {
-        let result = unsafe { libc::unlinkat(lock.directory.as_raw_fd(), target.as_ptr(), 0) };
-        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
-            return Err(format!(
-                "cannot remove {}: {}",
-                lock.state_file.display(),
-                io::Error::last_os_error()
-            ));
+    let expected = lock.journal_expected.borrow().clone();
+    let updated = if state.clients.is_empty() {
+        before_mutation();
+        if expected.content.is_some() {
+            conditional_remove(&lock.state_file, &expected)?
+        } else {
+            expected
         }
     } else {
         let mut content = serde_json::to_vec_pretty(state)
             .map_err(|e| format!("cannot serialize restoration state: {e}"))?;
         content.push(b'\n');
-        let (temporary, _, _) =
-            create_staged(&lock.directory, &lock.state_file, &content, Some(0o600))?;
-        if let Err(error) = rename_at(&lock.directory, &temporary, &target, 0) {
-            let _ = unsafe { libc::unlinkat(lock.directory.as_raw_fd(), temporary.as_ptr(), 0) };
-            return Err(format!(
-                "cannot save {}: {error}",
-                lock.state_file.display()
-            ));
-        }
-    }
-    lock.directory
-        .sync_all()
-        .map_err(|e| format!("cannot sync state directory: {e}"))?;
+        conditional_write_inner(
+            &lock.state_file,
+            &content,
+            &expected,
+            Some(0o600),
+            before_mutation,
+            || {},
+        )?
+    };
+    *lock.journal_expected.borrow_mut() = updated;
     lock.verify_directory_path()
 }
 
@@ -2289,6 +2305,42 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn stale_lock_writer_preserves_a_newer_recovery_journal() {
+        for stale_state in [
+            test_state("stale"),
+            State {
+                version: 1,
+                clients: BTreeMap::new(),
+            },
+        ] {
+            let directory = temporary_directory();
+            let state_file = directory.join("state/client-setup.json");
+            let lock_path = directory.join(".kirolb-client-setup.lock");
+            let first_lock = StateLock::acquire_at(state_file.clone()).unwrap();
+            save_state_locked(&first_lock, &test_state("initial")).unwrap();
+
+            let newer_state = test_state("newer");
+            let error = save_state_locked_inner(&first_lock, &stale_state, || {
+                fs::remove_file(&lock_path).unwrap();
+                let second_lock = StateLock::acquire_at(state_file.clone()).unwrap();
+                save_state_locked(&second_lock, &newer_state).unwrap();
+            })
+            .unwrap_err();
+
+            assert!(error.contains("changed after planning"));
+            let preserved: State =
+                serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+            assert_eq!(
+                preserved.clients["codex"].original.as_deref(),
+                Some("newer")
+            );
+            drop(first_lock);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn state_lock_refuses_to_write_after_its_directory_is_replaced() {
         let directory = temporary_directory();
         let state_directory = directory.join("state");
@@ -2592,12 +2644,19 @@ mod tests {
         fs::write(&path, "before").unwrap();
         let expected = inspect_expected(&path, false).unwrap();
 
-        let error = conditional_write_inner(&path, b"generated", &expected, Some(0o600), || {
-            fs::write(&path, "concurrent edit").unwrap();
-            fs::rename(&config, &moved_config).unwrap();
-            fs::create_dir(&config).unwrap();
-            fs::write(&path, "replacement").unwrap();
-        })
+        let error = conditional_write_inner(
+            &path,
+            b"generated",
+            &expected,
+            Some(0o600),
+            || {},
+            || {
+                fs::write(&path, "concurrent edit").unwrap();
+                fs::rename(&config, &moved_config).unwrap();
+                fs::create_dir(&config).unwrap();
+                fs::write(&path, "replacement").unwrap();
+            },
+        )
         .unwrap_err();
 
         assert!(error.contains("parent directory"));
@@ -2625,11 +2684,18 @@ mod tests {
         let path = config.join("settings.json");
         let expected = inspect_expected(&path, false).unwrap();
 
-        let error = conditional_write_inner(&path, b"generated", &expected, Some(0o600), || {
-            fs::rename(&config, &moved_config).unwrap();
-            fs::create_dir(&config).unwrap();
-            fs::write(&path, "replacement").unwrap();
-        })
+        let error = conditional_write_inner(
+            &path,
+            b"generated",
+            &expected,
+            Some(0o600),
+            || {},
+            || {
+                fs::rename(&config, &moved_config).unwrap();
+                fs::create_dir(&config).unwrap();
+                fs::write(&path, "replacement").unwrap();
+            },
+        )
         .unwrap_err();
 
         assert!(error.contains("parent directory"));
