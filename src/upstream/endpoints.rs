@@ -22,8 +22,10 @@ pub struct KiroEndpoint {
 }
 
 impl KiroEndpoint {
-    pub fn url(&self, region: &str) -> String {
-        self.url_template.replace("{region}", region)
+    pub fn url(&self, region: &str) -> Result<String, crate::config::InvalidRegion> {
+        Ok(self
+            .url_template
+            .replace("{region}", crate::config::validate_region(region)?))
     }
 
     pub fn header_overrides(&self) -> Vec<(&'static str, String)> {

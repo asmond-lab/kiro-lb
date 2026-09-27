@@ -12,6 +12,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 
 use crate::app::{detail, json_response, Shared};
+use crate::auth::{KiroAuth, Source};
 use crate::dashboard_store::{self as ds};
 use crate::pool::{self, account_label, routing_state};
 use crate::settings::{self, TunableKey};
@@ -661,6 +662,23 @@ async fn register(state: &Shared, entry: Value, requested_type: &str) -> Result<
     if state.pool.get(&id).is_some() {
         return Err(detail(400, "This credential source is already registered"));
     }
+    if matches!(
+        entry.get("type").and_then(Value::as_str),
+        Some("json" | "sqlite")
+    ) {
+        let region = entry
+            .get("region")
+            .and_then(Value::as_str)
+            .unwrap_or(config::REGION);
+        let api_region = entry.get("api_region").and_then(Value::as_str);
+        let source = if entry.get("type").and_then(Value::as_str) == Some("sqlite") {
+            Source::Sqlite(id.clone())
+        } else {
+            Source::File(id.clone())
+        };
+        KiroAuth::new(source, region, api_region, state.http.clone())
+            .map_err(|e| detail(400, e.to_string()))?;
+    }
     let mut entries = store::load_account_sources();
     entries.push(entry);
     let doc = state.pool.state_document();
@@ -741,10 +759,98 @@ fn build_entry(payload: &serde_json::Map<String, Value>) -> Result<Value, String
     ] {
         let v = get(field);
         if !v.is_empty() {
+            if field == "region" || field == "apiRegion" {
+                config::validate_region(&v).map_err(|e| e.to_string())?;
+            } else if let Some(region) = v.split(':').nth(3).filter(|region| !region.is_empty()) {
+                config::validate_region(region).map_err(|_| {
+                    "invalid profile ARN region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1".to_owned()
+                })?;
+            }
             entry[key] = json!(v);
         }
     }
+    if let Some(credential) = entry.get("credential") {
+        if let Some(region) = credential.get("region") {
+            let region = region.as_str().ok_or(
+                "invalid credential region: expected a string containing a lowercase AWS region",
+            )?;
+            config::validate_region(region).map_err(|e| e.to_string())?;
+        }
+        if let Some(profile_arn) = credential.get("profileArn") {
+            let profile_arn = profile_arn
+                .as_str()
+                .ok_or("invalid profile ARN: expected a string")?;
+            let parts: Vec<&str> = profile_arn.split(':').collect();
+            if parts.get(2) == Some(&"codewhisperer")
+                && parts.get(3).is_none_or(|region| region.is_empty())
+            {
+                return Err("invalid profile ARN region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1".into());
+            }
+            if let Some(region) = parts.get(3).filter(|region| !region.is_empty()) {
+                config::validate_region(region).map_err(|_| {
+                    "invalid profile ARN region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1".to_owned()
+                })?;
+            }
+        }
+    }
     Ok(entry)
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    #[test]
+    fn account_registration_rejects_outer_and_embedded_invalid_regions() {
+        for payload in [
+            json!({
+                "type": "refresh_token",
+                "refreshToken": "a-refresh-token-long-enough",
+                "apiRegion": "us-east-1/path"
+            }),
+            json!({
+                "type": "internal",
+                "id": "account",
+                "credential": {
+                    "refreshToken": "a-refresh-token-long-enough",
+                    "region": "US-EAST-1"
+                }
+            }),
+            json!({
+                "type": "internal",
+                "id": "account",
+                "credential": {
+                    "refreshToken": "a-refresh-token-long-enough",
+                    "region": 7
+                }
+            }),
+            json!({
+                "type": "internal",
+                "id": "account",
+                "credential": {
+                    "refreshToken": "a-refresh-token-long-enough",
+                    "profileArn": "arn:aws:codewhisperer:us-east-1.example.com:123456789012:profile/test"
+                }
+            }),
+        ] {
+            assert!(build_entry(payload.as_object().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn account_registration_preserves_distinct_auth_and_api_regions() {
+        let payload = json!({
+            "type": "refresh_token",
+            "refreshToken": "a-refresh-token-long-enough",
+            "region": "us-gov-west-1",
+            "apiRegion": "us-iso-east-1"
+        });
+
+        let entry = build_entry(payload.as_object().unwrap()).unwrap();
+
+        assert_eq!(entry["region"], "us-gov-west-1");
+        assert_eq!(entry["api_region"], "us-iso-east-1");
+    }
 }
 
 pub async fn register_account(
@@ -884,7 +990,10 @@ pub async fn get_endpoints(State(state): State<Shared>, headers: HeaderMap) -> R
     let region = probe_region(&state);
     let available: Vec<Value> = endpoints::ENDPOINTS
         .iter()
-        .map(|e| json!({"key": e.key, "name": e.name, "url": e.url(&region)}))
+        .map(|e| {
+            let url = e.url(&region).expect("account regions are validated");
+            json!({"key": e.key, "name": e.name, "url": url})
+        })
         .collect();
     json_response(
         200,

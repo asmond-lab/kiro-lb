@@ -533,15 +533,28 @@ impl AccountManager {
             return true;
         }
         let cfg = &a.config;
-        let region = cfg
-            .get("region")
-            .and_then(Value::as_str)
-            .unwrap_or(config::REGION)
-            .to_owned();
-        let api_region = cfg
-            .get("api_region")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let region = match cfg.get("region") {
+            None => config::REGION.to_owned(),
+            Some(Value::String(region)) => region.clone(),
+            Some(_) => {
+                tracing::error!(
+                    "Failed to initialize account {}: invalid configured auth region",
+                    a.id
+                );
+                return false;
+            }
+        };
+        let api_region = match cfg.get("api_region") {
+            None => None,
+            Some(Value::String(region)) => Some(region.clone()),
+            Some(_) => {
+                tracing::error!(
+                    "Failed to initialize account {}: invalid configured API region",
+                    a.id
+                );
+                return false;
+            }
+        };
         let source = match cfg.get("type").and_then(Value::as_str) {
             Some("internal") | Some("refresh_token") => Source::Internal(a.id.clone()),
             Some("sqlite") => Source::Sqlite(a.id.clone()),
@@ -557,8 +570,15 @@ impl AccountManager {
         })
         .await
         {
-            Ok(v) => Arc::new(v),
-            Err(_) => return false,
+            Ok(Ok(v)) => Arc::new(v),
+            Ok(Err(e)) => {
+                tracing::error!("Failed to initialize account {id}: {e}");
+                return false;
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize account {id}: {e}");
+                return false;
+            }
         };
         match auth.access_token().await {
             Ok(_) => {}

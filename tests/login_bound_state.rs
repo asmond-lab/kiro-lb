@@ -3,6 +3,7 @@ use kiro_lb::dashboard_store;
 use kiro_lb::pool::{is_quota_depleted, AccountManager};
 use kiro_lb::{model_resolver, store};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -60,12 +61,15 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     pool.load_credentials();
     pool.load_state();
     let account = pool.get("same").unwrap();
-    let auth_a = Arc::new(KiroAuth::new(
-        Source::Internal("same".into()),
-        "us-east-1",
-        None,
-        http.clone(),
-    ));
+    let auth_a = Arc::new(
+        KiroAuth::new(
+            Source::Internal("same".into()),
+            "us-east-1",
+            None,
+            http.clone(),
+        )
+        .unwrap(),
+    );
     let identity_a = auth_a.login_identity().unwrap().to_owned();
     *account.auth.lock() = Some(auth_a.clone());
     {
@@ -208,7 +212,8 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         "us-east-1",
         None,
         http.clone(),
-    );
+    )
+    .unwrap();
     let external_identity_a = external_a.login_identity().unwrap().to_owned();
     let overlay = json!({
         "_kiroLbLoginIdentity": external_identity_a,
@@ -223,7 +228,8 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         "us-east-1",
         None,
         http.clone(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         overlay_restart.access_token().await.unwrap(),
         "overlay-access-a"
@@ -238,7 +244,8 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         .to_string(),
     )
     .unwrap();
-    let external_b = KiroAuth::new(Source::File(external_id), "us-east-1", None, http.clone());
+    let external_b =
+        KiroAuth::new(Source::File(external_id), "us-east-1", None, http.clone()).unwrap();
     assert_ne!(
         external_b.login_identity(),
         Some(external_identity_a.as_str())
@@ -250,8 +257,18 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         "us-east-1",
         None,
         http.clone(),
-    );
+    )
+    .unwrap();
     let missing_identity = missing_a.login_identity().unwrap().to_owned();
+    let missing_account = pool.get("missing").unwrap();
+    *missing_account.auth.lock() = Some(Arc::new(missing_a));
+    missing_account.state.lock().failures = 3;
+    assert!(pool.save_state());
+    assert!(dashboard_store::save_account_usage(
+        "missing",
+        &missing_identity,
+        &json!({"currentUsage": 25.0, "usageLimit": 100.0, "nextDateReset": future_reset}),
+    ));
     let missing_rotated = json!({
         "_kiroLbLoginIdentity": missing_identity,
         "refreshToken": "missing-b",
@@ -259,12 +276,21 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         "expiresAt": "2999-01-01T00:00:00Z",
         "region": "us-east-1"
     });
+    let expected_fingerprint: String = store::with(|c| {
+        c.query_row(
+            "SELECT source_fingerprint FROM account_sources WHERE account_id = 'missing'",
+            [],
+            |row| row.get(0),
+        )
+    })
+    .unwrap();
+    let rotated_fingerprint = format!("source:{}", hex::encode(Sha256::digest(b"missing-b")));
     store::save_credential_for_login(
         "missing",
         &missing_identity,
         &missing_rotated,
-        None,
-        Some("gateway-rotated"),
+        Some(&expected_fingerprint),
+        Some(&rotated_fingerprint),
     )
     .unwrap();
     let missing_restart = KiroAuth::new(
@@ -272,7 +298,8 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         "us-east-1",
         None,
         http.clone(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         missing_restart.login_identity(),
         Some(missing_identity.as_str())
@@ -281,20 +308,53 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         missing_restart.access_token().await.unwrap(),
         "missing-access-b"
     );
+    let rotation_restart = AccountManager::new(http.clone());
+    rotation_restart.load_credentials();
+    rotation_restart.load_state();
+    assert_eq!(
+        rotation_restart
+            .get("missing")
+            .unwrap()
+            .state
+            .lock()
+            .failures,
+        3
+    );
+    assert_eq!(
+        dashboard_store::cached_usage("missing")["currentUsage"],
+        25.0
+    );
 
     let builder_a = KiroAuth::new(
         Source::Internal("builder".into()),
         "us-east-1",
         None,
         http.clone(),
-    );
+    )
+    .unwrap();
     let builder_identity = builder_a.login_identity().unwrap().to_owned();
+    let builder_account = pool.get("builder").unwrap();
+    *builder_account.auth.lock() = Some(Arc::new(builder_a));
+    builder_account.state.lock().failures = 9;
+    assert!(pool.save_state());
+    assert!(dashboard_store::save_account_usage(
+        "builder",
+        &builder_identity,
+        &json!({"currentUsage": 100.0, "usageLimit": 100.0, "nextDateReset": future_reset, "overageStatus": "DISABLED"}),
+    ));
     replace_internal(
         "builder",
         &json!({"refreshToken": "builder-b", "accessToken": "builder-access-b", "expiresAt": "2999-01-01T00:00:00Z", "region": "us-east-1", "clientId": "builder-registration", "clientSecret": "new-secret"}),
     );
-    let builder_b = KiroAuth::new(Source::Internal("builder".into()), "us-east-1", None, http);
-    assert_eq!(builder_b.login_identity(), Some(builder_identity.as_str()));
+    let builder_b =
+        KiroAuth::new(Source::Internal("builder".into()), "us-east-1", None, http).unwrap();
+    assert_ne!(builder_b.login_identity(), Some(builder_identity.as_str()));
+    let builder_restart = AccountManager::new(reqwest::Client::new());
+    builder_restart.load_credentials();
+    builder_restart.load_state();
+    let builder_state = builder_restart.get("builder").unwrap();
+    assert_eq!(builder_state.state.lock().failures, 0);
+    assert!(dashboard_store::cached_usage("builder").is_null());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
@@ -315,12 +375,15 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
         .build()
         .unwrap();
-    let stale_refresh = Arc::new(KiroAuth::new(
-        Source::Internal("stale-refresh".into()),
-        "us-east-1",
-        None,
-        proxy_client,
-    ));
+    let stale_refresh = Arc::new(
+        KiroAuth::new(
+            Source::Internal("stale-refresh".into()),
+            "us-east-1",
+            None,
+            proxy_client,
+        )
+        .unwrap(),
+    );
     let stale_task = {
         let auth = stale_refresh.clone();
         tokio::spawn(async move { auth.force_refresh().await })
