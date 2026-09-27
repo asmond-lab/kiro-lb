@@ -140,7 +140,12 @@ the exact prior bytes and Unix file mode, including the difference between a
 missing file and an existing empty file. Restore is idempotent. If a configured
 file changed after setup, restore refuses to overwrite it; reconcile that file
 manually rather than deleting the journal. Symlinked configuration files and
-configuration directories are rejected.
+configuration directories are rejected. Client files and restoration journals
+are limited to 8 MiB each; setup rejects an oversized generated file or journal
+before mutating a client file. An interrupted or conflicted operation can retain
+owner-only recovery or `.kirolb-*.tmp` staging files that may contain bytes
+needed for reconciliation. Inspect them manually and do not bulk-delete these
+files by name.
 
 ### Compatibility limits
 
