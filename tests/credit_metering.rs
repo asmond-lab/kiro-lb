@@ -28,12 +28,15 @@ fn context(request: RequestCtx) -> StreamCtx {
     StreamCtx {
         model: "claude-sonnet-4.5".into(),
         models: Arc::new(ModelInfoCache::new()),
-        auth: Arc::new(KiroAuth::new(
-            Source::File("/nonexistent/creds.json".into()),
-            "us-east-1",
-            None,
-            http.clone(),
-        )),
+        auth: Arc::new(
+            KiroAuth::new(
+                Source::File("/nonexistent/creds.json".into()),
+                "us-east-1",
+                None,
+                http.clone(),
+            )
+            .unwrap(),
+        ),
         transport: Arc::new(Transport { shared: http }),
         input_tokens: 3,
         request,
