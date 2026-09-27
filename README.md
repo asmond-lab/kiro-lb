@@ -70,3 +70,35 @@ cargo build --release          # target/release/kirolb(.exe)
 
 See `.env.example` and `AGENTS.md` for configuration details.
 Issues: https://github.com/minpeter/kiro-lb/issues
+
+## Release maintenance
+
+Release-plz opens or updates a release PR after changes reach `main`. Review its
+version and changelog, then merge it to approve a release. Use Conventional
+Commits (`fix:`, `feat:`, and `!` / `BREAKING CHANGE:`) for useful release notes.
+The baseline is `v0.2.0`; versions and tags are not reset. This is GitHub-only
+distribution: `git_only = true` disables publishing to crates.io.
+
+Before merging the automation setup, add the repository Actions secret
+`RELEASE_PLZ_TOKEN`: a fine-grained personal access token scoped only to this
+repository, with **Contents: read/write** and **Pull requests: read/write**.
+Use a bot account if available, set an expiry, and rotate it before expiry.
+Do not put the token in a file or PR. This separate token lets release PRs
+trigger normal PR CI; the default `GITHUB_TOKEN` would suppress those events.
+The release PR job fails explicitly if the secret is missing.
+
+The release workflow uses the default `GITHUB_TOKEN` to create a tag and a
+**draft** release, then directly calls the existing build workflow for that
+exact tag. It does not depend on a bot-created tag triggering another workflow.
+Rust/frontend checks and all four binary builds must pass before upload. The
+publisher downloads the uploaded assets, verifies `SHA256SUMS`, and only then
+makes the release public. Published releases are never overwritten.
+
+If a release build or upload fails, the draft remains unpublished. Re-run failed
+jobs, or run **Release automation** manually from `main` with the existing draft
+tag (for example `v0.2.1`). Recovery rejects published releases and tags outside
+`main` history. It rebuilds the tagged source using the selected workflow's
+packaging logic. Do not move or reuse published version tags.
+
+The existing `main` Docker build remains independent; automatic binary releases
+do not add a versioned Docker image or deploy/restart any running server.

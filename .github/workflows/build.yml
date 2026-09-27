@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Exact draft release tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -21,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.0"
@@ -50,6 +58,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
       - uses: actions/download-artifact@v5
         with:
           name: static
@@ -90,6 +100,8 @@ jobs:
             musl: true
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
       - uses: actions/download-artifact@v5
         with:
           name: static
@@ -117,11 +129,29 @@ jobs:
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v')
     needs: [test, binaries]
     runs-on: ubuntu-latest
+    concurrency:
+      group: publish-${{ inputs.release_tag || github.ref_name }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
+      - name: Validate version and refuse published releases
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          test "$TAG" = "v$version"
+          if gh release view "$TAG" --json isDraft --jq .isDraft > draft-status; then
+            test "$(cat draft-status)" = true || { echo 'Refusing to overwrite a published release'; exit 1; }
+          else
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
+          fi
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -130,6 +160,9 @@ jobs:
       - name: Package
         working-directory: dist
         run: |
+          for f in kirolb-linux-x64 kirolb-linux-arm64 kirolb-windows-x64.exe kirolb-windows-arm64.exe; do
+            test -s "$f"
+          done
           for f in kirolb-linux-*; do
             chmod 0755 "$f"
             cp "$GITHUB_WORKSPACE/assets/kirolb.svg" .
@@ -137,13 +170,19 @@ jobs:
             rm "$f" kirolb.svg
           done
           sha256sum kirolb-* > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+          sha256sum -c SHA256SUMS
+      - name: Upload, verify downloads, then publish
+        run: |
+          gh release upload "$TAG" dist/* --clobber
+          gh release download "$TAG" --dir downloaded
+          cmp dist/SHA256SUMS downloaded/SHA256SUMS
+          (cd downloaded && sha256sum -c SHA256SUMS)
+          gh release edit "$TAG" --draft=false --latest
 
   docker:
     name: Docker image
-    if: github.event_name != 'pull_request'
+    # The called workflow publishes binaries only; normal main/tag builds keep Docker publishing.
+    if: github.event_name != 'pull_request' && inputs.release_tag == ''
     needs: [test, binaries]
     runs-on: ubuntu-latest
     steps:

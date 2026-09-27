@@ -1,0 +1,8 @@
+[workspace]
+git_only = true
+release_always = false
+git_tag_name = "v{{ version }}"
+git_release_draft = true
+git_release_latest = false
+# The public contract is HTTP, not the internal Rust library API.
+semver_check = false

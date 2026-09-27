@@ -1,0 +1,87 @@
+name: Release automation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to retry (for example v0.2.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+concurrency:
+  group: release-automation
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'push'
+      # Use GITHUB_TOKEN for tags: build explicitly below, not via tag events.
+      - uses: release-plz/action@d9c19fb28c0cf7a73ae587be4417cf5233962400
+        if: github.event_name == 'push'
+        id: release
+        with:
+          command: release
+          version: '0.3.169'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Select and validate draft
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          tag="$INPUT_TAG"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag=$(jq -r '.[] | select(.package_name == "kiro-lb") | .tag' <<< "${RELEASES:-[]}")
+          fi
+          if [ -z "$tag" ]; then exit 0; fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid stable release tag'; exit 1; }
+          test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+          git fetch origin "refs/tags/$tag:refs/tags/$tag"
+          git merge-base --is-ancestor "$tag" origin/main
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    needs: prepare
+    if: needs.prepare.outputs.tag != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      release_tag: ${{ needs.prepare.outputs.tag }}
+
+  release-pr:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require release PR credentials
+        env:
+          TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          test -n "$TOKEN" || { echo 'Configure RELEASE_PLZ_TOKEN as documented in README.md'; exit 1; }
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@d9c19fb28c0cf7a73ae587be4417cf5233962400
+        with:
+          command: release-pr
+          version: '0.3.169'
+        env:
+          # A separate token makes the bot PR trigger normal pull_request CI.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
