@@ -349,14 +349,43 @@ impl Creds {
         if let Some(invalid) = invalid_profile_arn_type {
             self.invalid_profile_arn_type = invalid;
         }
-        let profile: Option<Value> = conn
-            .query_row(
-                "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok());
+        let has_state_table = match conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'state')",
+            [],
+            |r| r.get::<_, bool>(0),
+        ) {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!("SQLite error checking profile table in {db_path}: {e}");
+                return false;
+            }
+        };
+        let profile: Option<Value> = if has_state_table {
+            let raw = match conn
+                .query_row(
+                    "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::error!("SQLite error reading profile metadata in {db_path}: {e}");
+                    return false;
+                }
+            };
+            match raw.map(|text| serde_json::from_str(&text)).transpose() {
+                Ok(profile) => profile,
+                Err(e) => {
+                    tracing::error!("SQLite profile metadata contains invalid JSON: {e}");
+                    return false;
+                }
+            }
+        } else {
+            // Older credential databases have no state table.
+            None
+        };
         if let Some(arn) = profile
             .as_ref()
             .and_then(|p| s(p, "arn"))
@@ -1194,5 +1223,101 @@ mod tests {
         assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
         assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
         std::fs::remove_file(malformed).unwrap();
+    }
+
+    #[test]
+    fn failed_sqlite_profile_read_preserves_last_good_snapshot() {
+        let old_arn = "arn:aws-us-gov:codewhisperer:us-gov-west-1:123456789012:profile/test";
+        let path = temp_path("malformed-sqlite-profile", "credentials.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv(key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                SQLITE_TOKEN_KEYS[0],
+                json!({"access_token": "cached-access", "region": "us-east-1"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO state(key, value) VALUES ('api.codewhisperer.profile', ?1)",
+            [json!({"arn": old_arn}).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut creds = Creds::default();
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+        assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                json!({"access_token": "fresh-access", "region": "us-iso-east-1"}).to_string(),
+                SQLITE_TOKEN_KEYS[0]
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE state SET value = 'not-json' WHERE key = 'api.codewhisperer.profile'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+        assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE state SET value = ?1 WHERE key = 'api.codewhisperer.profile'",
+            [vec![0xff_u8, 0xfe]],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+        assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM state WHERE key = 'api.codewhisperer.profile'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("fresh-access"));
+        assert!(creds.profile_arn.is_none());
+        assert!(creds.detected_api_region.is_none());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO state(key, value) VALUES ('api.codewhisperer.profile', ?1)",
+            [json!({"arn": old_arn}).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+        assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE state;").unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("fresh-access"));
+        assert!(creds.profile_arn.is_none());
+        assert!(creds.detected_api_region.is_none());
+        std::fs::remove_file(path).unwrap();
     }
 }
