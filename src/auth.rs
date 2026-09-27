@@ -819,11 +819,11 @@ impl KiroAuth {
     fn reload_persisted_for_login(&self) -> bool {
         match &self.source {
             Source::Internal(id) => {
-                if let Some(doc) = self
-                    .login_identity
-                    .as_deref()
-                    .and_then(|identity| store::load_internal_credential_for_login(id, identity))
-                {
+                let doc = match self.login_identity.as_deref() {
+                    Some(identity) => store::load_internal_credential_for_login(id, identity),
+                    None => store::load_internal_credential(id),
+                };
+                if let Some(doc) = doc {
                     let mut fresh = Creds::default();
                     fresh.load_document(&doc);
                     if !self.creds_match_login(&fresh) {
