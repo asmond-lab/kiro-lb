@@ -181,13 +181,17 @@ impl Creds {
             self.invalid_profile_arn_type = !v.is_string() && !v.is_null();
         }
         if let Some(region) = data.get("region") {
-            match region.as_str() {
-                Some(r) => {
-                    self.sso_region = Some(r.to_owned());
-                    self.detected_api_region = Some(r.to_owned());
-                    self.invalid_region_type = false;
+            if region.is_null() {
+                self.invalid_region_type = false;
+            } else {
+                match region.as_str() {
+                    Some(r) => {
+                        self.sso_region = Some(r.to_owned());
+                        self.detected_api_region = Some(r.to_owned());
+                        self.invalid_region_type = false;
+                    }
+                    None => self.invalid_region_type = true,
                 }
-                None => self.invalid_region_type = true,
             }
         }
         if let Some(h) = s(data, "clientIdHash") {
@@ -311,10 +315,12 @@ impl Creds {
                 }
             }
             if let Some(region) = token.get("region") {
-                token_region_loaded = true;
-                invalid_region_type = Some(region.as_str().is_none());
+                invalid_region_type = Some(!region.is_string() && !region.is_null());
                 match region.as_str() {
-                    Some(v) => self.sso_region = Some(v.to_owned()),
+                    Some(v) => {
+                        token_region_loaded = true;
+                        self.sso_region = Some(v.to_owned());
+                    }
                     None => self.sso_region = None,
                 }
             }
@@ -334,8 +340,10 @@ impl Creds {
                 self.client_secret = Some(v);
             }
             if let Some(region) = reg.get("region") {
-                invalid_region_type =
-                    Some(invalid_region_type.unwrap_or(false) || region.as_str().is_none());
+                invalid_region_type = Some(
+                    invalid_region_type.unwrap_or(false)
+                        || (!region.is_string() && !region.is_null()),
+                );
                 match region.as_str() {
                     Some(v) if !token_region_loaded => self.sso_region = Some(v.to_owned()),
                     Some(_) => {}
@@ -1065,7 +1073,7 @@ mod tests {
         conn.execute(
             "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
             rusqlite::params![
-                json!({"profile_arn": null}).to_string(),
+                json!({"profile_arn": null, "region": null}).to_string(),
                 SQLITE_TOKEN_KEYS[0]
             ],
         )
@@ -1155,10 +1163,12 @@ mod tests {
     #[test]
     fn null_optional_profile_arn_is_absent_not_malformed() {
         let mut creds = Creds::default();
-        creds.replace_document(&json!({"profileArn": null, "region": "us-east-1"}));
+        creds.replace_document(&json!({"profileArn": null, "region": null}));
 
         assert!(creds.profile_arn.is_none());
+        assert!(creds.sso_region.is_none());
         assert!(!creds.invalid_profile_arn_type);
+        assert!(!creds.invalid_region_type);
         assert!(validate_credential_regions(&creds).is_ok());
     }
 

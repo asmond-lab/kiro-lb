@@ -746,10 +746,16 @@ fn build_entry(payload: &serde_json::Map<String, Value>) -> Result<Value, String
         ("region", "region"),
         ("apiRegion", "api_region"),
     ] {
-        let v = get(field);
+        let Some(value) = payload.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let v = value
+            .as_str()
+            .ok_or_else(|| format!("invalid {field}: expected a string"))?
+            .trim();
         if !v.is_empty() {
             if field == "region" || field == "apiRegion" {
-                config::validate_region(&v).map_err(|e| e.to_string())?;
+                config::validate_region(v).map_err(|e| e.to_string())?;
             } else if let Some(region) = v.split(':').nth(3).filter(|region| !region.is_empty()) {
                 config::validate_region(region).map_err(|_| {
                     "invalid profile ARN region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1".to_owned()
@@ -759,13 +765,16 @@ fn build_entry(payload: &serde_json::Map<String, Value>) -> Result<Value, String
         }
     }
     if let Some(credential) = entry.get("credential") {
-        if let Some(region) = credential.get("region") {
+        if let Some(region) = credential.get("region").filter(|region| !region.is_null()) {
             let region = region.as_str().ok_or(
                 "invalid credential region: expected a string containing a lowercase AWS region",
             )?;
             config::validate_region(region).map_err(|e| e.to_string())?;
         }
-        if let Some(profile_arn) = credential.get("profileArn") {
+        if let Some(profile_arn) = credential
+            .get("profileArn")
+            .filter(|profile_arn| !profile_arn.is_null())
+        {
             let profile_arn = profile_arn
                 .as_str()
                 .ok_or("invalid profile ARN: expected a string")?;
@@ -798,6 +807,16 @@ mod region_tests {
                 "apiRegion": "us-east-1/path"
             }),
             json!({
+                "type": "refresh_token",
+                "refreshToken": "a-refresh-token-long-enough",
+                "profileArn": false
+            }),
+            json!({
+                "type": "refresh_token",
+                "refreshToken": "a-refresh-token-long-enough",
+                "region": 7
+            }),
+            json!({
                 "type": "internal",
                 "id": "account",
                 "credential": {
@@ -811,6 +830,14 @@ mod region_tests {
                 "credential": {
                     "refreshToken": "a-refresh-token-long-enough",
                     "region": 7
+                }
+            }),
+            json!({
+                "type": "internal",
+                "id": "account",
+                "credential": {
+                    "refreshToken": "a-refresh-token-long-enough",
+                    "profileArn": false
                 }
             }),
             json!({
@@ -839,6 +866,28 @@ mod region_tests {
 
         assert_eq!(entry["region"], "us-gov-west-1");
         assert_eq!(entry["api_region"], "us-iso-east-1");
+    }
+
+    #[test]
+    fn account_registration_treats_optional_nulls_as_absent() {
+        let payload = json!({
+            "type": "internal",
+            "id": "account",
+            "profileArn": null,
+            "region": null,
+            "apiRegion": null,
+            "credential": {
+                "refreshToken": "a-refresh-token-long-enough",
+                "profileArn": null,
+                "region": null
+            }
+        });
+
+        let entry = build_entry(payload.as_object().unwrap()).unwrap();
+
+        assert!(entry.get("profile_arn").is_none());
+        assert!(entry.get("region").is_none());
+        assert!(entry.get("api_region").is_none());
     }
 }
 
