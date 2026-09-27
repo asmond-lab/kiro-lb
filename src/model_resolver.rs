@@ -188,7 +188,7 @@ impl ModelInfoCache {
             || state.models.is_empty()
             || state
                 .refreshed_at
-                .is_none_or(|t| t.elapsed().as_secs() > config::MODEL_CACHE_TTL)
+                .is_none_or(|t| t.elapsed().as_secs() > config::get().account_cache_ttl as u64)
         {
             return ModelSupport::Unknown;
         }
@@ -237,7 +237,11 @@ impl ModelInfoCache {
         self.inner
             .read()
             .refreshed_at
-            .is_none_or(|t| t.elapsed().as_secs() > config::MODEL_CACHE_TTL)
+            .is_none_or(|t| t.elapsed().as_secs() > config::get().account_cache_ttl as u64)
+    }
+
+    pub(crate) fn is_authoritative(&self) -> bool {
+        self.inner.read().authoritative
     }
 
     pub fn all_model_ids(&self) -> Vec<String> {
@@ -353,8 +357,19 @@ mod tests {
         let stale = ModelInfoCache::new();
         stale.update(vec![serde_json::json!({"modelId": "model-a"})]);
         stale.inner.write().refreshed_at =
-            Some(Instant::now() - Duration::from_secs(config::MODEL_CACHE_TTL + 1));
+            Some(Instant::now() - Duration::from_secs(config::get().account_cache_ttl as u64 + 1));
         assert_eq!(stale.support("model-a"), ModelSupport::Unknown);
         assert_eq!(stale.support("model-b"), ModelSupport::Unknown);
+    }
+
+    #[test]
+    fn support_stays_authoritative_until_the_refresh_is_due() {
+        let cache = ModelInfoCache::new();
+        cache.update(vec![serde_json::json!({"modelId": "model-a"})]);
+        cache.inner.write().refreshed_at =
+            Some(Instant::now() - Duration::from_secs(config::MODEL_CACHE_TTL + 1));
+
+        assert_eq!(cache.support("model-a"), ModelSupport::Supported);
+        assert_eq!(cache.support("model-b"), ModelSupport::Unsupported);
     }
 }

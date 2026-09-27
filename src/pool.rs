@@ -66,6 +66,7 @@ pub struct Account {
     pub state: Mutex<AccountState>,
     init: tokio::sync::Mutex<()>,
     models_refresh: tokio::sync::Mutex<()>,
+    models_refresh_scheduled: std::sync::atomic::AtomicBool,
 }
 
 impl Account {
@@ -313,6 +314,7 @@ impl AccountManager {
                         state: Mutex::new(AccountState::default()),
                         init: tokio::sync::Mutex::new(()),
                         models_refresh: tokio::sync::Mutex::new(()),
+                        models_refresh_scheduled: false.into(),
                     }),
                 );
             }
@@ -582,7 +584,11 @@ impl AccountManager {
         Fut: std::future::Future<Output = Option<Vec<Value>>>,
     {
         let _flight = a.models_refresh.lock().await;
-        let ttl = config::get().account_cache_ttl as f64;
+        let ttl = if a.models.is_authoritative() {
+            config::get().account_cache_ttl as f64
+        } else {
+            config::MODEL_CACHE_TTL as f64
+        };
         let cached = a.state.lock().models_cached_at;
         if cached > 0.0 && store::now_f64() - cached <= ttl {
             return;
@@ -595,6 +601,39 @@ impl AccountManager {
         }
         a.state.lock().models_cached_at = store::now_f64();
         self.mark_dirty();
+    }
+
+    fn schedule_model_refreshes(self: &Arc<Self>) {
+        let now = store::now_f64();
+        for a in self.accounts() {
+            let ttl = if a.models.is_authoritative() {
+                config::get().account_cache_ttl as f64
+            } else {
+                config::MODEL_CACHE_TTL as f64
+            };
+            let cached = a.state.lock().models_cached_at;
+            if a.auth.lock().is_none()
+                || cached <= 0.0
+                || now - cached <= ttl
+                || a.models_refresh_scheduled
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+            let (pool, account) = (self.clone(), a.clone());
+            tokio::spawn(async move {
+                pool.refresh_models(&account).await;
+                account
+                    .models_refresh_scheduled
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
     }
 
     fn routing_weight(s: &AccountState) -> f64 {
@@ -703,11 +742,12 @@ impl AccountManager {
     }
 
     pub async fn next_account(
-        &self,
+        self: &Arc<Self>,
         model: &str,
         exclude: &HashSet<String>,
         session: Option<u64>,
     ) -> Option<Arc<Account>> {
+        self.schedule_model_refreshes();
         if let Some(a) = self.select(model, exclude, session, false).await {
             return Some(a);
         }
@@ -1249,6 +1289,7 @@ mod tests {
             state: Mutex::new(AccountState::default()),
             init: tokio::sync::Mutex::new(()),
             models_refresh: tokio::sync::Mutex::new(()),
+            models_refresh_scheduled: false.into(),
         })
     }
 

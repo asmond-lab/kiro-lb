@@ -86,6 +86,28 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         .update(vec![json!({"modelId": "target-model"})]);
     pool.get("unknown").unwrap().models.seed_fallback();
 
+    let fallback_cached_at =
+        kiro_lb::store::now_f64() - kiro_lb::config::MODEL_CACHE_TTL as f64 - 1.0;
+    pool.get("unknown").unwrap().state.lock().models_cached_at = fallback_cached_at;
+    let selected = tokio::time::timeout(
+        Duration::from_secs(1),
+        pool.next_account("target-model", &excluded(&["known-b"]), None),
+    )
+    .await
+    .expect("fallback refresh must not block selection")
+    .unwrap();
+    assert_eq!(selected.id, "known-a");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while pool.get("unknown").unwrap().state.lock().models_cached_at <= fallback_cached_at
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        pool.get("unknown").unwrap().state.lock().models_cached_at > fallback_cached_at,
+        "an unknown fallback must refresh even while a supported account serves the request"
+    );
+
     let selected = pool
         .next_account("target-model", &excluded(&["known-b"]), None)
         .await
