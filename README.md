@@ -71,6 +71,90 @@ cargo build --release          # target/release/kirolb(.exe)
 See `.env.example` and `AGENTS.md` for configuration details.
 Issues: https://github.com/minpeter/kiro-lb/issues
 
+## Codex CLI and Claude Code
+
+`kirolb client` configures either CLI without changing the default Codex
+profile or requiring a paid inference request for verification. Start the
+gateway, export one of its data-plane keys, and run setup:
+
+```bash
+export KIROLB_API_KEY='your-gateway-key'
+kirolb client setup all --base-url http://127.0.0.1:8000
+```
+
+Use `--api-key-stdin` to pipe the key instead of putting it in the environment.
+Use `--api-key-env NAME` when Codex should read a different environment
+variable, and `--model MODEL` to choose the Codex profile's initial model.
+Never put the key on the command line: command arguments may be visible to
+other local processes and shell history.
+
+Setup first calls only `GET /health` and authenticated `GET /v1/models`. These
+checks verify reachability, authentication, and model discovery without
+generating tokens. Nothing is written if either check fails. You can run the
+same read-only check separately:
+
+```bash
+kirolb client diagnose --base-url http://127.0.0.1:8000
+```
+
+For Codex, setup writes the dedicated profile
+`$CODEX_HOME/kirolb.config.toml` (normally
+`~/.codex/kirolb.config.toml`). The profile reads the key from
+`KIROLB_API_KEY`; it does not contain the key itself:
+
+```bash
+codex --profile kirolb
+```
+
+Using an isolated profile is deliberate: setup does not need to parse,
+reformat, or merge the user's main TOML configuration.
+
+For Claude Code, setup updates `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`) with `ANTHROPIC_BASE_URL`, a bearer token,
+and gateway model discovery. Existing unrelated JSON settings are retained.
+The file and the private restoration journal are written with owner-only
+permissions on Unix. Confirm the active base URL and credential source with
+`/status` inside Claude Code.
+
+Inspect or undo setup at any time:
+
+```bash
+kirolb client status all
+kirolb client restore all
+```
+
+Setup is repeatable and serialized across concurrent processes. Writes use a
+same-directory temporary file and atomic rename. The private journal preserves
+the exact prior bytes and Unix file mode, including the difference between a
+missing file and an existing empty file. Restore is idempotent. If a configured
+file changed after setup, restore refuses to overwrite it; reconcile that file
+manually rather than deleting the journal. Symlinked configuration files and
+configuration directories are rejected.
+
+### Compatibility limits
+
+The `/v1/responses` endpoint is a translation facade, not persistent OpenAI
+Responses storage. Codex must send each turn's complete conversation in
+`input` with `store=false`; `previous_response_id` is rejected. The generated
+profile therefore disables standalone web search and WebSocket transport,
+which this gateway does not expose.
+
+Claude Code uses the Anthropic Messages API and can discover models from
+`/v1/models`. The gateway supports Messages streaming and token counting, but
+it translates requests to Kiro rather than forwarding every current or future
+Anthropic beta feature unchanged. Features that depend on direct Anthropic
+services or a claude.ai identity, including cloud sessions and Remote Control,
+are outside this setup. If a newly introduced Claude Code beta field is
+rejected, try `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` and report the
+incompatibility.
+
+The generated fields and paths follow the current official client contracts:
+
+- [Codex configuration reference](https://developers.openai.com/codex/config-reference)
+- [Codex custom model providers](https://developers.openai.com/codex/config-advanced#custom-model-providers)
+- [Connect Claude Code to an LLM gateway](https://code.claude.com/docs/en/llm-gateway-connect)
+- [Claude Code gateway compatibility guide](https://code.claude.com/docs/en/llm-gateway-protocol)
+
 ## Release maintenance
 
 Release-plz opens or updates a release PR after changes reach `main`. Review its

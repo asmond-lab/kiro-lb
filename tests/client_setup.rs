@@ -1,0 +1,347 @@
+use serde_json::Value;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use uuid::Uuid;
+
+const KEY: &str = "test-only-not-a-real-credential";
+
+struct TestHome {
+    path: PathBuf,
+}
+
+impl TestHome {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("kirolb-client-test-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        Self { path }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kirolb"));
+        command
+            .env_clear()
+            .env("HOME", &self.path)
+            .env("KIROLB_API_KEY", KEY)
+            .current_dir(&self.path);
+        command
+    }
+
+    fn codex(&self) -> PathBuf {
+        self.path.join(".codex/kirolb.config.toml")
+    }
+
+    fn claude(&self) -> PathBuf {
+        self.path.join(".claude/settings.json")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.path.join(".kirolb/client-setup.json")
+    }
+}
+
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn gateway(requests: usize) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming().take(requests) {
+            let mut stream = stream.unwrap();
+            let mut request = vec![0; 8192];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let (status, body) = if request.starts_with("GET /health ") {
+                ("200 OK", r#"{"status":"healthy"}"#)
+            } else if request.starts_with("GET /v1/models ")
+                && request.contains(&format!("authorization: Bearer {KEY}"))
+            {
+                ("200 OK", r#"{"data":[{"id":"claude-sonnet-4.6"}]}"#)
+            } else {
+                ("401 Unauthorized", r#"{"error":"unauthorized"}"#)
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    (address, handle)
+}
+
+fn run(home: &TestHome, arguments: &[&str]) -> Output {
+    home.command().args(arguments).output().unwrap()
+}
+
+fn setup(home: &TestHome, base_url: &str, client: &str) -> Output {
+    run(home, &["client", "setup", client, "--base-url", base_url])
+}
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
+    let home = TestHome::new();
+    fs::create_dir(home.path.join(".claude")).unwrap();
+    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\"}\n}\n";
+    fs::write(home.claude(), original).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home.claude(), fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    #[cfg(unix)]
+    let original_directory_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(home.path.join(".claude"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let (url, server) = gateway(4);
+    let first = setup(&home, &url, "all");
+    assert!(first.status.success(), "{}", text(&first));
+    let second = setup(&home, &url, "all");
+    assert!(second.status.success(), "{}", text(&second));
+    server.join().unwrap();
+
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(home.claude()).unwrap()).unwrap();
+    assert_eq!(settings["theme"], "dark");
+    assert_eq!(settings["env"]["CUSTOM"], "kept");
+    assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], url);
+    assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], KEY);
+    let codex = fs::read_to_string(home.codex()).unwrap();
+    assert!(codex.contains("wire_api = \"responses\""));
+    assert!(codex.contains("env_key = \"KIROLB_API_KEY\""));
+    assert!(!codex.contains(KEY));
+    assert!(!text(&first).contains(KEY));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(home.claude()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(home.state()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(home.path.join(".claude"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            original_directory_mode
+        );
+    }
+
+    let restored = run(&home, &["client", "restore", "all"]);
+    assert!(restored.status.success(), "{}", text(&restored));
+    assert_eq!(fs::read_to_string(home.claude()).unwrap(), original);
+    assert!(!home.codex().exists());
+    assert!(!home.state().exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(home.claude()).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+    let again = run(&home, &["client", "restore", "all"]);
+    assert!(again.status.success(), "{}", text(&again));
+}
+
+#[test]
+fn restore_distinguishes_a_preexisting_empty_file_from_an_absent_file() {
+    let home = TestHome::new();
+    fs::create_dir(home.path.join(".codex")).unwrap();
+    fs::write(home.codex(), "").unwrap();
+    let (url, server) = gateway(2);
+    let installed = setup(&home, &url, "all");
+    assert!(installed.status.success(), "{}", text(&installed));
+    server.join().unwrap();
+    let restored = run(&home, &["client", "restore", "all"]);
+    assert!(restored.status.success(), "{}", text(&restored));
+    assert!(home.codex().is_file());
+    assert_eq!(fs::read_to_string(home.codex()).unwrap(), "");
+    assert!(!home.claude().exists());
+}
+
+#[test]
+fn restore_refuses_edits_made_after_setup_without_exposing_the_key() {
+    let home = TestHome::new();
+    let (url, server) = gateway(2);
+    let installed = setup(&home, &url, "all");
+    assert!(installed.status.success(), "{}", text(&installed));
+    server.join().unwrap();
+    fs::write(home.claude(), "{\"userEdit\":true}\n").unwrap();
+    let restored = run(&home, &["client", "restore", "all"]);
+    assert!(!restored.status.success());
+    assert!(text(&restored).contains("refusing destructive restore"));
+    assert!(!text(&restored).contains(KEY));
+    assert!(home.codex().exists());
+    assert_eq!(
+        fs::read_to_string(home.claude()).unwrap(),
+        "{\"userEdit\":true}\n"
+    );
+}
+
+#[test]
+fn unavailable_gateway_and_malformed_settings_leave_clients_untouched() {
+    let home = TestHome::new();
+    let unavailable = setup(&home, "http://127.0.0.1:1", "all");
+    assert!(!unavailable.status.success());
+    assert!(!home.codex().exists());
+    assert!(!home.claude().exists());
+    assert!(!home.state().exists());
+
+    fs::create_dir(home.path.join(".claude")).unwrap();
+    fs::write(home.claude(), "not json\n").unwrap();
+    let (url, server) = gateway(2);
+    let malformed = setup(&home, &url, "all");
+    assert!(!malformed.status.success());
+    server.join().unwrap();
+    assert!(text(&malformed).contains("malformed JSON"));
+    assert!(!home.codex().exists());
+    assert_eq!(fs::read_to_string(home.claude()).unwrap(), "not json\n");
+    assert!(!home.state().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_refuses_symlink_targets_and_keeps_the_referent_unchanged() {
+    use std::os::unix::fs::symlink;
+    let home = TestHome::new();
+    fs::create_dir(home.path.join(".claude")).unwrap();
+    let referent = home.path.join("real-settings.json");
+    fs::write(&referent, "{\"safe\":true}\n").unwrap();
+    symlink(&referent, home.claude()).unwrap();
+    let (url, server) = gateway(2);
+    let output = setup(&home, &url, "all");
+    assert!(!output.status.success());
+    server.join().unwrap();
+    assert!(text(&output).contains("refusing to use symlink"));
+    assert_eq!(fs::read_to_string(referent).unwrap(), "{\"safe\":true}\n");
+    assert!(!home.codex().exists());
+}
+
+#[test]
+fn recovery_journal_can_restore_the_old_bytes_after_an_interrupted_install() {
+    let home = TestHome::new();
+    fs::create_dir(home.path.join(".claude")).unwrap();
+    let original = "{\"before\":true}\n";
+    fs::write(home.claude(), original).unwrap();
+    let (url, server) = gateway(2);
+    let output = setup(&home, &url, "all");
+    assert!(output.status.success(), "{}", text(&output));
+    server.join().unwrap();
+
+    // This is the observable on-disk state if setup stops after journaling but
+    // before replacing the Claude settings file.
+    fs::write(home.claude(), original).unwrap();
+    let restored = run(&home, &["client", "restore", "all"]);
+    assert!(restored.status.success(), "{}", text(&restored));
+    assert_eq!(fs::read_to_string(home.claude()).unwrap(), original);
+    assert!(!home.codex().exists());
+}
+
+#[test]
+fn parallel_setup_is_serialized_and_both_runs_succeed() {
+    let home = TestHome::new();
+    let (url, server) = gateway(4);
+    let mut first = home.command();
+    first
+        .args(["client", "setup", "all", "--base-url", &url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut second = home.command();
+    second
+        .args(["client", "setup", "all", "--base-url", &url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let first = first.spawn().unwrap();
+    let second = second.spawn().unwrap();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(first.status.success(), "{}", text(&first));
+    assert!(second.status.success(), "{}", text(&second));
+    assert!(home.codex().exists());
+    assert!(home.claude().exists());
+    let status = run(&home, &["client", "status", "all"]);
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("codex: installed"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("claude: installed"));
+}
+
+#[test]
+fn diagnose_rejects_malformed_discovery_without_writing_configuration() {
+    let home = TestHome::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(2).enumerate() {
+            let mut stream = stream.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let body = if index == 0 {
+                r#"{"status":"healthy"}"#
+            } else {
+                "{}"
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let output = run(&home, &["client", "diagnose", "--base-url", &url]);
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output).contains("no data array"));
+    assert!(!home.codex().exists());
+    assert!(!home.claude().exists());
+    assert!(!home.state().exists());
+    assert!(!home.path.join(".env").exists());
+}
+
+#[test]
+fn malformed_url_and_secret_are_rejected_without_printing_the_secret() {
+    let home = TestHome::new();
+    let url = run(
+        &home,
+        &[
+            "client",
+            "setup",
+            "--base-url",
+            "https://user:pass@example.test/path",
+        ],
+    );
+    assert!(!url.status.success());
+    assert!(text(&url).contains("base URL must"));
+
+    let mut command = home.command();
+    let output = command
+        .env("KIROLB_API_KEY", "line-one\nline-two")
+        .args(["client", "diagnose"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!text(&output).contains("line-one"));
+}
