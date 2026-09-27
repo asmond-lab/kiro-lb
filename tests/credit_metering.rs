@@ -19,6 +19,14 @@ fn events(items: Vec<Result<KiroEvent, StreamError>>) -> EventStream {
     Box::pin(futures_util::stream::iter(items))
 }
 
+fn parsed(request: &RequestCtx, bytes: &'static [u8]) -> EventStream {
+    let body: stream_core::ByteStream =
+        Box::pin(futures_util::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(bytes)),
+        ]));
+    stream_core::parse_kiro_stream_metered(body, 1.0, 1.0, request)
+}
+
 fn metered(request: &RequestCtx, items: Vec<Result<KiroEvent, StreamError>>) -> EventStream {
     stream_core::meter_generation(events(items), request)
 }
@@ -332,6 +340,100 @@ async fn legacy_usage_still_completes_an_openai_stream_without_counting_credits(
     assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
     assert!(terminal["usage"].get("credits_used").is_none());
     assert_eq!(request.usage.lock().credits, None);
+}
+
+#[tokio::test]
+async fn non_credit_metering_completes_openai_and_responses_without_counting_credits() {
+    const FRAMES: &[u8] = br#"{"content":"complete"}{"unit":"token","usage":4}"#;
+
+    let chat_request = RequestCtx::new(None);
+    let chunks: Vec<String> = stream_openai::stream(
+        parsed(&chat_request, FRAMES),
+        context(chat_request.clone()),
+        options(),
+    )
+    .map(|chunk| chunk.unwrap())
+    .collect()
+    .await;
+    let terminal = chunks
+        .iter()
+        .filter_map(|chunk| chunk.strip_prefix("data: "))
+        .filter_map(|body| serde_json::from_str::<Value>(body.trim()).ok())
+        .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("terminal chunk");
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    assert!(terminal["usage"].get("credits_used").is_none());
+    assert_eq!(chat_request.usage.lock().credits, None);
+
+    let responses_request = RequestCtx::new(None);
+    let chat = stream_openai::stream(
+        parsed(&responses_request, FRAMES),
+        context(responses_request.clone()),
+        options(),
+    );
+    let responses: Vec<String> = kiro_lb::stream_responses::translate(
+        chat,
+        "claude-sonnet-4.5".into(),
+        "resp_1".into(),
+        Default::default(),
+    )
+    .map(|chunk| chunk.unwrap())
+    .collect()
+    .await;
+    assert!(responses
+        .iter()
+        .any(|chunk| chunk.starts_with("event: response.completed")));
+    assert!(!responses
+        .iter()
+        .any(|chunk| chunk.starts_with("event: response.incomplete")));
+    assert_eq!(responses_request.usage.lock().credits, None);
+}
+
+#[tokio::test]
+async fn malformed_metering_remains_an_incomplete_openai_and_responses_stream() {
+    const FRAMES: &[u8] = br#"{"content":"incomplete"}{"unit":"credit","usage":false}"#;
+
+    let chat_request = RequestCtx::new(None);
+    let chunks: Vec<String> = stream_openai::stream(
+        parsed(&chat_request, FRAMES),
+        context(chat_request.clone()),
+        options(),
+    )
+    .map(|chunk| chunk.unwrap())
+    .collect()
+    .await;
+    let terminal = chunks
+        .iter()
+        .filter_map(|chunk| chunk.strip_prefix("data: "))
+        .filter_map(|body| serde_json::from_str::<Value>(body.trim()).ok())
+        .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("terminal chunk");
+    assert_eq!(terminal["choices"][0]["finish_reason"], "length");
+    assert!(terminal["usage"].get("credits_used").is_none());
+    assert_eq!(chat_request.usage.lock().credits, None);
+
+    let responses_request = RequestCtx::new(None);
+    let chat = stream_openai::stream(
+        parsed(&responses_request, FRAMES),
+        context(responses_request.clone()),
+        options(),
+    );
+    let responses: Vec<String> = kiro_lb::stream_responses::translate(
+        chat,
+        "claude-sonnet-4.5".into(),
+        "resp_1".into(),
+        Default::default(),
+    )
+    .map(|chunk| chunk.unwrap())
+    .collect()
+    .await;
+    assert!(responses
+        .iter()
+        .any(|chunk| chunk.starts_with("event: response.incomplete")));
+    assert!(!responses
+        .iter()
+        .any(|chunk| chunk.starts_with("event: response.completed")));
+    assert_eq!(responses_request.usage.lock().credits, None);
 }
 
 #[tokio::test]

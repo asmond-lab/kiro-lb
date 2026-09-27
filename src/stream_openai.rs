@@ -43,6 +43,7 @@ pub fn stream(
         v.accept(Some(&first), false)?;
         yield data(&first);
         let mut metering: Option<f64> = None;
+        let mut metering_reported = false;
         let mut legacy_usage_reported = false;
         let mut context_usage: Option<f64> = None;
         let mut full = String::new();
@@ -96,6 +97,7 @@ pub fn stream(
                     tools.push(tool);
                 }
                 KiroEvent::Metering(m) => {
+                    metering_reported = true;
                     if let Some(credits) = m.credits() {
                         metering = Some(credits);
                     }
@@ -107,7 +109,7 @@ pub fn stream(
             }
         }
         if !received { Err(StreamError::Protocol(stream_core::NO_EVENTS))?; }
-        let completed = metering.is_some() || legacy_usage_reported || context_usage.is_some();
+        let completed = metering_reported || legacy_usage_reported || context_usage.is_some();
         let mut all = tools;
         all.extend(parse_bracket_tool_calls(&full));
         let mut all = deduplicate_tool_calls(&all);
