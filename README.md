@@ -143,9 +143,9 @@ manually rather than deleting the journal. Symlinked configuration files and
 configuration directories are rejected. Client files and restoration journals
 are limited to 8 MiB each; setup rejects an oversized generated file or journal
 before mutating a client file. An interrupted or conflicted operation can retain
-owner-only recovery or `.kirolb-*.tmp` staging files that may contain bytes
-needed for reconciliation. Inspect them manually and do not bulk-delete these
-files by name.
+recovery or `.kirolb-*.tmp` staging files that preserve original or concurrent
+bytes needed for reconciliation. Review them before deletion and do not
+bulk-delete these files by name.
 
 ### Compatibility limits
 
