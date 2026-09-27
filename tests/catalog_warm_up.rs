@@ -7,6 +7,7 @@ use axum::Router;
 use common::*;
 use kiro_lb::app::Shared;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
@@ -221,4 +222,78 @@ async fn ensure_catalog_gives_up_at_its_limit_on_a_hanging_account() {
     assert!(!ready);
     assert!(took < Duration::from_secs(2), "{took:?}");
     assert!(!pool.catalog_ready());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selection_does_not_repeat_a_scheduled_failed_initialization() {
+    setup();
+    let up = upstream().await;
+    let pool = pool(&up.http, &["d1"]);
+
+    let selected = tokio::time::timeout(
+        Duration::from_millis(200),
+        pool.next_account("target-model", &HashSet::new(), None),
+    )
+    .await
+    .expect("selection must not wait for background initialization");
+    assert!(selected.is_none());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while up.refresh_calls() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        up.refresh_calls(),
+        1,
+        "the selector must not start a second attempt after the scheduled attempt fails"
+    );
+
+    for _ in 0..4 {
+        assert!(pool
+            .next_account("target-model", &HashSet::new(), None)
+            .await
+            .is_none());
+    }
+    assert_eq!(
+        up.refresh_calls(),
+        1,
+        "requests during initialization cooldown must not retry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_discovery_waits_for_scheduled_initialization() {
+    setup();
+    let up = upstream().await;
+    up.block_management(true);
+    let pool = pool(&up.http, &["h1"]);
+
+    assert!(pool
+        .next_account("target-model", &HashSet::new(), None)
+        .await
+        .is_none());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !up.management_blocked() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        up.management_blocked(),
+        "scheduled initialization must be in flight"
+    );
+
+    let discovery = {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.ensure_catalog(Duration::from_secs(2)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !discovery.is_finished(),
+        "catalog discovery must join the scheduled attempt"
+    );
+    up.block_management(false);
+
+    assert!(discovery.await.unwrap());
+    assert!(pool.catalog_ready());
+    assert_eq!(up.management_calls(), 1);
 }

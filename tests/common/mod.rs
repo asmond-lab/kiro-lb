@@ -16,6 +16,8 @@ pub struct Upstream {
     pub http: reqwest::Client,
     pub management: Arc<AtomicUsize>,
     pub refresh: Arc<AtomicUsize>,
+    management_blocked: Arc<AtomicBool>,
+    block_management: Arc<AtomicBool>,
 }
 
 impl Upstream {
@@ -26,6 +28,14 @@ impl Upstream {
     pub fn refresh_calls(&self) -> usize {
         self.refresh.load(Ordering::SeqCst)
     }
+
+    pub fn block_management(&self, block: bool) {
+        self.block_management.store(block, Ordering::SeqCst);
+    }
+
+    pub fn management_blocked(&self) -> bool {
+        self.management_blocked.load(Ordering::SeqCst)
+    }
 }
 
 pub async fn upstream() -> Upstream {
@@ -33,13 +43,20 @@ pub async fn upstream() -> Upstream {
     let port = listener.local_addr().unwrap().port();
     let management = Arc::new(AtomicUsize::new(0));
     let refresh = Arc::new(AtomicUsize::new(0));
-    let (m, r) = (management.clone(), refresh.clone());
+    let management_blocked = Arc::new(AtomicBool::new(false));
+    let block_management = Arc::new(AtomicBool::new(false));
+    let (m, r, blocked, block) = (
+        management.clone(),
+        refresh.clone(),
+        management_blocked.clone(),
+        block_management.clone(),
+    );
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
-            let (m, r) = (m.clone(), r.clone());
+            let (m, r, blocked, block) = (m.clone(), r.clone(), blocked.clone(), block.clone());
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 1024];
@@ -53,6 +70,13 @@ pub async fn upstream() -> Upstream {
                 let target = head.split_whitespace().nth(1).unwrap_or("").to_owned();
                 if target.starts_with("management.") {
                     m.fetch_add(1, Ordering::SeqCst);
+                    if block.load(Ordering::SeqCst) {
+                        blocked.store(true, Ordering::SeqCst);
+                        while block.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        blocked.store(false, Ordering::SeqCst);
+                    }
                 }
                 if target.contains(".auth.desktop.") {
                     r.fetch_add(1, Ordering::SeqCst);
@@ -76,6 +100,8 @@ pub async fn upstream() -> Upstream {
         http,
         management,
         refresh,
+        management_blocked,
+        block_management,
     }
 }
 

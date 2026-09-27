@@ -67,6 +67,7 @@ pub struct Account {
     init: tokio::sync::Mutex<()>,
     init_retry_at: Mutex<Option<Instant>>,
     init_scheduled: std::sync::atomic::AtomicBool,
+    init_complete: tokio::sync::Notify,
     models_refresh: tokio::sync::Mutex<()>,
     models_refresh_scheduled: std::sync::atomic::AtomicBool,
 }
@@ -187,16 +188,32 @@ impl AccountManager {
         let pending: Vec<Arc<Account>> = self
             .accounts()
             .into_iter()
-            .filter(|a| {
-                a.auth.lock().is_none()
-                    && !a.init_scheduled.load(std::sync::atomic::Ordering::Acquire)
-            })
+            .filter(|a| a.auth.lock().is_none())
             .collect();
         let tasks: Vec<_> = pending
             .into_iter()
             .map(|a| {
                 let pool = self.clone();
                 tokio::spawn(async move {
+                    if a.init_scheduled.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = tokio::time::timeout(per_account, async {
+                            loop {
+                                let complete = a.init_complete.notified();
+                                if !a.init_scheduled.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                complete.await;
+                            }
+                        })
+                        .await;
+                        return;
+                    }
+                    if a.init_retry_at
+                        .lock()
+                        .is_some_and(|retry_at| Instant::now() < retry_at)
+                    {
+                        return;
+                    }
                     pool.initialize_for_maintenance(&a, per_account).await;
                 })
             })
@@ -315,6 +332,7 @@ impl AccountManager {
                         init: tokio::sync::Mutex::new(()),
                         init_retry_at: Mutex::new(None),
                         init_scheduled: false.into(),
+                        init_complete: tokio::sync::Notify::new(),
                         models_refresh: tokio::sync::Mutex::new(()),
                         models_refresh_scheduled: false.into(),
                     }),
@@ -653,6 +671,7 @@ impl AccountManager {
                         account
                             .init_scheduled
                             .store(false, std::sync::atomic::Ordering::Release);
+                        account.init_complete.notify_waiters();
                     });
                 }
                 continue;
@@ -855,9 +874,7 @@ impl AccountManager {
                     tracing::info!("Probabilistic retry for broken account {}", a.id);
                 }
             }
-            if a.auth.lock().is_none() && !self.initialize(&a).await {
-                a.state.lock().failures += 1;
-                self.mark_dirty();
+            if a.auth.lock().is_none() {
                 continue;
             }
             let still_member = self
@@ -1338,6 +1355,7 @@ mod tests {
             init: tokio::sync::Mutex::new(()),
             init_retry_at: Mutex::new(None),
             init_scheduled: false.into(),
+            init_complete: tokio::sync::Notify::new(),
             models_refresh: tokio::sync::Mutex::new(()),
             models_refresh_scheduled: false.into(),
         })
