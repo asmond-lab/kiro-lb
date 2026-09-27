@@ -259,7 +259,12 @@ fn setup(options: Options) -> Result<(), String> {
     // this point, restore accepts either the old bytes or the staged bytes.
     save_state(&state)?;
     for plan in plans {
-        conditional_write(&plan.snapshot.path, plan.content.as_bytes(), &plan.expected)?;
+        conditional_write(
+            &plan.snapshot.path,
+            plan.content.as_bytes(),
+            &plan.expected,
+            None,
+        )?;
     }
     for client in &options.clients {
         if let Some(snapshot) = state.clients.get_mut(client.id()) {
@@ -514,8 +519,12 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
         };
         match snapshot.original {
             Some(content) => {
-                conditional_write(&snapshot.path, content.as_bytes(), &expected)?;
-                set_file_mode(&snapshot.path, snapshot.original_mode)?;
+                conditional_write(
+                    &snapshot.path,
+                    content.as_bytes(),
+                    &expected,
+                    snapshot.original_mode,
+                )?;
             }
             None if expected.content.is_some() => conditional_remove(&snapshot.path, &expected)?,
             None => {}
@@ -842,9 +851,10 @@ fn create_staged(
     parent: &fs::File,
     path: &Path,
     content: &[u8],
+    mode: Option<u32>,
 ) -> Result<(std::ffi::CString, FileIdentity), String> {
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let name = std::ffi::CString::new(format!(".kirolb-{}.tmp", Uuid::new_v4()))
         .expect("generated temporary name");
@@ -865,7 +875,12 @@ fn create_staged(
     }
     let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
     file.write_all(content)
-        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
+    if let Some(mode) = mode {
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("cannot stage permissions for {}: {e}", path.display()))?;
+    }
+    file.sync_all()
         .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
     let metadata = file
         .metadata()
@@ -880,7 +895,12 @@ fn create_staged(
 }
 
 #[cfg(target_os = "linux")]
-fn conditional_write(path: &Path, content: &[u8], expected: &ExpectedFile) -> Result<(), String> {
+fn conditional_write(
+    path: &Path,
+    content: &[u8],
+    expected: &ExpectedFile,
+    mode: Option<u32>,
+) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
     let parent = open_parent_secure(path, false)?;
@@ -892,7 +912,7 @@ fn conditional_write(path: &Path, content: &[u8], expected: &ExpectedFile) -> Re
             path.display()
         ));
     }
-    let (temporary, staged_identity) = create_staged(&parent, path, content)?;
+    let (temporary, staged_identity) = create_staged(&parent, path, content, mode)?;
     let temporary_path = path.with_file_name(temporary.to_string_lossy().as_ref());
     let result = match expected.content.as_deref() {
         None => rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE).map_err(|e| {
@@ -1022,7 +1042,12 @@ fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String
 }
 
 #[cfg(not(target_os = "linux"))]
-fn conditional_write(path: &Path, content: &[u8], expected: &ExpectedFile) -> Result<(), String> {
+fn conditional_write(
+    path: &Path,
+    content: &[u8],
+    expected: &ExpectedFile,
+    mode: Option<u32>,
+) -> Result<(), String> {
     let current = inspect_expected(path, false)?;
     if current.content != expected.content {
         return Err(format!(
@@ -1039,7 +1064,8 @@ fn conditional_write(path: &Path, content: &[u8], expected: &ExpectedFile) -> Re
             path.display()
         ));
     }
-    atomic_write(path, content)
+    atomic_write(path, content)?;
+    set_file_mode(path, mode)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1181,7 +1207,7 @@ fn file_mode(_path: &Path) -> Result<Option<u32>, String> {
     Ok(None)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(mode) = mode {
@@ -1191,7 +1217,7 @@ fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_os = "linux")))]
 fn set_file_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
     Ok(())
 }
@@ -1272,7 +1298,7 @@ mod tests {
         let expected = inspect_expected(&path, false).unwrap();
         fs::write(&path, "user edit").unwrap();
 
-        let error = conditional_write(&path, b"generated", &expected).unwrap_err();
+        let error = conditional_write(&path, b"generated", &expected, None).unwrap_err();
 
         assert!(error.contains("changed after planning"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "user edit");
@@ -1316,7 +1342,7 @@ mod tests {
         fs::rename(&home, &moved_home).unwrap();
         symlink(&attacker_home, &home).unwrap();
 
-        assert!(conditional_write(&path, b"generated", &expected).is_err());
+        assert!(conditional_write(&path, b"generated", &expected, None).is_err());
         assert_eq!(fs::read_to_string(attacker_path).unwrap(), "do not touch");
         assert_eq!(
             fs::read_to_string(moved_home.join(".claude/settings.json")).unwrap(),
