@@ -137,6 +137,10 @@ pub fn stream(
         let (mut prompt, mut total) = (0i64, completion);
         match stream_core::tokens_from_context_usage(context_usage, completion, ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model))) {
             Some((p, t)) => { prompt = p; total = t; }
+            None if ctx.input_tokens > 0 => {
+                prompt = ctx.input_tokens;
+                total = prompt + completion;
+            }
             None if !opts.request_messages.is_empty() => {
                 let (msgs, tls, model) = (opts.request_messages.clone(), opts.request_tools.clone(), ctx.model.clone());
                 prompt = tokio::task::spawn_blocking(move || count_message_tokens(&msgs, false, Some(&model)) + count_tools_tokens(&tls, false, Some(&model))).await.unwrap_or(0) as i64;

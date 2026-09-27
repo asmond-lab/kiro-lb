@@ -210,9 +210,13 @@ fn get(id: &str) -> Option<DeviceFlow> {
     FLOWS.lock().as_ref().and_then(|f| f.get(id).cloned())
 }
 
+/// Publishes a poll result only while the flow is still registered: a poll
+/// that was in flight when the operator cancelled must not bring it back.
 fn put(flow: DeviceFlow) {
     if let Some(f) = FLOWS.lock().as_mut() {
-        f.insert(flow.id.clone(), flow);
+        if let Some(slot) = f.get_mut(&flow.id) {
+            *slot = flow;
+        }
     }
 }
 
@@ -341,4 +345,55 @@ pub fn internal_credentials(flow: &DeviceFlow) -> Result<Value, String> {
         }
     }
     Ok(doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flow(id: &str) -> DeviceFlow {
+        DeviceFlow {
+            id: id.into(),
+            provider: "Google",
+            device_code: "dc".into(),
+            user_code: "uc".into(),
+            verification_uri: String::new(),
+            verification_uri_complete: String::new(),
+            expires_at: now_f64() + 600.0,
+            interval: 5.0,
+            status: "pending".into(),
+            detail: None,
+            token: None,
+            registration: None,
+        }
+    }
+
+    #[test]
+    fn a_poll_that_completes_after_cancel_does_not_resurrect_the_flow() {
+        let id = "cancelled-mid-poll";
+        FLOWS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), flow(id));
+        let mut in_flight = get(id).unwrap();
+        discard(id);
+        in_flight.status = "approved".into();
+        in_flight.token = Some(json!({"refreshToken": "rt"}));
+        put(in_flight);
+        assert!(get(id).is_none());
+    }
+
+    #[test]
+    fn a_poll_result_updates_a_flow_that_is_still_registered() {
+        let id = "still-registered";
+        FLOWS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), flow(id));
+        let mut in_flight = get(id).unwrap();
+        in_flight.status = "approved".into();
+        put(in_flight);
+        assert_eq!(get(id).unwrap().status, "approved");
+        discard(id);
+    }
 }

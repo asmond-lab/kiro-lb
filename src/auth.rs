@@ -21,6 +21,19 @@ const SQLITE_REGISTRATION_KEYS: [&str; 2] = [
     "codewhisperer:odic:device-registration",
 ];
 
+/// Holds the durable refresh lease and releases it on drop, so a cancelled
+/// refresh (client disconnect, aborted task) cannot strand the lease.
+pub struct RefreshLease {
+    pub account: String,
+    pub owner: String,
+}
+
+impl Drop for RefreshLease {
+    fn drop(&mut self) {
+        store::release_refresh_lease(&self.account, &self.owner);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthType {
     KiroDesktop,
@@ -496,24 +509,38 @@ impl KiroAuth {
             return self.refresh_request().await;
         };
         let previous = self.cached_token();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
-        let owner = loop {
+        let wait = std::env::var("KIRO_REFRESH_LEASE_WAIT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(75.0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait);
+        let _lease = loop {
             let a = account.clone();
-            if let Some(o) =
-                tokio::task::spawn_blocking(move || store::try_acquire_refresh_lease(&a, 60.0))
-                    .await
-                    .ok()
-                    .flatten()
+            if let Some(lease) = tokio::task::spawn_blocking(move || {
+                store::try_acquire_refresh_lease(&a, 60.0)
+                    .map(|owner| RefreshLease { account: a, owner })
+            })
+            .await
+            .ok()
+            .flatten()
             {
-                break o;
+                break lease;
             }
             if tokio::time::Instant::now() >= deadline {
-                tracing::warn!("Refresh lease for account {account} not acquired in 75s; refreshing without it");
-                return self.refresh_request().await;
+                if let Some(latest) = store::load_internal_credential(&account) {
+                    self.creds.lock().load_document(&latest);
+                }
+                if self.cached_token().is_some() && !self.expired() {
+                    return Ok(());
+                }
+                tracing::warn!("Refresh lease for account {account} not acquired in {wait}s; not refreshing without ownership");
+                return Err(AuthError::Other(
+                    "Credential refresh is owned by another slot; try again shortly".into(),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        let result = async {
+        async {
             if let Some(latest) = store::load_internal_credential(&account) {
                 self.creds.lock().load_document(&latest);
             }
@@ -526,9 +553,7 @@ impl KiroAuth {
             }
             self.refresh_request().await
         }
-        .await;
-        store::release_refresh_lease(&account, &owner);
-        result
+        .await
     }
 
     async fn refresh_request(&self) -> Result<(), AuthError> {
