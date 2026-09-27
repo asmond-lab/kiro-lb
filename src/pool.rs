@@ -65,6 +65,7 @@ pub struct Account {
     pub models: Arc<ModelInfoCache>,
     pub state: Mutex<AccountState>,
     init: tokio::sync::Mutex<()>,
+    models_refresh: tokio::sync::Mutex<()>,
 }
 
 impl Account {
@@ -239,6 +240,7 @@ impl AccountManager {
                         models: Arc::new(ModelInfoCache::new()),
                         state: Mutex::new(AccountState::default()),
                         init: tokio::sync::Mutex::new(()),
+                        models_refresh: tokio::sync::Mutex::new(()),
                     }),
                 );
             }
@@ -490,9 +492,31 @@ impl AccountManager {
         }
     }
 
-    async fn refresh_models(&self, a: &Arc<Account>) {
+    /// Single-flight per account: selectors that see the same expired cache
+    /// queue on one refresh and reuse its result instead of each calling
+    /// ListAvailableModels.
+    pub async fn refresh_models(&self, a: &Arc<Account>) {
+        let http = self.http.clone();
+        self.refresh_models_with(a, move |auth| {
+            let http = http.clone();
+            async move { crate::model_catalog::fetch_available_models(&auth, &http).await }
+        })
+        .await;
+    }
+
+    pub async fn refresh_models_with<F, Fut>(&self, a: &Arc<Account>, fetch: F)
+    where
+        F: FnOnce(Arc<KiroAuth>) -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<Value>>>,
+    {
+        let _flight = a.models_refresh.lock().await;
+        let ttl = config::get().account_cache_ttl as f64;
+        let cached = a.state.lock().models_cached_at;
+        if cached > 0.0 && store::now_f64() - cached <= ttl {
+            return;
+        }
         let Some(auth) = a.auth() else { return };
-        let refreshed = crate::model_catalog::fetch_available_models(&auth, &self.http).await;
+        let refreshed = fetch(auth).await;
         match refreshed {
             Some(m) => a.models.update(m),
             None => a.models.seed_fallback(),

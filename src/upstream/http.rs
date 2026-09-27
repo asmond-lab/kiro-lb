@@ -337,6 +337,7 @@ pub async fn concurrency_slot(account: &str) -> Result<Vec<OwnedSemaphorePermit>
         *gates.waiting.entry(account.to_owned()).or_insert(0) += 1;
         (g, a)
     };
+    let _waiting = WaitingGuard(account.to_owned());
     let mut permits = Vec::new();
     let result = async {
         if let Some(g) = g {
@@ -348,10 +349,21 @@ pub async fn concurrency_slot(account: &str) -> Result<Vec<OwnedSemaphorePermit>
         Ok::<(), TransportError>(())
     }
     .await;
-    if let Some(gates) = GATES.lock().as_mut() {
-        *gates.waiting.entry(account.to_owned()).or_insert(1) -= 1;
-    }
     result.map(|_| permits)
+}
+
+/// Decrements the queue depth when acquisition ends, including when the
+/// waiting future is dropped by a client disconnect.
+struct WaitingGuard(String);
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        if let Some(gates) = GATES.lock().as_mut() {
+            if let Some(n) = gates.waiting.get_mut(&self.0) {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
 }
 
 pub fn concurrency_status() -> Value {

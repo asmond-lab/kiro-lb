@@ -18,8 +18,15 @@ use crate::upstream::http::Transport;
 use crate::usage_tracking::{GenerationTimer, RequestCtx};
 use crate::{pyjson, utils, web_search};
 
+/// Builds the generation that answers after an intercepted web_search.
+/// `Err` is a real failure (transport error, non-200) and fails the turn; it is
+/// never turned into a quiet fallback that would credit the account.
 pub type SearchFollowup = Arc<
-    dyn Fn(String, String, String) -> Pin<Box<dyn Future<Output = Option<EventStream>> + Send>>
+    dyn Fn(
+            String,
+            String,
+            String,
+        ) -> Pin<Box<dyn Future<Output = Result<EventStream, StreamError>> + Send>>
         + Send
         + Sync,
 >;
@@ -220,13 +227,12 @@ pub fn stream(
                                     yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
                                     index += 1;
                                     intercepted.insert(tool_call_signature(&json!({"function": {"name": name, "arguments": pyjson::dumps(&input)}})));
-                                    if let Some(next) = followup(id.clone(), query.clone(), web_search::summary(&query, &results)).await {
-                                        current = next;
-                                        stop_reason = None;
-                                        context_usage = None;
-                                        cache_usage.clear();
-                                        continue 'outer;
-                                    }
+                                    drop(std::mem::replace(&mut current, Box::pin(futures_util::stream::empty())));
+                                    current = followup(id.clone(), query.clone(), web_search::summary(&query, &results)).await?;
+                                    stop_reason = None;
+                                    context_usage = None;
+                                    cache_usage.clear();
+                                    continue 'outer;
                                 } else {
                                     tracing::error!("MCP API call failed for web_search");
                                 }
@@ -397,10 +403,8 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         );
         native.push(json!({"type": "server_tool_use", "id": srv_id, "name": "web_search", "input": {"query": query}}));
         native.push(json!({"type": "web_search_tool_result", "tool_use_id": srv_id, "content": web_search::search_content(&results)}));
-        match followup(id, query.clone(), web_search::summary(&query, &results)).await {
-            Some(next) => result = stream_core::collect(next).await?,
-            None => break,
-        }
+        let next = followup(id, query.clone(), web_search::summary(&query, &results)).await?;
+        result = stream_core::collect(next).await?;
     }
     let cache = result.usage.as_ref().map(cache_fields).unwrap_or_default();
     let mut content = Vec::new();

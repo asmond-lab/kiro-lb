@@ -98,8 +98,8 @@ pub fn enabled() -> bool {
 }
 
 impl Capture {
-    pub fn new() -> Option<Mutex<Capture>> {
-        enabled().then(|| Mutex::new(Capture::default()))
+    pub fn new() -> Option<std::sync::Arc<Mutex<Capture>>> {
+        enabled().then(|| std::sync::Arc::new(Mutex::new(Capture::default())))
     }
 
     fn room(&mut self, n: usize) -> bool {
@@ -123,6 +123,19 @@ impl Capture {
         if self.room(data.len()) {
             self.chunks.push((kind.to_owned(), data.to_vec()));
         }
+    }
+
+    /// True when the bytes sent to the client carry a protocol error event,
+    /// so a stream that failed after its 200 headers is still captured.
+    pub fn client_saw_error(&self) -> bool {
+        self.chunks.iter().any(|(k, d)| {
+            k == "client" && {
+                let t = String::from_utf8_lossy(d);
+                t.contains("event: error")
+                    || t.contains("response.failed")
+                    || t.contains("\"error\":{")
+            }
+        })
     }
 
     pub fn flush(&self, status: u16, error: &str) {

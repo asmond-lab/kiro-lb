@@ -30,6 +30,7 @@ pub struct RequestCtx {
     pub api_key_id: Option<String>,
     pub account_id: Arc<Mutex<Option<String>>>,
     pub usage: Arc<Mutex<RequestUsage>>,
+    pub capture: Option<Arc<Mutex<crate::debug::Capture>>>,
 }
 
 impl RequestCtx {
@@ -37,6 +38,12 @@ impl RequestCtx {
         RequestCtx {
             api_key_id,
             ..Default::default()
+        }
+    }
+
+    pub fn capture(&self, f: impl FnOnce(&mut crate::debug::Capture)) {
+        if let Some(c) = &self.capture {
+            f(&mut c.lock());
         }
     }
 

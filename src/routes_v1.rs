@@ -189,6 +189,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    plan.ctx.capture(|c| c.kiro_request(&built.payload));
     let body = Bytes::from(built.serialized.clone());
     let result = state
         .transport
@@ -285,13 +286,19 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             let (state, plan, auth, cid, arn) = (state.clone(), plan.clone(), auth.clone(), cid.clone(), arn.clone());
             Box::pin(async move {
                 let mut req = plan.req.clone();
-                let msgs = req["messages"].as_array_mut()?;
+                let msgs = req["messages"].as_array_mut().ok_or(StreamError::Protocol("web_search follow-up has no messages"))?;
                 msgs.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool_id, "name": "web_search", "input": {"query": query}}]}));
                 msgs.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": content}]}));
-                let built = tokio::task::spawn_blocking(move || convert_anthropic::anthropic_to_kiro(&req, &cid, &arn)).await.ok()?.ok()?;
+                let built = tokio::task::spawn_blocking(move || convert_anthropic::anthropic_to_kiro(&req, &cid, &arn))
+                    .await
+                    .map_err(|_| StreamError::Protocol("web_search follow-up build panicked"))?
+                    .map_err(|e| StreamError::Upstream(format!("web_search follow-up could not be built: {e}")))?;
                 let model = built.payload.pointer("/conversationState/currentMessage/userInputMessage/modelId").and_then(Value::as_str).unwrap_or("").to_owned();
-                let r = state.transport.generate(&auth, Bytes::from(built.serialized), &model, true, false).await.ok().filter(|r| r.status == 200)?;
-                Some(events_of(r))
+                match state.transport.generate(&auth, Bytes::from(built.serialized), &model, true, false).await {
+                    Ok(r) if r.status == 200 => Ok(events_of(r, &plan.ctx)),
+                    Ok(r) => Err(StreamError::UpstreamStatus(r.status)),
+                    Err(e) => Err(StreamError::Upstream(e.to_string())),
+                }
             }) as _
         });
         f
@@ -310,8 +317,9 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
         auth: auth.clone(),
         body,
         model_id,
+        ctx: plan.ctx.clone(),
     };
-    let events = first_token_retry(events_of(response), retry);
+    let events = first_token_retry(events_of(response, &plan.ctx), retry);
     let account_id = account.id.clone();
     let pool = state.pool.clone();
     let model = plan.model.clone();
@@ -391,9 +399,18 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     }
 }
 
-fn events_of(r: UpstreamResponse) -> EventStream {
+fn events_of(r: UpstreamResponse, ctx: &RequestCtx) -> EventStream {
     let cfg = config::get();
     let (bytes, permits) = r.into_stream();
+    let bytes: stream_core::ByteStream = match ctx.capture.clone() {
+        None => bytes,
+        Some(capture) => Box::pin(bytes.map(move |chunk| {
+            if let Ok(b) = &chunk {
+                capture.lock().chunk("upstream", b);
+            }
+            chunk
+        })),
+    };
     let inner =
         stream_core::parse_kiro_stream(bytes, cfg.first_token_timeout, cfg.streaming_read_timeout);
     Box::pin(async_stream::stream! {
@@ -410,6 +427,7 @@ struct Retry {
     auth: Arc<crate::auth::KiroAuth>,
     body: Bytes,
     model_id: String,
+    ctx: RequestCtx,
 }
 
 fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
@@ -433,7 +451,7 @@ fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
                     )
                     .await
                 {
-                    Ok(r) if r.status == 200 => Ok(events_of(r)),
+                    Ok(r) if r.status == 200 => Ok(events_of(r, &retry.ctx)),
                     Ok(r) => Err(StreamError::UpstreamStatus(r.status)),
                     Err(e) => Err(StreamError::Upstream(e.to_string())),
                 }

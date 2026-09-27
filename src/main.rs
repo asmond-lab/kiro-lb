@@ -149,7 +149,7 @@ fn router(state: app::Shared) -> Router {
                 app::detail(404, "Not Found")
             }
         })
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(app::MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             app::data_plane_middleware,
@@ -329,15 +329,20 @@ async fn serve(host: String, port: u16) {
             "No account in the store yet. Open the dashboard and add one with device login."
         );
     }
-    let mut initialized = false;
-    for a in pool.accounts() {
-        if pool.initialize_account(&a.id).await {
-            initialized = true;
-            break;
-        }
-    }
-    if !initialized {
-        tracing::warn!("No account initialized at startup; they will be retried on first use");
+    if quiesced {
+        tracing::info!(
+            "Standby slot: deferring account initialization until activation or first use"
+        );
+    } else {
+        let p = pool.clone();
+        tokio::spawn(async move {
+            for a in p.accounts() {
+                if p.initialize_account(&a.id).await {
+                    return;
+                }
+            }
+            tracing::warn!("No account initialized at startup; they will be retried on first use");
+        });
     }
     let observations = dashboard_store::load_rate_observations(
         store::now_f64() - cfg.rate_estimate_window_seconds as f64,
