@@ -690,7 +690,9 @@ impl Transport {
                 .into_iter()
                 .enumerate()
             {
-                let url = ep.url(&region);
+                let url = ep
+                    .url(&region)
+                    .map_err(|e| TransportError::Auth(AuthError::Other(e.to_string())))?;
                 if i > 0 {
                     tracing::warn!("[Endpoints] Rotating to {} ({url})", ep.name);
                 }

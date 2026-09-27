@@ -237,26 +237,117 @@ pub fn get() -> &'static Config {
     CONFIG.get_or_init(Config::from_env)
 }
 
-pub fn kiro_refresh_url(region: &str) -> String {
-    format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidRegion;
+
+impl std::fmt::Display for InvalidRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "invalid region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1",
+        )
+    }
 }
 
-pub fn aws_sso_oidc_url(region: &str) -> String {
-    format!("https://oidc.{region}.amazonaws.com/token")
+impl std::error::Error for InvalidRegion {}
+
+/// Validates the extensible AWS region-name syntax without freezing a list of
+/// currently launched regions or partitions.
+pub fn validate_region(region: &str) -> Result<&str, InvalidRegion> {
+    if !(5..=63).contains(&region.len()) {
+        return Err(InvalidRegion);
+    }
+    let parts: Vec<&str> = region.split('-').collect();
+    let Some((number, names)) = parts.split_last() else {
+        return Err(InvalidRegion);
+    };
+    if names.len() < 2
+        || names[0].len() < 2
+        || !names[0].bytes().all(|b| b.is_ascii_lowercase())
+        || names[1..].iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+        || number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(InvalidRegion);
+    }
+    Ok(region)
 }
 
-pub fn kiro_api_host(region: &str) -> String {
-    format!("https://runtime.{region}.kiro.dev")
+pub fn kiro_refresh_url(region: &str) -> Result<String, InvalidRegion> {
+    Ok(format!(
+        "https://prod.{}.auth.desktop.kiro.dev/refreshToken",
+        validate_region(region)?
+    ))
 }
 
-pub fn kiro_q_host(region: &str, is_builder_id: bool) -> String {
+pub fn aws_sso_oidc_url(region: &str) -> Result<String, InvalidRegion> {
+    Ok(format!(
+        "https://oidc.{}.amazonaws.com/token",
+        validate_region(region)?
+    ))
+}
+
+pub fn kiro_api_host(region: &str) -> Result<String, InvalidRegion> {
+    Ok(format!(
+        "https://runtime.{}.kiro.dev",
+        validate_region(region)?
+    ))
+}
+
+pub fn kiro_q_host(region: &str, is_builder_id: bool) -> Result<String, InvalidRegion> {
+    let region = validate_region(region)?;
     if is_builder_id {
-        format!("https://q.{region}.amazonaws.com")
+        Ok(format!("https://q.{region}.amazonaws.com"))
     } else {
-        format!("https://runtime.{region}.kiro.dev")
+        Ok(format!("https://runtime.{region}.kiro.dev"))
     }
 }
 
 pub fn fallback_limits(model: &str) -> Option<&'static FallbackModel> {
     FALLBACK_MODELS.iter().find(|m| m.model_id == model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_validation_supports_current_and_future_partition_shapes() {
+        for region in [
+            "us-east-1",
+            "ap-southeast-7",
+            "us-gov-west-1",
+            "us-iso-east-1",
+            "us-isob-east-1",
+            "eu-isoe-west-1",
+            "eusc-de-east-1",
+        ] {
+            assert_eq!(validate_region(region), Ok(region));
+        }
+    }
+
+    #[test]
+    fn url_builders_reject_non_region_host_material() {
+        for region in [
+            "",
+            "us-east",
+            "US-EAST-1",
+            " us-east-1",
+            "us-east-01",
+            "us..east-1",
+            "us-east-1.example.com",
+            "us-east-1@localhost",
+            "us-east-1/path",
+        ] {
+            assert!(kiro_refresh_url(region).is_err(), "accepted {region:?}");
+            assert!(aws_sso_oidc_url(region).is_err(), "accepted {region:?}");
+            assert!(kiro_api_host(region).is_err(), "accepted {region:?}");
+            assert!(kiro_q_host(region, true).is_err(), "accepted {region:?}");
+        }
+    }
 }

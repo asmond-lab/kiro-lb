@@ -90,7 +90,8 @@ async fn ctx(followup: SearchFollowup) -> StreamCtx {
         "us-east-1",
         None,
         http.clone(),
-    );
+    )
+    .unwrap();
     auth.q_host = mcp_server().await;
     StreamCtx {
         model: "claude-sonnet-4.5".into(),

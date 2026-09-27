@@ -4,16 +4,21 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::auth::KiroAuth;
+use crate::auth::{region_from_arn, KiroAuth};
+use crate::config;
 use crate::utils::{ide_user_agent, kiro_headers};
 
-fn region(auth: &KiroAuth) -> String {
+fn region(auth: &KiroAuth) -> Result<String, String> {
     let arn = auth.profile_arn().unwrap_or_default();
     let parts: Vec<&str> = arn.split(':').collect();
-    if parts.len() >= 4 && parts[2] == "codewhisperer" && !parts[3].is_empty() {
-        return parts[3].to_owned();
+    if parts.get(2) == Some(&"codewhisperer") {
+        return region_from_arn(&arn).ok_or_else(|| {
+            "invalid profile ARN region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1".into()
+        });
     }
-    auth.api_region.clone()
+    config::validate_region(&auth.api_region)
+        .map(|_| auth.api_region.clone())
+        .map_err(|e| e.to_string())
 }
 
 async fn management_call(
@@ -24,6 +29,7 @@ async fn management_call(
     mut body: Value,
     extra: &[(&str, &str)],
 ) -> Result<Value, String> {
+    let region = region(auth)?;
     let token = auth.access_token().await.map_err(|e| e.to_string())?;
     let arn = auth.request_profile_arn().or_else(|| auth.profile_arn());
     let mut params: Vec<(String, String)> = vec![("origin".into(), "AI_EDITOR".into())];
@@ -35,7 +41,7 @@ async fn management_call(
         body["profileArn"] = json!(a);
     }
     let mut req = http
-        .post(format!("https://management.{}.kiro.dev/", region(auth)))
+        .post(format!("https://management.{region}.kiro.dev/"))
         .timeout(Duration::from_secs(20))
         .query(&params)
         .json(&body);
@@ -152,4 +158,36 @@ pub async fn fetch_account_usage(
         "nextDateReset": payload.get("nextDateReset").cloned().unwrap_or(Value::Null),
         "daysUntilReset": payload.get("daysUntilReset").cloned().unwrap_or(Value::Null),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Source;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn management_rejects_an_invalid_region_before_refresh_or_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let http = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        let mut auth = KiroAuth::new(
+            Source::File("/nonexistent/region-validation-credentials.json".into()),
+            config::REGION,
+            None,
+            http.clone(),
+        )
+        .unwrap();
+        auth.api_region = "us-east-1/path".into();
+
+        let error = management_call(&auth, &http, "unused", "unused", json!({}), &[])
+            .await
+            .unwrap_err();
+
+        assert!(error.starts_with("invalid region:"));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    }
 }
