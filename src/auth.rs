@@ -394,6 +394,14 @@ impl Creds {
             // Older credential databases have no state table.
             None
         };
+        if profile
+            .as_ref()
+            .and_then(|profile| profile.get("arn"))
+            .is_some_and(|arn| !arn.is_string() && !arn.is_null())
+        {
+            tracing::error!("SQLite profile ARN has an invalid type");
+            return false;
+        }
         if let Some(arn) = profile
             .as_ref()
             .and_then(|p| s(p, "arn"))
@@ -487,7 +495,11 @@ impl KiroAuth {
                 c.replace_document(&store::load_internal_credential(id).unwrap_or(json!({})))
             }
             Source::Sqlite(p) => {
-                c.replace_sqlite(p);
+                if !c.replace_sqlite(p) {
+                    return Err(AuthError::Other(
+                        "could not load SQLite credential source".into(),
+                    ));
+                }
             }
             Source::File(p) => match std::fs::read_to_string(store::expand_home(p))
                 .ok()
@@ -1295,6 +1307,78 @@ mod tests {
         drop(conn);
         assert!(!creds.replace_sqlite(path.to_str().unwrap()));
         assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+        assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+
+        for invalid_arn in [json!(false), json!(7), json!({}), json!([])] {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE state SET value = ?1 WHERE key = 'api.codewhisperer.profile'",
+                [json!({"arn": invalid_arn}).to_string()],
+            )
+            .unwrap();
+            drop(conn);
+            assert!(!creds.replace_sqlite(path.to_str().unwrap()));
+            assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+            assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+            assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+        }
+
+        let (http, listener) = recording_client();
+        let result = KiroAuth::new(
+            Source::Sqlite(path.to_string_lossy().into_owned()),
+            config::REGION,
+            None,
+            http,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthError::Other(message)) if message == "could not load SQLite credential source"
+        ));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE state SET value = ?1 WHERE key = 'api.codewhisperer.profile'",
+            [json!({"arn": null}).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("fresh-access"));
+        assert!(creds.profile_arn.is_none());
+        assert!(creds.detected_api_region.is_none());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE state SET value = ?1 WHERE key = 'api.codewhisperer.profile'",
+            [json!({"arn": old_arn}).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
+        assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE state SET value = '{}' WHERE key = 'api.codewhisperer.profile'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
+        assert!(creds.profile_arn.is_none());
+        assert!(creds.detected_api_region.is_none());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE state SET value = ?1 WHERE key = 'api.codewhisperer.profile'",
+            [json!({"arn": old_arn}).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(creds.replace_sqlite(path.to_str().unwrap()));
         assert_eq!(creds.profile_arn.as_deref(), Some(old_arn));
         assert_eq!(creds.detected_api_region.as_deref(), Some("us-gov-west-1"));
 
