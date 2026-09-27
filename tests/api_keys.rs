@@ -1,6 +1,6 @@
 #[test]
 fn a_failed_insert_returns_an_error_instead_of_an_unusable_key() {
-    let dir = std::env::temp_dir().join(format!("kirolb-keys-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("kirolb-keys-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);
     kiro_lb::store::initialize().unwrap();

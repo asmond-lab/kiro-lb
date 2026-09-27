@@ -1347,6 +1347,10 @@ pub async fn handoff_activate(State(state): State<Shared>, headers: HeaderMap) -
     state
         .quiesced
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    let pool = state.pool.clone();
+    tokio::spawn(async move { pool.warm_up(crate::pool::WARM_UP_ACCOUNT_TIMEOUT).await });
+    let s = state.clone();
+    tokio::spawn(async move { refresh_all_usage(&s).await });
     json_response(200, json!({"ready": true, "state": "active"}))
 }
 
@@ -1357,6 +1361,9 @@ pub async fn handoff_ready(State(state): State<Shared>, headers: HeaderMap) -> R
     if state.quiesced.load(std::sync::atomic::Ordering::SeqCst) || state.pool.accounts().is_empty()
     {
         return detail(503, "slot is not active");
+    }
+    if !state.pool.catalog_ready() {
+        return detail(503, "slot is active but no account has initialized yet");
     }
     json_response(200, json!({"ready": true, "state": "active"}))
 }

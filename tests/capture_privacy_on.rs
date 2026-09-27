@@ -44,13 +44,14 @@ fn bundles(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_live_failed_request_is_captured_and_redacted() {
+async fn content_capture_on_keeps_prompt_text_but_redacts_secrets() {
     let root =
-        std::env::temp_dir().join(format!("kirolb-debugcap-{}", uuid::Uuid::new_v4().simple()));
+        std::env::temp_dir().join(format!("kirolb-privon-{}", uuid::Uuid::new_v4().simple()));
     let debug_dir = root.join("debug");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    std::env::set_var("DEBUG_MODE", "all");
+    std::env::set_var("DEBUG_MODE", "errors");
+    std::env::set_var("DEBUG_CAPTURE_CONTENT", "true");
     std::env::set_var("DEBUG_DIR", &debug_dir);
     std::env::set_var("DASHBOARD_DATA_DIR", &data_dir);
     kiro_lb::store::initialize().unwrap();
@@ -58,11 +59,13 @@ async fn a_live_failed_request_is_captured_and_redacted() {
     let s = state();
     let router = Router::new()
         .route(
-            "/v1/messages",
+            "/v1/responses",
             post(|| async {
                 (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    axum::Json(json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}})),
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(
+                        json!({"error": {"type": "invalid_request_error", "message": "bad"}}),
+                    ),
                 )
                     .into_response()
             }),
@@ -74,26 +77,27 @@ async fn a_live_failed_request_is_captured_and_redacted() {
         .with_state(s);
 
     let body = json!({
-        "model": "claude-sonnet-4",
-        "x-api-key": "klb_ABCDEFGHIJKLMNOP",
-        "metadata": {"note": "klb_ABCDEFGHIJKLMNOP"},
-        "messages": [{"role": "user", "content": "hi"}]
+        "model": "claude-sonnet-4.5",
+        "input": "PRIVATE_INPUT_SENTINEL",
+        "instructions": "PRIVATE_INSTRUCTIONS_SENTINEL",
+        "metadata": {"note": "{\"klb_ABCDEFGHIJKLMNOP\":\"PRIVATE_METADATA_SENTINEL\"}"},
+        "x-api-key": "klb_ABCDEFGHIJKLMNOP"
     });
     let res = router
         .oneshot(
-            Request::post("/v1/messages")
+            Request::post("/v1/responses")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while bundles(&debug_dir).is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -106,9 +110,12 @@ async fn a_live_failed_request_is_captured_and_redacted() {
     let _ = std::fs::remove_dir_all(&root);
 
     assert_eq!(found.len(), 1, "{found:?}");
-    let bundle: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(bundle["status"], 503);
-    assert!(bundle["request"].is_object(), "{bundle}");
-    assert_eq!(bundle["request"]["model"], "claude-sonnet-4");
+    assert!(text.contains("PRIVATE_INPUT_SENTINEL"), "{text}");
+    assert!(text.contains("PRIVATE_INSTRUCTIONS_SENTINEL"), "{text}");
+    assert!(text.contains("PRIVATE_METADATA_SENTINEL"), "{text}");
     assert!(!text.contains("klb_ABCDEFGHIJKLMNOP"), "{text}");
+    let bundle: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(bundle["status"], 400);
+    assert_eq!(bundle["request"]["input"], "PRIVATE_INPUT_SENTINEL");
+    assert_eq!(bundle["request"]["x-api-key"], "[REDACTED]");
 }

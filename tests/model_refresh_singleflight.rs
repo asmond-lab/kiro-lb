@@ -7,7 +7,7 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_expired_cache_readers_share_one_model_refresh() {
-    let dir = std::env::temp_dir().join(format!("kirolb-models-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("kirolb-models-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);
     kiro_lb::store::initialize().unwrap();

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standby_slot_never_refreshes_without_the_lease() {
-    let dir = std::env::temp_dir().join(format!("kirolb-standby-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("kirolb-standby-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);
     std::env::set_var("KIRO_SLOT", "green");

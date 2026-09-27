@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 fn data_dir() -> &'static PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("kirolb-websearch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kirolb-websearch-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("DASHBOARD_DATA_DIR", &dir);
         let creds = dir.join("creds.json");

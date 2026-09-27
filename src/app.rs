@@ -167,6 +167,8 @@ pub async fn data_plane_middleware(
         while let Some(chunk) = stream.next().await {
             if let Ok(b) = &chunk {
                 log.ctx.capture(|c| c.chunk("client", b));
+            } else {
+                log.ctx.stream_failed.store(true, Ordering::SeqCst);
             }
             yield chunk;
         }
@@ -207,9 +209,8 @@ impl RequestLogGuard {
 
     fn stream_failed(&self) -> bool {
         self.ctx
-            .capture
-            .as_ref()
-            .is_some_and(|c| c.lock().client_saw_error())
+            .stream_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -234,13 +235,13 @@ impl Drop for RequestLogGuard {
             generation_ms: u.generation_ms,
             ttft_ms: u.ttft_ms,
         };
-        let capture = self.ctx.capture.take();
         let failed_stream = self.stream_failed();
+        let capture = self.ctx.capture.take();
         let write = move || {
             dashboard_store::record_request(record);
             if let Some(c) = capture {
                 let (code, error) = if failed_stream && status < 400 {
-                    (500, "stream ended with an error event")
+                    (500, "stream failed")
                 } else if status == CLIENT_CLOSED_REQUEST {
                     (status, "client closed the request")
                 } else {

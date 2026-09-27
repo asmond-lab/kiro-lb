@@ -14,7 +14,8 @@ static INIT: Once = Once::new();
 
 fn init() {
     INIT.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("kirolb-reqlog-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("kirolb-reqlog-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("DASHBOARD_DATA_DIR", &dir);
         kiro_lb::store::initialize().unwrap();
