@@ -810,7 +810,7 @@ pub fn build_kiro_payload(
 
     let cfg = config::get();
     let mut serialized = payload_guard::compact_json(&payload);
-    let (tokens, bytes) = payload_guard::measure_text(&serialized);
+    let (tokens, bytes) = payload_guard::measure(&payload);
     let token_cap = cfg.max_payload_tokens.max(0) as usize;
     let byte_cap = (cfg.max_payload_bytes > 0).then_some(cfg.max_payload_bytes as usize);
     let over_tokens = tokens > token_cap;

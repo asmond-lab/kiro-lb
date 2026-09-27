@@ -110,7 +110,9 @@ kiro-lb/
 - Applying the Claude correction coefficient to prompt tokens or to Latin text.
 - Measuring the payload guard as UTF-8 bytes. `CONTENT_LENGTH_EXCEEDS_THRESHOLD`
   tracks cl100k tokens of the compact JSON (claude-opus-5: 800k Hangul pass /
-  1M fail, 2026-08-23).
+  1M fail, 2026-08-23). Image base64 is not part of it: the guard blanks
+  `images[].source.bytes` and adds ceil(w*h/750) per image (capped at 1600),
+  because upstream only enforces its own 5 MiB per-image cap (2026-09-27).
 - Trusting the advertised context window. `claude-opus-4.7`, `-4.8`, `-5`,
   `-5.5` and `claude-sonnet-5` report 1000000 but charge against 666667.
 - Rejecting unknown model names, or suggesting a model from another family.
