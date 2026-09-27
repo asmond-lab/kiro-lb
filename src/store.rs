@@ -593,6 +593,20 @@ pub fn load_internal_credential(account_id: &str) -> Option<Value> {
     raw.flatten().and_then(|s| serde_json::from_str(&s).ok())
 }
 
+pub fn load_internal_credential_for_login(account_id: &str, login_identity: &str) -> Option<Value> {
+    let raw: Option<Option<String>> = with(|c| {
+        c.query_row(
+            "SELECT credential_json FROM account_sources WHERE account_id = ?1 AND login_identity = ?2",
+            params![account_id, login_identity],
+            |r| r.get(0),
+        )
+        .optional()
+    })
+    .ok()
+    .flatten();
+    raw.flatten().and_then(|s| serde_json::from_str(&s).ok())
+}
+
 pub fn save_internal_credential(account_id: &str, document: &Value) -> rusqlite::Result<()> {
     let payload = document.to_string();
     with(|c| {

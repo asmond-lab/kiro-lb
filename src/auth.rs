@@ -712,7 +712,11 @@ impl KiroAuth {
                 break lease;
             }
             if tokio::time::Instant::now() >= deadline {
-                self.reload_persisted_for_login();
+                if !self.reload_persisted_for_login() {
+                    return Err(AuthError::Other(
+                        "Credential source changed to a different login".into(),
+                    ));
+                }
                 validate_credential_regions(&self.creds.lock().clone())?;
                 if self.cached_token().is_some() && !self.expired() {
                     return Ok(());
@@ -725,7 +729,11 @@ impl KiroAuth {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         async {
-            self.reload_persisted_for_login();
+            if !self.reload_persisted_for_login() {
+                return Err(AuthError::Other(
+                    "Credential source changed to a different login".into(),
+                ));
+            }
             validate_credential_regions(&self.creds.lock().clone())?;
             let renewed_elsewhere = self.cached_token() != previous;
             if self.cached_token().is_some()
@@ -741,13 +749,12 @@ impl KiroAuth {
 
     async fn refresh_request(&self) -> Result<(), AuthError> {
         if let Source::Internal(id) = &self.source {
-            let doc = store::load_internal_credential(id)
-                .ok_or_else(|| AuthError::Other(format!("Unknown internal account: {id}")))?;
-            if !self.is_current_login() {
-                return Err(AuthError::Other(
-                    "Credential source changed to a different login".into(),
-                ));
-            }
+            let identity = self.login_identity.as_deref().ok_or_else(|| {
+                AuthError::Other("Credential login identity is unavailable".into())
+            })?;
+            let doc = store::load_internal_credential_for_login(id, identity).ok_or_else(|| {
+                AuthError::Other("Credential source changed to a different login".into())
+            })?;
             let mut fresh = Creds::default();
             fresh.load_document(&doc);
             *self.source_fingerprint.lock() = source_fingerprint(&fresh);
@@ -781,18 +788,28 @@ impl KiroAuth {
         true
     }
 
-    fn reload_persisted_for_login(&self) {
+    fn reload_persisted_for_login(&self) -> bool {
         match &self.source {
-            Source::Internal(id) if self.is_current_login() => {
-                if let Some(doc) = store::load_internal_credential(id) {
+            Source::Internal(id) => {
+                if let Some(doc) = self
+                    .login_identity
+                    .as_deref()
+                    .and_then(|identity| store::load_internal_credential_for_login(id, identity))
+                {
                     let mut fresh = Creds::default();
                     fresh.load_document(&doc);
                     *self.source_fingerprint.lock() = source_fingerprint(&fresh);
                     *self.creds.lock() = fresh;
+                    true
+                } else {
+                    false
                 }
             }
-            Source::File(_) | Source::Sqlite(_) => self.apply_overlay(),
-            Source::Internal(_) => {}
+            Source::File(_) | Source::Sqlite(_) if self.is_current_login() => {
+                self.apply_overlay();
+                true
+            }
+            Source::File(_) | Source::Sqlite(_) => false,
         }
     }
 
