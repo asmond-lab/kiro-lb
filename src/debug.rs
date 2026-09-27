@@ -81,7 +81,7 @@ fn patterns() -> &'static [Regex] {
             r"\baoa[A-Za-z0-9_\-]{20,}",
             r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}",
             r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-            r"(?i)[?&](?:key|token|signature|credential)=[^&#\s]+",
+            r#"(?i)[?&](?:key|token|signature|credential)=[^&#\s"'<>\\{}\[\],]+"#,
             r"arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile/[A-Za-z0-9]+",
         ]
         .iter()
@@ -120,46 +120,80 @@ fn is_binary(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b))
 }
 
+/// Overall nesting budget, shared across JSON documents decoded from
+/// strings, so a string that wraps JSON inside JSON cannot recurse without
+/// bound. Deeper values are replaced wholesale.
+const MAX_SANITIZE_DEPTH: usize = 64;
+
 pub fn sanitize(v: &Value, keep_content: bool) -> Value {
-    sanitize_at(v, keep_content, None)
+    sanitize_at(v, keep_content, None, 0)
 }
 
-fn sanitize_at(v: &Value, keep_content: bool, key: Option<&str>) -> Value {
+fn sanitize_at(v: &Value, keep_content: bool, key: Option<&str>, depth: usize) -> Value {
     let normalized = key.map(normalize_key).unwrap_or_default();
     if key.is_some_and(is_sensitive) {
         return json!("[REDACTED]");
     }
+    if depth >= MAX_SANITIZE_DEPTH {
+        return json!("[REDACTED_DEPTH]");
+    }
     match v {
         Value::Object(m) => Value::Object(
             m.iter()
-                .map(|(k, x)| (k.clone(), sanitize_at(x, keep_content, Some(k))))
+                .map(|(k, x)| {
+                    (
+                        redact_patterns(k),
+                        sanitize_at(x, keep_content, Some(k), depth + 1),
+                    )
+                })
                 .collect(),
         ),
         Value::Array(a) => Value::Array(
             a.iter()
-                .map(|x| sanitize_at(x, keep_content, key))
+                .map(|x| sanitize_at(x, keep_content, key, depth + 1))
                 .collect(),
         ),
         Value::String(s) => {
             if is_binary(s) && matches!(normalized.as_str(), "data" | "bytes") {
                 return json!("[REDACTED_BINARY]");
             }
-            if let Ok(inner @ (Value::Object(_) | Value::Array(_))) =
-                serde_json::from_str::<Value>(s)
-            {
-                return json!(
-                    serde_json::to_string(&sanitize_at(&inner, keep_content, None))
-                        .unwrap_or_default()
-                );
+            let structural = STRUCTURAL_KEYS.contains(&normalized.as_str());
+            if !keep_content && !structural {
+                return redacted_text(s);
             }
-            if keep_content || STRUCTURAL_KEYS.contains(&normalized.as_str()) {
-                json!(redact_patterns(s))
-            } else {
-                redacted_text(s)
+            if keep_content {
+                if let Ok(inner @ (Value::Object(_) | Value::Array(_))) =
+                    serde_json::from_str::<Value>(s)
+                {
+                    return json!(serde_json::to_string(&sanitize_at(
+                        &inner,
+                        keep_content,
+                        None,
+                        depth + 1
+                    ))
+                    .unwrap_or_default());
+                }
             }
+            json!(redact_patterns(s))
         }
         other => other.clone(),
     }
+}
+
+/// Sanitizes a capture bundle for export while keeping its replay schema:
+/// record discriminators and the base64 SSE payloads stay intact, and the
+/// request fields get the content-off rule.
+pub fn sanitize_bundle(bundle: &Value) -> Value {
+    let mut out = bundle.clone();
+    for key in ["request", "kiroRequest"] {
+        if let Some(v) = bundle.get(key) {
+            out[key] = sanitize(v, false);
+        }
+    }
+    if let Some(e) = bundle.get("error").and_then(Value::as_str) {
+        out["error"] = sanitize_error(e, false);
+    }
+    out
 }
 
 /// Error strings can quote upstream bodies that echo the prompt, so they get
@@ -211,19 +245,6 @@ impl Capture {
         if self.room(data.len()) {
             self.chunks.push((kind.to_owned(), data.to_vec()));
         }
-    }
-
-    /// True when the bytes sent to the client carry a protocol error event,
-    /// so a stream that failed after its 200 headers is still captured.
-    pub fn client_saw_error(&self) -> bool {
-        self.chunks.iter().any(|(k, d)| {
-            k == "client" && {
-                let t = String::from_utf8_lossy(d);
-                t.contains("event: error")
-                    || t.contains("response.failed")
-                    || t.contains("\"error\":{")
-            }
-        })
     }
 
     pub fn flush(&self, status: u16, error: &str) {
@@ -390,7 +411,7 @@ pub fn replay_cli(args: &[String]) -> i32 {
                 let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
                 let _ = std::fs::write(
                     out,
-                    serde_json::to_vec_pretty(&sanitize(&v, false)).unwrap_or_default(),
+                    serde_json::to_vec_pretty(&sanitize_bundle(&v)).unwrap_or_default(),
                 );
                 println!("exported sanitized fixture to {out}");
             }
@@ -477,8 +498,8 @@ mod tests {
     #[test]
     fn json_encoded_strings_are_sanitized_inside() {
         let v = json!({"arguments": "{\"query\":\"PRIVATE_A\",\"token\":\"x\"}"});
-        let s = sanitize(&v, false);
-        assert!(sentinels(&s).is_empty());
+        assert!(sentinels(&sanitize(&v, false)).is_empty());
+        let s = sanitize(&v, true);
         let inner: Value = serde_json::from_str(s["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(inner["token"], "[REDACTED]");
     }

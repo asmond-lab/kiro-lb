@@ -207,9 +207,8 @@ impl RequestLogGuard {
 
     fn stream_failed(&self) -> bool {
         self.ctx
-            .capture
-            .as_ref()
-            .is_some_and(|c| c.lock().client_saw_error())
+            .stream_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

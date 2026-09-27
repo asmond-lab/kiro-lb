@@ -31,6 +31,10 @@ pub struct RequestCtx {
     pub account_id: Arc<Mutex<Option<String>>>,
     pub usage: Arc<Mutex<RequestUsage>>,
     pub capture: Option<Arc<Mutex<crate::debug::Capture>>>,
+    /// Set by the SSE wrapper when a stream that already sent 200 headers ends
+    /// with a protocol failure, so telemetry classifies it without parsing
+    /// model-generated text.
+    pub stream_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RequestCtx {

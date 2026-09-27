@@ -332,6 +332,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                 account_id,
                 model,
                 Protocol::Anthropic,
+                &plan.ctx,
             ))
         }
         Protocol::Anthropic => match stream_anthropic::collect(events, sctx).await {
@@ -373,9 +374,17 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                         account_id,
                         model,
                         Protocol::OpenAI,
+                        &plan.ctx,
                     ));
                 }
-                Attempt::Done(sse_response(s, pool, account_id, model, Protocol::OpenAI))
+                Attempt::Done(sse_response(
+                    s,
+                    pool,
+                    account_id,
+                    model,
+                    Protocol::OpenAI,
+                    &plan.ctx,
+                ))
             } else {
                 match stream_openai::collect(events, sctx, opts, strip_fence).await {
                     Ok(v) => {
@@ -578,8 +587,11 @@ fn sse_response(
     account_id: String,
     model: String,
     protocol: Protocol,
+    request: &RequestCtx,
 ) -> Response {
+    let failed = request.stream_failed.clone();
     let body = sse_body(s, protocol == Protocol::Anthropic, move |ok| {
+        failed.store(!ok, std::sync::atomic::Ordering::SeqCst);
         if ok {
             pool.report_success(&account_id, &model);
             tracing::info!("HTTP 200 - {model} (streaming) - completed");

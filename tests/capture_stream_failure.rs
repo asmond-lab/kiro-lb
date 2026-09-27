@@ -1,11 +1,14 @@
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::Extension;
 use axum::Router;
 use kiro_lb::app::{self, AppState, Shared};
 use kiro_lb::pool::AccountManager;
+use kiro_lb::stream_core::StreamError;
 use kiro_lb::upstream::http::Transport;
+use kiro_lb::usage_tracking::RequestCtx;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -43,16 +46,18 @@ fn bundles(dir: &PathBuf) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn sse(chunks: Vec<&'static str>) -> Response {
-    let stream = futures_util::stream::iter(
-        chunks
-            .into_iter()
-            .map(|c| Ok::<Bytes, std::io::Error>(Bytes::from_static(c.as_bytes()))),
-    );
+type Chunks =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>>;
+
+fn sse(ctx: RequestCtx, chunks: Chunks, anthropic: bool) -> Response {
+    let failed = ctx.stream_failed.clone();
+    let body = kiro_lb::routes_v1::sse_body(chunks, anthropic, move |ok| {
+        failed.store(!ok, std::sync::atomic::Ordering::SeqCst)
+    });
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/event-stream")],
-        Body::from_stream(stream),
+        Body::from_stream(body),
     )
         .into_response()
 }
@@ -94,21 +99,23 @@ async fn a_stream_failing_after_200_is_captured_in_errors_mode() {
     let router = Router::new()
         .route(
             "/v1/messages",
-            post(|| async {
-                sse(vec![
-                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4.5\"}}\n\n",
-                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}\n\n",
-                ])
+            post(|Extension(ctx): Extension<RequestCtx>| async move {
+                let chunks: Chunks = Box::pin(futures_util::stream::iter(vec![
+                    Ok("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4.5\"}}\n\n".to_owned()),
+                    Err(StreamError::UpstreamStatus(429)),
+                ]));
+                sse(ctx, chunks, true)
             }),
         )
         .route(
             "/v1/chat/completions",
-            post(|| async {
-                sse(vec![
-                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n",
-                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                    "data: [DONE]\n\n",
-                ])
+            post(|Extension(ctx): Extension<RequestCtx>| async move {
+                let chunks: Chunks = Box::pin(futures_util::stream::iter(vec![
+                    Ok("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"The response.failed event and event: error mean a failed response.\"}}]}\n\n".to_owned()),
+                    Ok("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_owned()),
+                    Ok("data: [DONE]\n\n".to_owned()),
+                ]));
+                sse(ctx, chunks, false)
             }),
         )
         .layer(axum::middleware::from_fn_with_state(
