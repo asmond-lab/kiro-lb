@@ -193,7 +193,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     let body = Bytes::from(built.serialized.clone());
     let result = state
         .transport
-        .generate(&auth, body.clone(), &model_id, true, false)
+        .generate(&account.id, &auth, body.clone(), &model_id, true, false)
         .await;
     let response = match result {
         Ok(r) => r,
@@ -280,9 +280,9 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     }
     let input_tokens = built.input_tokens as i64;
     let followup: Option<SearchFollowup> = (plan.protocol == Protocol::Anthropic).then(|| {
-        let (state, plan, auth, cid, arn) = (state.clone(), plan.clone(), auth.clone(), conversation_id.clone(), arn.clone());
+        let (state, plan, account_id, auth, cid, arn) = (state.clone(), plan.clone(), account.id.clone(), auth.clone(), conversation_id.clone(), arn.clone());
         let f: SearchFollowup = Arc::new(move |tool_id: String, query: String, content: String| {
-            let (state, plan, auth, cid, arn) = (state.clone(), plan.clone(), auth.clone(), cid.clone(), arn.clone());
+            let (state, plan, account_id, auth, cid, arn) = (state.clone(), plan.clone(), account_id.clone(), auth.clone(), cid.clone(), arn.clone());
             Box::pin(async move {
                 let mut req = plan.req.clone();
                 let msgs = req["messages"].as_array_mut().ok_or(StreamError::Protocol("web_search follow-up has no messages"))?;
@@ -293,7 +293,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                     .map_err(|_| StreamError::Protocol("web_search follow-up build panicked"))?
                     .map_err(|e| StreamError::Upstream(format!("web_search follow-up could not be built: {e}")))?;
                 let model = built.payload.pointer("/conversationState/currentMessage/userInputMessage/modelId").and_then(Value::as_str).unwrap_or("").to_owned();
-                match state.transport.generate(&auth, Bytes::from(built.serialized), &model, true, false).await {
+                match state.transport.generate(&account_id, &auth, Bytes::from(built.serialized), &model, true, false).await {
                     Ok(r) if r.status == 200 => Ok(events_of(r, &plan.ctx)),
                     Ok(r) => Err(StreamError::UpstreamStatus(r.status)),
                     Err(e) => Err(StreamError::Upstream(e.to_string())),
@@ -313,6 +313,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     };
     let retry = Retry {
         state: state.clone(),
+        account_id: account.id.clone(),
         auth: auth.clone(),
         body,
         model_id,
@@ -434,6 +435,7 @@ fn events_of(r: UpstreamResponse, ctx: &RequestCtx) -> EventStream {
 
 struct Retry {
     state: Shared,
+    account_id: String,
     auth: Arc<crate::auth::KiroAuth>,
     body: Bytes,
     model_id: String,
@@ -453,6 +455,7 @@ fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
                     .state
                     .transport
                     .generate(
+                        &retry.account_id,
                         &retry.auth,
                         retry.body.clone(),
                         &retry.model_id,

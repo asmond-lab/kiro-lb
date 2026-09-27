@@ -675,14 +675,14 @@ impl Transport {
 
     pub async fn generate(
         &self,
+        account_id: &str,
         auth: &KiroAuth,
         body: Bytes,
         model: &str,
         stream: bool,
         retry_rate_limits: bool,
     ) -> Result<UpstreamResponse, TransportError> {
-        let account_key = auth.profile_arn().unwrap_or_else(|| "default".into());
-        let permits = concurrency_slot(&account_key).await?;
+        let permits = concurrency_slot(account_id).await?;
         let s = settings::endpoint_settings();
         let result = if !s.rotation {
             self.through_proxies(

@@ -594,9 +594,10 @@ impl AccountManager {
             return;
         }
         let Some(auth) = a.auth() else { return };
+        let refresh_revision = a.models.refresh_revision();
         let refreshed = fetch(auth).await;
         match refreshed {
-            Some(m) => a.models.update(m),
+            Some(m) => a.models.update_after_refresh(m, refresh_revision),
             None => a.models.seed_fallback(),
         }
         a.state.lock().models_cached_at = store::now_f64();
@@ -723,17 +724,22 @@ impl AccountManager {
                 .position(|a| a.id == id && a.models.support(model) != ModelSupport::Unsupported)
                 .map(|index| accounts.remove(index))
         });
+        let pinned = pinned.and_then(|a| {
+            if crate::upstream::http::account_concurrency_load(&a.id)
+                .is_none_or(|(held, limit)| held < limit)
+            {
+                Some(a)
+            } else {
+                accounts.push(a);
+                None
+            }
+        });
         accounts.sort_by_key(|a| {
             let support = a.models.support(model);
-            let load = a
-                .auth()
-                .and_then(|auth| {
-                    let key = auth.profile_arn().unwrap_or_else(|| "default".into());
-                    crate::upstream::http::account_concurrency_load(&key)
-                })
+            let load = crate::upstream::http::account_concurrency_load(&a.id)
                 .map(|(held, limit)| (held >= limit, held))
                 .unwrap_or((false, 0));
-            (support, load)
+            (load.0, support, load.1)
         });
         if let Some(pinned) = pinned {
             accounts.insert(0, pinned);

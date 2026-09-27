@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -108,8 +108,9 @@ struct ModelInfoState {
     models: HashMap<String, Value>,
     refreshed_at: Option<Instant>,
     authoritative: bool,
-    confirmed: HashSet<String>,
-    rejected: HashSet<String>,
+    observation_revision: u64,
+    confirmed: HashMap<String, u64>,
+    rejected: HashMap<String, u64>,
 }
 
 /// Model metadata and observed capability evidence, shared per account.
@@ -124,6 +125,18 @@ impl ModelInfoCache {
     }
 
     pub fn update(&self, models: Vec<Value>) {
+        self.update_after(models, None);
+    }
+
+    pub(crate) fn refresh_revision(&self) -> u64 {
+        self.inner.read().observation_revision
+    }
+
+    pub(crate) fn update_after_refresh(&self, models: Vec<Value>, revision: u64) {
+        self.update_after(models, Some(revision));
+    }
+
+    fn update_after(&self, models: Vec<Value>, preserve_after: Option<u64>) {
         tracing::info!("Updating model cache. Found {} models.", models.len());
         let map = models
             .into_iter()
@@ -134,12 +147,20 @@ impl ModelInfoCache {
                     .map(|id| (id, m.clone()))
             })
             .collect();
-        *self.inner.write() = ModelInfoState {
-            models: map,
-            refreshed_at: Some(Instant::now()),
-            authoritative: true,
-            ..Default::default()
-        };
+        let mut state = self.inner.write();
+        state.models = map;
+        state.refreshed_at = Some(Instant::now());
+        state.authoritative = true;
+        match preserve_after {
+            Some(revision) => {
+                state.confirmed.retain(|_, observed| *observed > revision);
+                state.rejected.retain(|_, observed| *observed > revision);
+            }
+            None => {
+                state.confirmed.clear();
+                state.rejected.clear();
+            }
+        }
     }
 
     pub fn seed_fallback(&self) {
@@ -178,10 +199,10 @@ impl ModelInfoCache {
     pub fn support(&self, external: &str) -> ModelSupport {
         let id = get_model_id_for_kiro(external);
         let state = self.inner.read();
-        if state.confirmed.contains(&id) {
+        if state.confirmed.contains_key(&id) {
             return ModelSupport::Supported;
         }
-        if state.rejected.contains(&id) {
+        if state.rejected.contains_key(&id) {
             return ModelSupport::Unsupported;
         }
         if !state.authoritative
@@ -203,14 +224,18 @@ impl ModelInfoCache {
         let id = get_model_id_for_kiro(external);
         let mut state = self.inner.write();
         state.rejected.remove(&id);
-        state.confirmed.insert(id);
+        state.observation_revision += 1;
+        let revision = state.observation_revision;
+        state.confirmed.insert(id, revision);
     }
 
     pub fn record_unsupported(&self, external: &str) {
         let id = get_model_id_for_kiro(external);
         let mut state = self.inner.write();
         state.confirmed.remove(&id);
-        state.rejected.insert(id);
+        state.observation_revision += 1;
+        let revision = state.observation_revision;
+        state.rejected.insert(id, revision);
     }
 
     /// The window contextUsagePercentage is a percentage of. Five models advertise
@@ -371,5 +396,27 @@ mod tests {
 
         assert_eq!(cache.support("model-a"), ModelSupport::Supported);
         assert_eq!(cache.support("model-b"), ModelSupport::Unsupported);
+    }
+
+    #[test]
+    fn refresh_preserves_only_observations_recorded_after_it_started() {
+        let cache = ModelInfoCache::new();
+        cache.record_supported("old-observation");
+        let revision = cache.refresh_revision();
+        cache.record_supported("omitted-model");
+        cache.record_unsupported("listed-model");
+
+        cache.update_after_refresh(
+            vec![serde_json::json!({"modelId": "listed-model"})],
+            revision,
+        );
+
+        assert_eq!(
+            cache.support("old-observation"),
+            ModelSupport::Unsupported,
+            "fresh catalog evidence must replace observations from before the refresh"
+        );
+        assert_eq!(cache.support("omitted-model"), ModelSupport::Supported);
+        assert_eq!(cache.support("listed-model"), ModelSupport::Unsupported);
     }
 }

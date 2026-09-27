@@ -1,7 +1,10 @@
+use bytes::Bytes;
 use kiro_lb::errors::ErrorType;
 use kiro_lb::pool::AccountManager;
 use kiro_lb::settings;
-use kiro_lb::upstream::http::{account_concurrency_load, concurrency_slot, reset_concurrency};
+use kiro_lb::upstream::http::{
+    account_concurrency_load, concurrency_slot, reset_concurrency, Transport,
+};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +26,21 @@ fn source(id: &str) -> serde_json::Value {
             "accessToken": format!("access-{id}"),
             "expiresAt": "2999-01-01T00:00:00Z",
             "profileArn": profile_arn(id),
+            "region": "us-east-1"
+        }
+    })
+}
+
+fn builder_source(id: &str) -> serde_json::Value {
+    json!({
+        "type": "internal",
+        "id": id,
+        "credential": {
+            "refreshToken": format!("refresh-{id}"),
+            "accessToken": format!("access-{id}"),
+            "expiresAt": "2999-01-01T00:00:00Z",
+            "clientId": format!("client-{id}"),
+            "clientSecret": format!("secret-{id}"),
             "region": "us-east-1"
         }
     })
@@ -76,6 +94,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         source("known-a"),
         source("known-b"),
         source("unknown"),
+        builder_source("builder"),
     ];
     kiro_lb::store::with(|c| kiro_lb::store::replace_account_sources(c, &sources, true)).unwrap();
     kiro_lb::store::save_setting("load_balancing", &json!("session")).unwrap();
@@ -84,11 +103,38 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     reset_concurrency();
 
     let (http, hang_refresh, refresh_blocked) = rejecting_client().await;
-    let pool = AccountManager::new(http);
+    let pool = AccountManager::new(http.clone());
     pool.load_credentials();
-    for id in ["unsupported", "known-a", "known-b", "unknown"] {
+    for id in ["unsupported", "known-a", "known-b", "unknown", "builder"] {
         assert!(pool.initialize_account(id).await, "initialize {id}");
     }
+    pool.get("builder").unwrap().state.lock().suspended_until = f64::MAX;
+
+    let refreshing = pool.get("known-a").unwrap();
+    refreshing.state.lock().models_cached_at = 1.0;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let refresh_pool = pool.clone();
+    let refresh_account = refreshing.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_pool
+            .refresh_models_with(&refresh_account, |_| async move {
+                let _ = started_tx.send(());
+                let _ = finish_rx.await;
+                Some(vec![json!({"modelId": "target-model"})])
+            })
+            .await;
+    });
+    started_rx.await.unwrap();
+    refreshing.models.record_unsupported("target-model");
+    finish_tx.send(()).unwrap();
+    refresh.await.unwrap();
+    assert_eq!(
+        refreshing.models.support("target-model"),
+        kiro_lb::model_resolver::ModelSupport::Unsupported,
+        "a completed refresh must preserve newer request outcome evidence"
+    );
+
     pool.get("unsupported")
         .unwrap()
         .models
@@ -229,9 +275,42 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     );
     pool.get("known-a").unwrap().state.lock().quota_headroom = Some(1.0);
 
-    let known_a_arn = profile_arn("known-a");
-    let held = concurrency_slot(&known_a_arn).await.unwrap();
-    assert_eq!(account_concurrency_load(&known_a_arn), Some((1, 1)));
+    let shared_builder_gate = concurrency_slot("default").await.unwrap();
+    let builder_auth = pool.get("builder").unwrap().auth().unwrap();
+    assert!(builder_auth.profile_arn().is_none());
+    hang_refresh.store(true, Ordering::SeqCst);
+    let generation = tokio::spawn(async move {
+        (Transport {
+            shared: http.clone(),
+        })
+        .generate(
+            "builder",
+            &builder_auth,
+            Bytes::from_static(b"{}"),
+            "target-model",
+            true,
+            false,
+        )
+        .await
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while account_concurrency_load("builder") != Some((1, 1))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        account_concurrency_load("builder"),
+        Some((1, 1)),
+        "a Builder ID generation must acquire capacity under its stable account key"
+    );
+    generation.abort();
+    assert!(matches!(generation.await, Err(e) if e.is_cancelled()));
+    hang_refresh.store(false, Ordering::SeqCst);
+    drop(shared_builder_gate);
+
+    let held = concurrency_slot("known-a").await.unwrap();
+    assert_eq!(account_concurrency_load("known-a"), Some((1, 1)));
     let selected = pool
         .next_account("target-model", &excluded(&["unknown", "unsupported"]), None)
         .await
@@ -241,17 +320,39 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         "a saturated account must not receive new work"
     );
 
-    let waiter_arn = known_a_arn.clone();
-    let waiter = tokio::spawn(async move { concurrency_slot(&waiter_arn).await });
+    let selected = pool
+        .next_account("target-model", &excluded(&["known-b", "unsupported"]), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.id, "unknown",
+        "an idle unknown account must precede a saturated supported account"
+    );
+
+    pool.pin_session(session, "known-a");
+    let selected = pool
+        .next_account(
+            "target-model",
+            &excluded(&["unknown", "unsupported"]),
+            session,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.id, "known-b",
+        "a saturated affinity pin must yield to an idle suitable account"
+    );
+
+    let waiter = tokio::spawn(async move { concurrency_slot("known-a").await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     waiter.abort();
     drop(held);
-    let reacquired = tokio::time::timeout(Duration::from_secs(1), concurrency_slot(&known_a_arn))
+    let reacquired = tokio::time::timeout(Duration::from_secs(1), concurrency_slot("known-a"))
         .await
         .expect("a cancelled waiter must not retain capacity")
         .unwrap();
     drop(reacquired);
-    assert_eq!(account_concurrency_load(&known_a_arn), Some((0, 1)));
+    assert_eq!(account_concurrency_load("known-a"), Some((0, 1)));
 
     pool.report_failure(
         "known-a",
