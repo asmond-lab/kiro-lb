@@ -496,7 +496,7 @@ fn plaintext_loopback_diagnostic_ignores_environment_proxies() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn setup_rejects_empty_model_discovery_without_writing_configuration() {
+fn setup_rejects_unusable_model_discovery_without_writing_configuration() {
     let home = TestHome::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -508,7 +508,7 @@ fn setup_rejects_empty_model_discovery_without_writing_configuration() {
             let body = if index == 0 {
                 r#"{"status":"healthy"}"#
             } else {
-                r#"{"data":[]}"#
+                r#"{"data":[null,{}, {"id":""}, {"id":7}]}"#
             };
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
@@ -518,9 +518,79 @@ fn setup_rejects_empty_model_discovery_without_writing_configuration() {
 
     server.join().unwrap();
     assert!(!output.status.success());
-    assert!(text(&output).contains("returned no models"));
+    assert!(text(&output).contains("returned no usable models"));
     assert!(!home.codex().exists());
     assert!(!home.claude().exists());
+    assert!(!home.state().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn plaintext_setup_rejects_unsafe_inherited_proxy_before_writing() {
+    let home = TestHome::new();
+    let (url, server) = gateway(2);
+    let output = home
+        .command()
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "localhost")
+        .args(["client", "setup", "all", "--base-url", &url])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output).contains("without an unambiguous NO_PROXY/no_proxy"));
+    assert!(!home.codex().exists());
+    assert!(!home.claude().exists());
+    assert!(!home.state().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn plaintext_setup_accepts_proxy_with_matching_bypass() {
+    let home = TestHome::new();
+    let (url, server) = gateway(2);
+    let host = url
+        .strip_prefix("http://")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap();
+    let output = home
+        .command()
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", host)
+        .args(["client", "setup", "all", "--base-url", &url])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(home.codex().exists());
+    assert!(home.claude().exists());
+    assert!(home.state().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn plaintext_setup_honors_preserved_claude_proxy_overrides() {
+    let home = TestHome::new();
+    fs::create_dir(home.path.join(".claude")).unwrap();
+    let original =
+        r#"{"env":{"HTTP_PROXY":"http://127.0.0.1:1","NO_PROXY":"localhost"},"theme":"dark"}"#;
+    fs::write(home.claude(), original).unwrap();
+    let (url, server) = gateway(2);
+    let output = home
+        .command()
+        .env("NO_PROXY", "127.0.0.1")
+        .args(["client", "setup", "claude", "--base-url", &url])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output).contains("claude runtime has an HTTP proxy"));
+    assert_eq!(fs::read_to_string(home.claude()).unwrap(), original);
     assert!(!home.state().exists());
 }
 

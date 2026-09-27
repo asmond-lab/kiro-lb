@@ -262,6 +262,7 @@ fn setup(options: Options) -> Result<(), String> {
         .iter()
         .map(|client| plan_install(*client, &options, &key, &state))
         .collect::<Result<_, _>>()?;
+    validate_runtime_proxy(&options, &plans)?;
     for plan in &plans {
         state
             .clients
@@ -390,17 +391,142 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
             .json()
             .await
             .map_err(|_| "gateway model discovery returned malformed JSON".to_owned())?;
-        let count = document
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "gateway model discovery response has no data array".to_owned())?
-            .len();
+        let count = usable_model_count(&document)?;
         if count == 0 {
-            return Err("gateway model discovery returned no models; add a serving account first".into());
+            return Err(
+                "gateway model discovery returned no usable models; add a serving account first"
+                    .into(),
+            );
         }
         println!("Gateway is healthy; authentication succeeded; discovered {count} model(s).");
         println!("Diagnostic complete. No inference request was made.");
         Ok(())
+    })
+}
+
+fn usable_model_count(document: &Value) -> Result<usize, String> {
+    Ok(document
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "gateway model discovery response has no data array".to_owned())?
+        .iter()
+        .filter(|entry| {
+            entry
+                .as_object()
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        })
+        .count())
+}
+
+fn validate_runtime_proxy(options: &Options, plans: &[PlannedWrite]) -> Result<(), String> {
+    if options.base_url.scheme() != "http" {
+        return Ok(());
+    }
+    for client in &options.clients {
+        let configured_env = if *client == ClientKind::Claude {
+            let content = plans
+                .iter()
+                .find(|plan| plan.client == ClientKind::Claude)
+                .expect("Claude plan exists");
+            let document: Value = serde_json::from_str(&content.content)
+                .map_err(|_| "generated Claude Code settings are malformed".to_owned())?;
+            document.get("env").and_then(Value::as_object).cloned()
+        } else {
+            None
+        };
+        validate_client_runtime_proxy(*client, &options.base_url, configured_env.as_ref())?;
+    }
+    Ok(())
+}
+
+fn validate_client_runtime_proxy(
+    client: ClientKind,
+    base_url: &Url,
+    configured_env: Option<&serde_json::Map<String, Value>>,
+) -> Result<(), String> {
+    if base_url.scheme() != "http" {
+        return Ok(());
+    }
+    let proxy_active = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .map(|name| effective_env(name, configured_env))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty());
+    if !proxy_active {
+        return Ok(());
+    }
+
+    let bypasses = ["NO_PROXY", "no_proxy"]
+        .into_iter()
+        .map(|name| effective_env(name, configured_env))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bypass_is_safe = bypasses.iter().any(Option::is_some)
+        && bypasses
+            .iter()
+            .flatten()
+            .all(|value| no_proxy_covers(value, base_url));
+    if bypass_is_safe {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} runtime has an HTTP proxy without an unambiguous NO_PROXY/no_proxy entry for {}; unset the proxy or add this loopback host before setup and when starting the client",
+        client.id(),
+        base_url.host_str().expect("validated base URL")
+    ))
+}
+
+fn effective_env(
+    name: &str,
+    configured_env: Option<&serde_json::Map<String, Value>>,
+) -> Result<Option<String>, String> {
+    if let Some(value) = configured_env.and_then(|env| env.get(name)) {
+        return value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| format!("existing Claude Code {name} setting must be a string"));
+    }
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} must contain valid Unicode text"))
+        }
+    }
+}
+
+fn no_proxy_covers(value: &str, base_url: &Url) -> bool {
+    let host = base_url
+        .host_str()
+        .expect("validated base URL")
+        .trim_matches(['[', ']']);
+    let port = base_url.port_or_known_default();
+    value.split(',').any(|entry| {
+        let entry = entry.trim();
+        if entry == "*" || entry.eq_ignore_ascii_case(host) {
+            return true;
+        }
+        if let Some(bracketed) = entry.strip_prefix('[') {
+            let Some((candidate, suffix)) = bracketed.split_once(']') else {
+                return false;
+            };
+            return candidate.eq_ignore_ascii_case(host)
+                && (suffix.is_empty()
+                    || suffix
+                        .strip_prefix(':')
+                        .and_then(|value| value.parse::<u16>().ok())
+                        == port);
+        }
+        let Some((candidate, candidate_port)) = entry.rsplit_once(':') else {
+            return false;
+        };
+        !candidate.contains(':')
+            && candidate.eq_ignore_ascii_case(host)
+            && candidate_port.parse::<u16>().ok() == port
     })
 }
 
@@ -1871,6 +1997,49 @@ mod tests {
         assert!(normalize_base_url("https://gateway.example:8443").is_ok());
         assert!(normalize_base_url("http://gateway.example:8000").is_err());
         assert!(normalize_base_url("http://192.168.1.10:8000").is_err());
+    }
+
+    #[test]
+    fn model_discovery_counts_only_nonempty_string_ids() {
+        let document = json!({
+            "data": [null, {}, {"id": ""}, {"id": 7}, {"id": "future-model"}]
+        });
+        assert_eq!(usable_model_count(&document).unwrap(), 1);
+        assert_eq!(usable_model_count(&json!({"data": [null, {}]})).unwrap(), 0);
+    }
+
+    #[test]
+    fn proxy_bypass_requires_each_defined_variant_to_cover_the_loopback_host() {
+        let base_url = Url::parse("http://127.0.0.1:8000/").unwrap();
+        let matching = serde_json::Map::from_iter([
+            ("HTTP_PROXY".into(), json!("http://proxy.example")),
+            ("http_proxy".into(), json!("")),
+            ("ALL_PROXY".into(), json!("")),
+            ("all_proxy".into(), json!("")),
+            ("NO_PROXY".into(), json!("localhost,127.0.0.1")),
+            ("no_proxy".into(), json!("127.0.0.1")),
+        ]);
+        assert!(
+            validate_client_runtime_proxy(ClientKind::Claude, &base_url, Some(&matching)).is_ok()
+        );
+
+        let conflicting = serde_json::Map::from_iter([
+            ("HTTP_PROXY".into(), json!("http://proxy.example")),
+            ("http_proxy".into(), json!("")),
+            ("ALL_PROXY".into(), json!("")),
+            ("all_proxy".into(), json!("")),
+            ("NO_PROXY".into(), json!("127.0.0.1")),
+            ("no_proxy".into(), json!("localhost")),
+        ]);
+        assert!(
+            validate_client_runtime_proxy(ClientKind::Claude, &base_url, Some(&conflicting))
+                .is_err()
+        );
+
+        let https = Url::parse("https://gateway.example/").unwrap();
+        assert!(
+            validate_client_runtime_proxy(ClientKind::Claude, &https, Some(&conflicting)).is_ok()
+        );
     }
 
     #[test]

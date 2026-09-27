@@ -96,15 +96,22 @@ other local processes and shell history.
 
 Setup first calls only `GET /health` and authenticated `GET /v1/models`. These
 checks verify reachability, authentication, and model discovery without
-generating tokens. Discovery must return at least one model, so setup also
-detects a gateway with no serving account. Nothing is written if either check
-fails. You can run the same read-only check separately:
+generating tokens. Discovery must return at least one object with a nonempty
+string model ID, so setup also detects a gateway with no serving account.
+Nothing is written if either check fails. You can run the same read-only check
+separately:
 
 ```bash
 kirolb client diagnose --base-url http://127.0.0.1:8000
 ```
 
-Plaintext HTTP is accepted only for `localhost` and loopback IP addresses. Use
+Plaintext HTTP is accepted only for `localhost` and loopback IP addresses. If
+`HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, or `all_proxy` is set, setup also
+requires an unambiguous `NO_PROXY`/`no_proxy` entry for that exact loopback host
+(or `*`) in both the setup environment and the environment used to start the
+client. Preserved Claude Code `env` overrides are included in this check. The
+read-only diagnostic always connects directly for plaintext loopback, so its
+success alone does not prove that a generated client will bypass a proxy. Use
 HTTPS for remote gateways so the bearer key is not sent in cleartext.
 
 For Codex, setup writes the dedicated profile
