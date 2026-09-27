@@ -340,11 +340,15 @@ async fn non_streaming_anthropic_merges_legacy_and_metering_cache_fields() {
     let response = kiro_lb::stream_anthropic::collect(
         events(vec![
             Ok(KiroEvent::Content("answer".into())),
-            Ok(KiroEvent::Usage(json!({"cacheReadInputTokens": 7}))),
+            Ok(KiroEvent::Usage(json!({"cacheCreationInputTokens": 3}))),
             Ok(KiroEvent::Metering(reading(json!({
                 "unit": "credit",
                 "usage": 0.01,
-                "cacheCreationInputTokens": 3
+                "cacheReadInputTokens": 7
+            })))),
+            Ok(KiroEvent::Metering(reading(json!({
+                "unit": "credit",
+                "usage": 0.02
             })))),
             Ok(KiroEvent::ContextUsage(1.0)),
         ]),

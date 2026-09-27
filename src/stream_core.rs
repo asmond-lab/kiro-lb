@@ -249,7 +249,24 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     .push(json!({"type": "tool_use", "tool": t}));
             }
             KiroEvent::Usage(u) if !is_zero(&u) => r.usage = Some(u),
-            KiroEvent::Metering(m) => r.metering = Some(m),
+            KiroEvent::Metering(m) => {
+                let mut raw = m
+                    .raw()
+                    .as_object()
+                    .expect("validated metering event is an object")
+                    .clone();
+                if let Some(previous) = r.metering.take() {
+                    for (key, value) in previous.raw().as_object().into_iter().flatten() {
+                        if !matches!(key.as_str(), "unit" | "unitPlural" | "usage" | "amount") {
+                            raw.entry(key.clone()).or_insert_with(|| value.clone());
+                        }
+                    }
+                }
+                r.metering = Some(
+                    MeteringEvent::parse(Value::Object(raw))
+                        .expect("merged metering event remains valid"),
+                );
+            }
             KiroEvent::ContextUsage(p) => r.context_usage_percentage = Some(p),
             KiroEvent::StopReason(s) if !s.is_empty() => r.stop_reason = Some(s),
             _ => {}
