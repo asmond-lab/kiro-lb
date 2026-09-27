@@ -518,7 +518,7 @@ impl AccountManager {
         match auth.access_token().await {
             Ok(_) => {}
             Err(AuthError::CredentialDead { status, .. }) => {
-                self.report_credential_dead(&id, status);
+                self.commit_credential_dead(a, status);
                 return false;
             }
             Err(e) => {
@@ -872,10 +872,6 @@ impl AccountManager {
         inner.unsaved.push(obs);
     }
 
-    fn record_event(&self, id: &str, outcome: &str) {
-        Self::record_event_locked(&mut self.inner.lock(), id, outcome);
-    }
-
     pub fn report_success(&self, id: &str, model: &str) {
         let Some(a) = self.get(id) else { return };
         self.commit_success(&a, model, None);
@@ -953,6 +949,26 @@ impl AccountManager {
         message: Option<&str>,
     ) {
         let Some(a) = self.get(id) else { return };
+        self.commit_failure(&a, model, error_type, status, reason, message);
+    }
+
+    pub fn commit_failure(
+        &self,
+        a: &Arc<Account>,
+        model: &str,
+        error_type: ErrorType,
+        status: u16,
+        reason: Option<&str>,
+        message: Option<&str>,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&a.id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            return false;
+        }
         let cfg = config::get();
         let now = store::now_f64();
         let outcome = {
@@ -960,20 +976,21 @@ impl AccountManager {
             if reason == Some("INVALID_MODEL_ID") {
                 a.models.record_unsupported(model);
                 s.stats.total += 1;
-                tracing::warn!("Model '{model}' not available on account {id}: status={status}, reason=INVALID_MODEL_ID");
+                tracing::warn!("Model '{model}' not available on account {}: status={status}, reason=INVALID_MODEL_ID", a.id);
                 None
             } else if reason == Some("USER_REQUEST_RATE_EXCEEDED") {
                 s.rate_limited_until = now + cfg.account_rate_limit_cooldown as f64;
                 s.stats.total += 1;
                 s.stats.failed += 1;
-                tracing::warn!("Account {id} rate limited: status={status}, cooldown={} (failures unchanged at {})", format_duration(cfg.account_rate_limit_cooldown as f64), s.failures);
+                tracing::warn!("Account {} rate limited: status={status}, cooldown={} (failures unchanged at {})", a.id, format_duration(cfg.account_rate_limit_cooldown as f64), s.failures);
                 Some("rate_limited")
             } else if is_suspension_error(status, message, reason) {
                 s.suspended_until = now + cfg.account_suspension_quarantine as f64;
                 s.stats.total += 1;
                 s.stats.failed += 1;
                 tracing::error!(
-                    "Account {id} is SUSPENDED upstream: status={status}; excluded for {}",
+                    "Account {} is SUSPENDED upstream: status={status}; excluded for {}",
+                    a.id,
                     format_duration(cfg.account_suspension_quarantine as f64)
                 );
                 Some("suspended")
@@ -982,7 +999,8 @@ impl AccountManager {
                 s.stats.total += 1;
                 s.stats.failed += 1;
                 tracing::warn!(
-                    "Account {id} monthly quota exhausted; excluded for {}",
+                    "Account {} monthly quota exhausted; excluded for {}",
+                    a.id,
                     format_duration((s.quota_exhausted_until - now).max(0.0))
                 );
                 Some("quota_exhausted")
@@ -991,7 +1009,8 @@ impl AccountManager {
                     s.failures += 1;
                     s.last_failure_time = now;
                     tracing::warn!(
-                        "Account {id} failure #{}: status={status}, reason={reason:?}",
+                        "Account {} failure #{}: status={status}, reason={reason:?}",
+                        a.id,
                         s.failures
                     );
                 }
@@ -1001,13 +1020,27 @@ impl AccountManager {
             }
         };
         if let Some(o) = outcome {
-            self.record_event(id, o);
+            Self::record_event_locked(&mut inner, &a.id, o);
         }
+        drop(inner);
         self.mark_dirty();
+        true
     }
 
     pub fn report_credential_dead(&self, id: &str, status: u16) {
         let Some(a) = self.get(id) else { return };
+        self.commit_credential_dead(&a, status);
+    }
+
+    pub fn commit_credential_dead(&self, a: &Arc<Account>, status: u16) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&a.id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            return false;
+        }
         let now = store::now_f64();
         let already = {
             let mut s = a.state.lock();
@@ -1018,10 +1051,12 @@ impl AccountManager {
             already
         };
         if !already {
-            self.record_event(id, "auth_dead");
-            tracing::error!("Account {id} credential is DEAD (HTTP {status} from the auth host); re-register or re-login to restore it.");
+            Self::record_event_locked(&mut inner, &a.id, "auth_dead");
+            tracing::error!("Account {} credential is DEAD (HTTP {status} from the auth host); re-register or re-login to restore it.", a.id);
         }
+        drop(inner);
         self.mark_dirty();
+        true
     }
 
     pub fn set_quota(
@@ -1265,5 +1300,54 @@ mod tests {
         assert_eq!(replacement.state.lock().failures, 0);
         assert_eq!(replacement.models.support("model"), ModelSupport::Supported);
         assert_eq!(pool.session_counts().get("a"), Some(&1));
+    }
+
+    #[test]
+    fn old_failures_cannot_mutate_a_same_id_replacement() {
+        let pool = AccountManager::new(reqwest::Client::new());
+        let old = account("a");
+        let replacement = account("a");
+        replacement.state.lock().failures = 3;
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("a".into());
+            inner.accounts.insert("a".into(), replacement.clone());
+        }
+
+        assert!(!pool.commit_failure(
+            &old,
+            "model",
+            ErrorType::Fatal,
+            400,
+            Some("INVALID_MODEL_ID"),
+            None,
+        ));
+        assert!(!pool.commit_failure(
+            &old,
+            "model",
+            ErrorType::Recoverable,
+            429,
+            Some("USER_REQUEST_RATE_EXCEEDED"),
+            None,
+        ));
+        assert!(!pool.commit_failure(
+            &old,
+            "model",
+            ErrorType::Recoverable,
+            402,
+            Some("MONTHLY_REQUEST_COUNT"),
+            None,
+        ));
+        assert!(!pool.commit_credential_dead(&old, 401));
+
+        let state = replacement.state.lock();
+        assert_eq!(state.failures, 3);
+        assert_eq!(state.rate_limited_until, 0.0);
+        assert_eq!(state.quota_exhausted_until, 0.0);
+        assert_eq!(state.auth_dead_until, 0.0);
+        assert_eq!(state.stats.total, 0);
+        drop(state);
+        assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
+        assert!(pool.inner.lock().observations.is_empty());
     }
 }

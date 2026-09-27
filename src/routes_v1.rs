@@ -198,12 +198,12 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     let response = match result {
         Ok(r) => r,
         Err(TransportError::Auth(AuthError::CredentialDead { status, .. })) => {
-            state.pool.report_credential_dead(&account.id, status);
+            state.pool.commit_credential_dead(&account, status);
             return Attempt::Next { status: 502, message: format!("Account credential rejected by the auth host (HTTP {status}); re-login required.") };
         }
         Err(TransportError::Http { status, detail }) if status == 502 || status == 504 => {
-            state.pool.report_failure(
-                &account.id,
+            state.pool.commit_failure(
+                &account,
                 &plan.model,
                 ErrorType::Recoverable,
                 status,
@@ -223,8 +223,8 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             return Attempt::Done(error_for(plan.protocol, status, detail))
         }
         Err(TransportError::Auth(e)) => {
-            state.pool.report_failure(
-                &account.id,
+            state.pool.commit_failure(
+                &account,
                 &plan.model,
                 ErrorType::Recoverable,
                 502,
@@ -252,8 +252,8 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             ),
         };
         let kind = classify_error(status, reason.as_deref());
-        state.pool.report_failure(
-            &account.id,
+        state.pool.commit_failure(
+            &account,
             &plan.model,
             kind,
             status,
