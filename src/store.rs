@@ -803,6 +803,26 @@ pub fn load_quota_headroom() -> HashMap<String, f64> {
     load_quota_headroom_at(now_f64(), config::get().usage_refresh_interval_seconds)
 }
 
+pub fn load_quota_observed_at() -> HashMap<String, f64> {
+    let now = now_f64();
+    let Some(fresh_after) = quota_fresh_after(now, config::get().usage_refresh_interval_seconds)
+    else {
+        return HashMap::new();
+    };
+    with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT u.account_id, u.updated_at FROM account_usage u
+             JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity
+             WHERE u.error IS NULL AND u.updated_at >= ?1",
+        )?;
+        let rows = stmt.query_map([fresh_after], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as f64))
+        })?;
+        rows.collect()
+    })
+    .unwrap_or_default()
+}
+
 pub fn load_quota_headroom_at(now: f64, refresh_interval: i64) -> HashMap<String, f64> {
     let Some(fresh_after) = quota_fresh_after(now, refresh_interval) else {
         return HashMap::new();

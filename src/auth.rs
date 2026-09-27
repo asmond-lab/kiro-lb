@@ -650,10 +650,20 @@ impl KiroAuth {
     }
 
     pub async fn access_token(&self) -> Result<String, AuthError> {
+        if !self.is_current_login() {
+            return Err(AuthError::Other(
+                "Credential source changed to a different login".into(),
+            ));
+        }
         if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
             return Ok(t);
         }
         let _guard = self.refresh_lock.lock().await;
+        if !self.is_current_login() {
+            return Err(AuthError::Other(
+                "Credential source changed to a different login".into(),
+            ));
+        }
         if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
             return Ok(t);
         }

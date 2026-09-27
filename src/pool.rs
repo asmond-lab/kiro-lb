@@ -53,6 +53,7 @@ pub struct AccountState {
     pub auth_dead_until: f64,
     pub models_cached_at: f64,
     pub quota_headroom: Option<f64>,
+    pub quota_observed_at: f64,
     pub quota_resets_at: f64,
     pub quota_overage_enabled: Option<bool>,
     pub stats: AccountStats,
@@ -76,9 +77,24 @@ impl Account {
 }
 
 pub fn is_quota_depleted(s: &AccountState, now: f64) -> bool {
-    s.quota_headroom.is_some_and(|h| h <= 0.0)
+    quota_depleted_at(s, now, config::get().usage_refresh_interval_seconds)
+}
+
+fn quota_depleted_at(s: &AccountState, now: f64, refresh_interval: i64) -> bool {
+    effective_quota_headroom(s, now, refresh_interval).is_some_and(|h| h <= 0.0)
         && s.quota_overage_enabled == Some(false)
-        && s.quota_resets_at > now
+}
+
+fn effective_quota_headroom(s: &AccountState, now: f64, refresh_interval: i64) -> Option<f64> {
+    if refresh_interval <= 0
+        || s.quota_observed_at <= 0.0
+        || s.quota_observed_at < now - refresh_interval.max(60) as f64 * 2.0
+        || (s.quota_resets_at > 0.0 && s.quota_resets_at <= now)
+    {
+        return None;
+    }
+    let headroom = s.quota_headroom?;
+    Some(headroom)
 }
 
 fn cooling_remaining(s: &AccountState, now: f64) -> f64 {
@@ -379,7 +395,16 @@ impl AccountManager {
         let now = store::now_f64();
         let headroom = store::load_quota_headroom();
         let period = store::load_quota_period();
+        let observed = store::load_quota_observed_at();
         let inner = self.inner.lock();
+        for (id, observed_at) in observed {
+            if let Some(a) = inner.accounts.get(&id) {
+                let mut state = a.state.lock();
+                if state.login_identity.as_deref() == store::login_identity(&id).as_deref() {
+                    state.quota_observed_at = observed_at;
+                }
+            }
+        }
         for (id, h) in headroom {
             if let Some(a) = inner.accounts.get(&id) {
                 let mut state = a.state.lock();
@@ -678,9 +703,9 @@ impl AccountManager {
         self.mark_dirty();
     }
 
-    fn routing_weight(s: &AccountState) -> f64 {
+    fn routing_weight_at(s: &AccountState, now: f64, refresh_interval: i64) -> f64 {
         let cfg = config::get();
-        match s.quota_headroom {
+        match effective_quota_headroom(s, now, refresh_interval) {
             None => cfg.unknown_quota_weight.max(config::MINIMUM_ROUTING_WEIGHT),
             Some(h) if h <= 0.0 => cfg
                 .depleted_quota_weight
@@ -691,6 +716,8 @@ impl AccountManager {
 
     fn candidate_order(&self, session: Option<u64>) -> Vec<Arc<Account>> {
         let mut inner = self.inner.lock();
+        let now = store::now_f64();
+        let refresh_interval = config::get().usage_refresh_interval_seconds;
         let ids = inner.order.clone();
         if ids.is_empty() {
             return vec![];
@@ -709,7 +736,7 @@ impl AccountManager {
                     let w = inner
                         .accounts
                         .get(id)
-                        .map(|a| Self::routing_weight(&a.state.lock()))
+                        .map(|a| Self::routing_weight_at(&a.state.lock(), now, refresh_interval))
                         .unwrap_or(config::MINIMUM_ROUTING_WEIGHT);
                     let e: f64 = -(1.0 - rng.gen::<f64>()).ln();
                     (e / w, id.clone())
@@ -727,12 +754,12 @@ impl AccountManager {
                 let wa = inner
                     .accounts
                     .get(a)
-                    .map(|x| Self::routing_weight(&x.state.lock()))
+                    .map(|x| Self::routing_weight_at(&x.state.lock(), now, refresh_interval))
                     .unwrap_or(0.0);
                 let wb = inner
                     .accounts
                     .get(b)
-                    .map(|x| Self::routing_weight(&x.state.lock()))
+                    .map(|x| Self::routing_weight_at(&x.state.lock(), now, refresh_interval))
                     .unwrap_or(0.0);
                 wb.total_cmp(&wa)
             });
@@ -1059,13 +1086,20 @@ impl AccountManager {
         if s.login_identity.as_deref() != Some(login_identity) {
             return;
         }
+        let now = store::now_f64();
         s.quota_headroom = headroom.map(|h| h.clamp(0.0, 1.0));
+        s.quota_observed_at = if headroom.is_some() || resets_at.is_some() || overage.is_some() {
+            now
+        } else {
+            0.0
+        };
         s.quota_resets_at = resets_at
-            .filter(|r| r.is_finite() && *r > store::now_f64())
+            .filter(|r| r.is_finite() && *r > now)
             .unwrap_or(0.0);
         s.quota_overage_enabled = overage;
         if resets_at.is_some() && s.quota_resets_at == 0.0 {
             s.quota_headroom = None;
+            s.quota_observed_at = 0.0;
             s.quota_overage_enabled = None;
         }
     }
@@ -1229,4 +1263,70 @@ pub fn session_key(system: &str, first_user: &str) -> Option<u64> {
         .chain_update(first_user.as_bytes())
         .finalize();
     Some(u64::from_be_bytes(digest[..8].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn quota_evidence_expires_at_reset_and_after_two_polling_intervals() {
+        let cfg = config::get();
+        let interval = 60;
+        let now = 10_000.0;
+        let mut state = AccountState {
+            quota_headroom: Some(0.0),
+            quota_observed_at: now,
+            quota_resets_at: now + 1.0,
+            quota_overage_enabled: Some(false),
+            ..Default::default()
+        };
+        let depleted_weight = cfg
+            .depleted_quota_weight
+            .max(config::MINIMUM_ROUTING_WEIGHT);
+        let unknown_weight = cfg.unknown_quota_weight.max(config::MINIMUM_ROUTING_WEIGHT);
+
+        assert!(quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            depleted_weight
+        );
+
+        state.quota_resets_at = now;
+        assert!(!quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            unknown_weight
+        );
+
+        state.quota_resets_at = now + 60.0;
+        state.quota_observed_at = now - interval.max(60) as f64 * 2.0;
+        assert!(quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            depleted_weight
+        );
+
+        state.quota_observed_at -= 0.001;
+        assert!(!quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            unknown_weight
+        );
+
+        state.quota_resets_at = 0.0;
+        state.quota_observed_at = now;
+        assert!(quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            depleted_weight
+        );
+
+        state.quota_observed_at = now - interval.max(60) as f64 * 2.0 - 0.001;
+        assert!(!quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            unknown_weight
+        );
+    }
 }

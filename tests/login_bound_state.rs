@@ -249,6 +249,7 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     assert!(!store::load_quota_period_at(now, 60).contains_key("same"));
     let mut quota_state = kiro_lb::pool::AccountState {
         quota_headroom: Some(0.0),
+        quota_observed_at: now,
         quota_overage_enabled: Some(false),
         quota_resets_at: now - 1.0,
         ..Default::default()
@@ -295,6 +296,9 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         .to_string(),
     )
     .unwrap();
+    assert!(
+        matches!(external_a.access_token().await, Err(kiro_lb::auth::AuthError::Other(ref message)) if message.contains("different login"))
+    );
     let external_b =
         KiroAuth::new(Source::File(external_id), "us-east-1", None, http.clone()).unwrap();
     assert_ne!(
