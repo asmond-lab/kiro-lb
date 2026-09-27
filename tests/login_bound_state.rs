@@ -47,9 +47,27 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         "raw-a",
     );
     std::fs::write(&file, file_a.to_string()).unwrap();
+    let expanded_dir = dir.join("expanded");
+    std::fs::create_dir_all(&expanded_dir).unwrap();
+    let expanded_file = expanded_dir.join("child.json");
+    std::fs::write(
+        &expanded_file,
+        credential(
+            "arn:aws:codewhisperer:us-east-1:333:profile/expanded",
+            "expanded-refresh",
+            "expanded-access",
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let expanded_id = std::fs::canonicalize(&expanded_file)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let entries = vec![
         json!({"type": "internal", "id": "same", "credential": credential("arn:aws:codewhisperer:us-east-1:111:profile/a", "refresh-a", "access-a")}),
         json!({"type": "json", "path": file}),
+        json!({"type": "json", "path": expanded_dir}),
         json!({"type": "internal", "id": "missing", "credential": {"refreshToken": "missing-a", "accessToken": "missing-access-a", "expiresAt": "2999-01-01T00:00:00Z", "region": "us-east-1"}}),
         json!({"type": "internal", "id": "builder", "credential": {"refreshToken": "builder-a", "accessToken": "builder-access-a", "expiresAt": "2999-01-01T00:00:00Z", "region": "us-east-1", "clientId": "builder-registration", "clientSecret": "secret"}}),
         json!({"type": "internal", "id": "stale-refresh", "credential": {"profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/a", "refreshToken": "stale-refresh-a", "accessToken": "expired-a", "expiresAt": "2000-01-01T00:00:00Z", "region": "us-east-1"}}),
@@ -60,6 +78,27 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     let pool = AccountManager::new(http.clone());
     pool.load_credentials();
     pool.load_state();
+    let expanded_identity = store::login_identity(&expanded_id).unwrap();
+    assert_eq!(
+        pool.get(&expanded_id)
+            .unwrap()
+            .state
+            .lock()
+            .login_identity
+            .as_deref(),
+        Some(expanded_identity.as_str())
+    );
+    assert!(dashboard_store::save_account_usage(
+        &expanded_id,
+        &expanded_identity,
+        &json!({"currentUsage": 10.0, "usageLimit": 100.0, "nextDateReset": store::now_f64() + 3600.0}),
+    ));
+    store::with(|c| store::replace_account_sources(c, &entries, true)).unwrap();
+    assert_eq!(
+        store::login_identity(&expanded_id).as_deref(),
+        Some(expanded_identity.as_str())
+    );
+    assert_eq!(store::load_account_sources().len(), entries.len());
     let account = pool.get("same").unwrap();
     let auth_a = Arc::new(
         KiroAuth::new(
@@ -83,7 +122,7 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     assert!(dashboard_store::save_account_usage(
         "same",
         &identity_a,
-        &json!({"currentUsage": 100.0, "usageLimit": 100.0, "nextDateReset": future_reset, "overageStatus": "DISABLED"}),
+        &json!({"email": "a@example.invalid", "subscriptionTitle": "A plan", "currentUsage": 100.0, "usageLimit": 100.0, "nextDateReset": future_reset, "overageStatus": "DISABLED"}),
     ));
     let same_restart = AccountManager::new(http.clone());
     same_restart.load_credentials();
@@ -151,6 +190,17 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         assert_eq!(replacement_state.quota_headroom, None);
     }
     assert!(dashboard_store::cached_usage("same").is_null());
+    assert!(dashboard_store::save_account_usage_error(
+        "same",
+        &identity_b,
+        "replacement offline"
+    ));
+    let replacement_error = dashboard_store::cached_usage("same");
+    assert_eq!(replacement_error["error"], "replacement offline");
+    assert!(replacement_error["email"].is_null());
+    assert!(replacement_error["subscriptionTitle"].is_null());
+    assert!(replacement_error["currentUsage"].is_null());
+    assert!(replacement_error["usageLimit"].is_null());
 
     assert!(dashboard_store::save_account_usage(
         "same",

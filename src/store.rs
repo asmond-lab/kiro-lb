@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -428,6 +428,7 @@ pub fn load_account_sources_in(conn: &Connection) -> rusqlite::Result<Vec<Value>
     Ok(rows
         .flatten()
         .filter_map(|s| serde_json::from_str(&s).ok())
+        .filter(|entry: &Value| entry.get("_kiroLbExpanded").and_then(Value::as_bool) != Some(true))
         .collect())
 }
 
@@ -502,25 +503,46 @@ pub fn replace_account_sources(
     if !ungated {
         require_runtime_writer(conn)?;
     }
-    let existing: HashMap<String, (Option<String>, Option<String>, Option<String>)> = {
+    let existing: HashMap<String, (Option<String>, Option<String>, Option<String>, String, i64)> = {
         let mut stmt = conn.prepare(
-            "SELECT account_id, credential_json, login_identity, source_fingerprint FROM account_sources",
+            "SELECT account_id, credential_json, login_identity, source_fingerprint, config_json, position FROM account_sources",
         )?;
         let iter = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
+            ))
         })?;
         iter.collect::<rusqlite::Result<_>>()?
     };
+    let expanded_directories = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.get("type").and_then(Value::as_str),
+                Some("json" | "sqlite")
+            )
+        })
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .map(expand_home)
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect::<Vec<_>>();
     conn.execute("DELETE FROM account_sources", [])?;
+    let mut inserted = HashSet::new();
     for (position, entry) in entries.iter().enumerate() {
         let account_id = account_id_for_entry(entry);
+        inserted.insert(account_id.clone());
         let credential = if entry.get("type").and_then(Value::as_str) == Some("internal") {
             entry.get("credential").filter(|v| !v.is_null())
         } else {
             None
         };
-        let (mut credential_json, login_identity, source_fingerprint) =
-            existing.get(&account_id).cloned().unwrap_or_default();
+        let (mut credential_json, login_identity, source_fingerprint) = existing
+            .get(&account_id)
+            .map(|row| (row.0.clone(), row.1.clone(), row.2.clone()))
+            .unwrap_or_default();
         if credential_json.is_none() {
             credential_json = credential.map(Value::to_string);
         }
@@ -532,6 +554,26 @@ pub fn replace_account_sources(
             "INSERT INTO account_sources(account_id, position, config_json, credential_json, login_identity, source_fingerprint)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![account_id, position as i64, stored.to_string(), credential_json, login_identity, source_fingerprint],
+        )?;
+    }
+    for (account_id, (credential, identity, fingerprint, config_json, position)) in existing {
+        let account_path = PathBuf::from(&account_id);
+        if inserted.contains(&account_id)
+            || !account_path.is_file()
+            || !expanded_directories
+                .iter()
+                .any(|directory| account_path.starts_with(directory))
+            || serde_json::from_str::<Value>(&config_json)
+                .ok()
+                .and_then(|v| v.get("_kiroLbExpanded").and_then(Value::as_bool))
+                != Some(true)
+        {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO account_sources(account_id, position, config_json, credential_json, login_identity, source_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![account_id, position, config_json, credential, identity, fingerprint],
         )?;
     }
     Ok(())
@@ -575,17 +617,26 @@ pub fn bind_login_identity(
     source_fingerprint: Option<&str>,
 ) -> Option<String> {
     with(|c| {
-        let current: Option<(Option<String>, Option<String>)> = c
+        let mut current: Option<(Option<String>, Option<String>)> = c
             .query_row(
                 "SELECT login_identity, source_fingerprint FROM account_sources WHERE account_id = ?1",
                 [account_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let writable = require_runtime_writer(c).is_ok();
+        if current.is_none() && writable {
+            c.execute(
+                "INSERT OR IGNORE INTO account_sources(account_id, position, config_json)
+                 VALUES (?1, -1, '{\"_kiroLbExpanded\":true}')",
+                [account_id],
+            )?;
+            current = Some((None, None));
+        }
         let Some((identity, fingerprint)) = current else {
             return Ok(None);
         };
-        if require_runtime_writer(c).is_err() {
+        if !writable {
             let matches = stable_identity
                 .is_some_and(|stable| identity.as_deref() == Some(stable))
                 || (stable_identity.is_none()

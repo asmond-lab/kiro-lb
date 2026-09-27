@@ -274,7 +274,20 @@ pub fn save_account_usage_error(account_id: &str, login_identity: &str, error: &
             "INSERT INTO account_usage(account_id, login_identity, updated_at, error)
              SELECT ?1, ?2, ?3, ?4
              WHERE EXISTS (SELECT 1 FROM account_sources WHERE account_id = ?1 AND login_identity = ?2)
-             ON CONFLICT(account_id) DO UPDATE SET login_identity=excluded.login_identity, updated_at=excluded.updated_at, error=excluded.error",
+             ON CONFLICT(account_id) DO UPDATE SET
+                email=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.email END,
+                subscription_title=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.subscription_title END,
+                subscription_type=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.subscription_type END,
+                resource_type=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.resource_type END,
+                current_usage=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.current_usage END,
+                usage_limit=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.usage_limit END,
+                usage_percent=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.usage_percent END,
+                unit=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.unit END,
+                next_date_reset=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.next_date_reset END,
+                days_until_reset=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.days_until_reset END,
+                overage_status=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.overage_status END,
+                overage_used=CASE WHEN account_usage.login_identity=excluded.login_identity THEN account_usage.overage_used END,
+                login_identity=excluded.login_identity, updated_at=excluded.updated_at, error=excluded.error",
             params![account_id, login_identity, now, error],
         )
     })

@@ -735,6 +735,7 @@ impl KiroAuth {
             }
             let mut fresh = Creds::default();
             fresh.load_document(&doc);
+            *self.source_fingerprint.lock() = source_fingerprint(&fresh);
             *self.creds.lock() = fresh;
         }
         validate_credential_regions(&self.creds.lock().clone())?;
@@ -771,6 +772,7 @@ impl KiroAuth {
                 if let Some(doc) = store::load_internal_credential(id) {
                     let mut fresh = Creds::default();
                     fresh.load_document(&doc);
+                    *self.source_fingerprint.lock() = source_fingerprint(&fresh);
                     *self.creds.lock() = fresh;
                 }
             }
