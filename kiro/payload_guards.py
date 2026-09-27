@@ -12,6 +12,9 @@ pass, 1_000_000 fail. This module provides:
 - Auto-trimming of oldest history entries to fit under the limit
 """
 
+import base64
+import binascii
+import io
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -28,6 +31,7 @@ class PayloadTrimStats:
     trimmed: bool
     original_tokens: int = 0
     final_tokens: int = 0
+    images_stripped: int = 0
 
 
 class PayloadTooLargeError(Exception):
@@ -262,6 +266,186 @@ def _drop_pairs_by_estimate(
         del history[:index]
 
 
+def _known_over_limit(
+    tokens: int,
+    nbytes: int,
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> bool:
+    if max_tokens is not None and tokens > max_tokens:
+        return True
+    if max_bytes is not None and nbytes > max_bytes:
+        return True
+    return False
+
+
+def _current_user_input(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    conversation_state = payload.get("conversationState")
+    if not isinstance(conversation_state, dict):
+        return None
+    current_message = conversation_state.get("currentMessage")
+    if not isinstance(current_message, dict):
+        return None
+    user_input = current_message.get("userInputMessage")
+    if not isinstance(user_input, dict):
+        return None
+    return user_input
+
+
+def _drop_oldest_current_images_until_fit(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> None:
+    """Remove oldest current-turn images until the payload fits."""
+    user_input = _current_user_input(payload)
+    if user_input is None:
+        return
+    images = user_input.get("images")
+    if not isinstance(images, list) or not images:
+        return
+    while images and _over_limit(payload, max_bytes, max_tokens):
+        images.pop(0)
+    if not images:
+        user_input.pop("images", None)
+
+
+def _shrink_kiro_image(image: Dict[str, Any], max_edge: int = 1280, quality: int = 70) -> bool:
+    """Re-encode one Kiro image as a smaller JPEG. Returns True if it shrank."""
+    source = image.get("source")
+    if not isinstance(source, dict):
+        return False
+    raw_b64 = source.get("bytes")
+    if not isinstance(raw_b64, str) or not raw_b64:
+        return False
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        original = base64.b64decode(raw_b64, validate=True)
+        with Image.open(io.BytesIO(original)) as decoded:
+            rgb = decoded.convert("RGB")
+            width, height = rgb.size
+            longest = max(width, height)
+            if longest > max_edge:
+                scale = max_edge / longest
+                rgb = rgb.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+            buffer = io.BytesIO()
+            rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+    except (OSError, ValueError, binascii.Error):
+        return False
+    shrunk = base64.b64encode(buffer.getvalue()).decode("ascii")
+    if len(shrunk) >= len(raw_b64):
+        return False
+    image["format"] = "jpeg"
+    source["bytes"] = shrunk
+    return True
+
+
+def _shrink_current_images_until_fit(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> None:
+    """Downscale remaining current-turn images when history trim is not enough."""
+    user_input = _current_user_input(payload)
+    if user_input is None:
+        return
+    images = user_input.get("images")
+    if not isinstance(images, list) or not images:
+        return
+    for max_edge, quality in ((1280, 70), (720, 50)):
+        for image in images:
+            if not _over_limit(payload, max_bytes, max_tokens):
+                return
+            if isinstance(image, dict):
+                _shrink_kiro_image(image, max_edge=max_edge, quality=quality)
+
+
+def _fit_current_images(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> None:
+    """Shrink, then drop, current-turn images. History trim cannot remove them."""
+    if not _over_limit(payload, max_bytes, max_tokens):
+        return
+    _shrink_current_images_until_fit(payload, max_bytes, max_tokens)
+    if _over_limit(payload, max_bytes, max_tokens):
+        _drop_oldest_current_images_until_fit(payload, max_bytes, max_tokens)
+
+
+HISTORY_IMAGE_PLACEHOLDER = "[image omitted: trimmed to fit the Kiro payload limit]"
+
+# cl100k tokens per base64 character, set just above the ~0.71 measured on
+# PNG screenshots. Overestimating what each strip frees makes the loop stop
+# early and re-measure, instead of discarding recent images that could stay.
+_B64_TOKENS_PER_CHAR_ESTIMATE = 0.75
+
+
+def _history_image_slots(history: list) -> list[tuple[Dict[str, Any], int]]:
+    """Return (userInputMessage, base64 length) for history entries with images, oldest first."""
+    slots = []
+    for entry in history:
+        user_msg = entry.get("userInputMessage") if isinstance(entry, dict) else None
+        if not isinstance(user_msg, dict):
+            continue
+        images = user_msg.get("images")
+        if not isinstance(images, list) or not images:
+            continue
+        size = 0
+        for image in images:
+            source = image.get("source") if isinstance(image, dict) else None
+            data = source.get("bytes") if isinstance(source, dict) else None
+            if isinstance(data, str):
+                size += len(data)
+        slots.append((user_msg, size))
+    return slots
+
+
+def _strip_history_image(user_msg: Dict[str, Any]) -> None:
+    count = len(user_msg.pop("images", None) or [])
+    note = HISTORY_IMAGE_PLACEHOLDER if count == 1 else f"{HISTORY_IMAGE_PLACEHOLDER} x{count}"
+    content = user_msg.get("content") or ""
+    user_msg["content"] = f"{content}\n{note}" if content else note
+
+
+def _strip_history_images_until_fit(
+    payload: Dict[str, Any],
+    history: list,
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+    total_tokens: int,
+    total_bytes: int,
+) -> tuple[int, int, int]:
+    """Drop base64 images from the oldest history turns before any text is trimmed.
+
+    Screenshots dominate agent payloads: 58 PNGs are ~18.7M base64 chars, ~13M
+    cl100k tokens, against ~0.4M tokens of text. Trimming whole turns to make
+    room for them discarded the entire conversation while keeping the pixels.
+    Old images are replaced by a text placeholder; newest images survive longest.
+
+    Returns (images_stripped, tokens, bytes) with the exact final measurement.
+    """
+    slots = _history_image_slots(history)
+    stripped = 0
+    tokens, nbytes = total_tokens, total_bytes
+    while slots and _known_over_limit(tokens, nbytes, max_bytes, max_tokens):
+        token_excess = tokens - max_tokens * 0.97 if max_tokens is not None else 0
+        byte_excess = nbytes - max_bytes if max_bytes is not None else 0
+        freed_tokens = 0.0
+        freed_bytes = 0
+        while slots and (freed_tokens < token_excess or freed_bytes < byte_excess):
+            user_msg, size = slots.pop(0)
+            _strip_history_image(user_msg)
+            stripped += 1
+            freed_tokens += size * _B64_TOKENS_PER_CHAR_ESTIMATE
+            freed_bytes += size
+        tokens, nbytes = measure_payload(payload)
+    return stripped, tokens, nbytes
+
+
 def trim_payload_to_limit(
     payload: Dict[str, Any],
     max_bytes: Optional[int] = None,
@@ -287,14 +471,26 @@ def trim_payload_to_limit(
     history = conversation_state.get("history")
 
     if not history:
+        if not _known_over_limit(original_tokens, original_bytes, max_bytes, max_tokens):
+            return PayloadTrimStats(
+                original_bytes=original_bytes,
+                final_bytes=original_bytes,
+                original_entries=0,
+                final_entries=0,
+                trimmed=False,
+                original_tokens=original_tokens,
+                final_tokens=original_tokens,
+            )
+        _fit_current_images(payload, max_bytes, max_tokens)
+        final_tokens, final_bytes = measure_payload(payload)
         return PayloadTrimStats(
             original_bytes=original_bytes,
-            final_bytes=original_bytes,
+            final_bytes=final_bytes,
             original_entries=0,
             final_entries=0,
-            trimmed=False,
+            trimmed=final_bytes < original_bytes or final_tokens < original_tokens,
             original_tokens=original_tokens,
-            final_tokens=original_tokens,
+            final_tokens=final_tokens,
         )
 
     original_entries = len(history)
@@ -302,11 +498,20 @@ def trim_payload_to_limit(
     # Strip empty toolUses before measuring
     _strip_empty_tool_uses(history)
 
+    # Old screenshots go first: they cost far more than the text around them,
+    # and the assistant's reply to each one already carries what it showed.
+    images_stripped = 0
+    current_tokens, current_bytes = original_tokens, original_bytes
+    if _known_over_limit(original_tokens, original_bytes, max_bytes, max_tokens):
+        images_stripped, current_tokens, current_bytes = _strip_history_images_until_fit(
+            payload, history, max_bytes, max_tokens, original_tokens, original_bytes
+        )
+
     # Trim pairs from the beginning until under limit or no history remains.
     # The per-entry estimate handles the bulk without re-tokenizing the whole
     # payload; the exact check below covers the tokenizer's boundary difference
     # and normally needs no extra iteration.
-    _drop_pairs_by_estimate(payload, history, max_bytes, max_tokens, original_tokens, original_bytes)
+    _drop_pairs_by_estimate(payload, history, max_bytes, max_tokens, current_tokens, current_bytes)
     while history and _over_limit(payload, max_bytes, max_tokens):
         del history[:2]
 
@@ -318,6 +523,7 @@ def trim_payload_to_limit(
 
     if not history:
         del conversation_state["history"]
+        _fit_current_images(payload, max_bytes, max_tokens)
 
     final_tokens, final_bytes = measure_payload(payload)
     return PayloadTrimStats(
@@ -325,7 +531,8 @@ def trim_payload_to_limit(
         final_bytes=final_bytes,
         original_entries=original_entries,
         final_entries=len(history),
-        trimmed=original_entries != len(history),
+        trimmed=original_entries != len(history) or images_stripped > 0,
         original_tokens=original_tokens,
         final_tokens=final_tokens,
+        images_stripped=images_stripped,
     )

@@ -6,3 +6,4 @@ httpx==0.28.1
 loguru==0.7.3
 python-dotenv==1.2.3
 tiktoken==0.14.0
+pillow==12.3.0

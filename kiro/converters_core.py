@@ -1469,7 +1469,8 @@ def build_kiro_payload(
                 known_bytes=payload_size,
             )
             logger.info(
-                f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
+                f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages, "
+                f"{stats.images_stripped} old images stripped "
                 f"({stats.original_tokens} -> {stats.final_tokens} tokens, "
                 f"{stats.original_bytes} -> {stats.final_bytes} bytes, model={model_id}, cap={token_cap})"
             )

@@ -252,6 +252,87 @@ class TestTrimPayloadToLimit:
         assert stats.final_entries == 0
 
 
+def _image_payload(num_pairs=6, image_chars=40_000, text_size=200):
+    """Helper: history where every user turn carries one base64 screenshot."""
+    import base64
+    import random
+
+    rng = random.Random(7)
+    history = []
+    for i in range(num_pairs):
+        blob = base64.b64encode(rng.randbytes(image_chars * 3 // 4)).decode("ascii")
+        history.append(
+            {
+                "userInputMessage": {
+                    "content": f"user message {i} " + "x" * text_size,
+                    "images": [{"format": "png", "source": {"bytes": blob}}],
+                }
+            }
+        )
+        history.append({"assistantResponseMessage": {"content": f"assistant message {i} " + "y" * text_size}})
+    return {
+        "conversationState": {
+            "chatTriggerType": "MANUAL",
+            "conversationId": "test-conv",
+            "currentMessage": {"userInputMessage": {"content": "current message", "modelId": "test"}},
+            "history": history,
+        }
+    }
+
+
+class TestTrimStripsHistoryImagesFirst:
+    def test_keeps_all_text_turns_when_images_account_for_the_excess(self):
+        """Old screenshots are dropped instead of the conversation around them."""
+        payload = _image_payload()
+        text_only = json.loads(json.dumps(payload))
+        for entry in text_only["conversationState"]["history"]:
+            entry.get("userInputMessage", {}).pop("images", None)
+        limit = check_payload_tokens(text_only) + 30_000
+
+        stats = trim_payload_to_limit(payload, max_tokens=limit)
+
+        history = payload["conversationState"]["history"]
+        assert stats.final_entries == stats.original_entries == 12
+        assert stats.images_stripped > 0
+        assert stats.trimmed is True
+        assert stats.final_tokens <= limit
+        assert check_payload_tokens(payload) == stats.final_tokens
+        assert all("user message" in e["userInputMessage"]["content"] for e in history[0::2])
+
+    def test_strips_oldest_images_first_and_leaves_a_placeholder(self):
+        from kiro.payload_guards import HISTORY_IMAGE_PLACEHOLDER
+
+        payload = _image_payload()
+        stats = trim_payload_to_limit(payload, max_tokens=check_payload_tokens(payload) - 20_000)
+
+        users = [e["userInputMessage"] for e in payload["conversationState"]["history"][0::2]]
+        with_images = ["images" in u for u in users]
+        assert stats.images_stripped == with_images.count(False)
+        # Stripped images form a prefix: the newest screenshots survive longest.
+        assert with_images == sorted(with_images)
+        assert with_images[-1] is True
+        for user in users:
+            if "images" not in user:
+                assert HISTORY_IMAGE_PLACEHOLDER in user["content"]
+
+    def test_falls_back_to_turn_trim_when_text_alone_is_over(self):
+        payload = _image_payload(num_pairs=6, image_chars=4_000, text_size=5_000)
+        stats = trim_payload_to_limit(payload, max_tokens=4_000)
+
+        assert stats.final_entries < stats.original_entries
+        assert stats.final_tokens <= 4_000
+        for entry in payload["conversationState"].get("history", []):
+            assert "images" not in entry.get("userInputMessage", {})
+
+    def test_under_limit_keeps_images(self):
+        payload = _image_payload(num_pairs=2)
+        stats = trim_payload_to_limit(payload, max_tokens=check_payload_tokens(payload) * 2)
+
+        assert stats.images_stripped == 0
+        assert not stats.trimmed
+        assert all("images" in e["userInputMessage"] for e in payload["conversationState"]["history"][0::2])
+
+
 class TestOversizedPayloadWithoutAutoTrim:
     """The guard must refuse an oversized payload instead of sending it blind.
 
