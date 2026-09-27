@@ -491,6 +491,7 @@ fn claude_config(original: Option<&str>, options: &Options, key: &str) -> Result
         "ANTHROPIC_BASE_URL".into(),
         Value::String(options.base_url.as_str().trim_end_matches('/').to_owned()),
     );
+    env.insert("ANTHROPIC_API_KEY".into(), Value::String(String::new()));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(key.to_owned()));
     env.insert(
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".into(),
@@ -967,7 +968,7 @@ fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentit
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
     if descriptor < 0 {
@@ -1070,8 +1071,37 @@ fn create_staged(
     content: &[u8],
     mode: Option<u32>,
 ) -> Result<(std::ffi::CString, FileIdentity, u32), String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    create_staged_inner(parent, path, |file| {
+        file.write_all(content)
+            .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
+        if let Some(mode) = mode {
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("cannot stage permissions for {}: {e}", path.display()))?;
+        }
+        file.sync_all()
+            .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("cannot inspect staged file for {}: {e}", path.display()))?;
+        Ok((
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            metadata.mode() & 0o7777,
+        ))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn create_staged_inner(
+    parent: &fs::File,
+    path: &Path,
+    finish: impl FnOnce(&mut fs::File) -> Result<(FileIdentity, u32), String>,
+) -> Result<(std::ffi::CString, FileIdentity, u32), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     let name = std::ffi::CString::new(format!(".kirolb-{}.tmp", Uuid::new_v4()))
         .expect("generated temporary name");
@@ -1091,25 +1121,21 @@ fn create_staged(
         ));
     }
     let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
-    file.write_all(content)
-        .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
-    if let Some(mode) = mode {
-        file.set_permissions(fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("cannot stage permissions for {}: {e}", path.display()))?;
+    match finish(&mut file) {
+        Ok((identity, staged_mode)) => Ok((name, identity, staged_mode)),
+        Err(error) => {
+            let cleanup = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+            if cleanup < 0 && io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
+                Err(format!(
+                    "{error}; cannot remove failed staged file for {}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                ))
+            } else {
+                Err(error)
+            }
+        }
     }
-    file.sync_all()
-        .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("cannot inspect staged file for {}: {e}", path.display()))?;
-    Ok((
-        name,
-        FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        },
-        metadata.mode() & 0o7777,
-    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1296,6 +1322,7 @@ fn conditional_remove(_path: &Path, _expected: &ExpectedFile) -> Result<Expected
 #[cfg(target_os = "linux")]
 struct StateLock {
     file: fs::File,
+    file_identity: FileIdentity,
     directory: fs::File,
     directory_identity: FileIdentity,
     _lock_directory: fs::File,
@@ -1343,13 +1370,16 @@ impl StateLock {
             ));
         }
         let file = unsafe { fs::File::from_raw_fd(descriptor) };
-        if !file
+        let file_metadata = file
             .metadata()
-            .map_err(|e| format!("cannot inspect client setup lock: {e}"))?
-            .is_file()
-        {
+            .map_err(|e| format!("cannot inspect client setup lock: {e}"))?;
+        if !file_metadata.is_file() {
             return Err("client setup lock is not a regular file".into());
         }
+        let file_identity = FileIdentity {
+            device: file_metadata.dev(),
+            inode: file_metadata.ino(),
+        };
         file.lock()
             .map_err(|e| format!("cannot lock client setup state: {e}"))?;
         let directory = open_parent_secure(&state_file, true)?;
@@ -1362,6 +1392,7 @@ impl StateLock {
         };
         let lock = Self {
             file,
+            file_identity,
             directory,
             directory_identity,
             _lock_directory: lock_directory,
@@ -1394,6 +1425,7 @@ impl StateLock {
     }
 
     fn verify_lock_directory_path(&self) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
 
         let current = open_parent_secure(&self.state_directory, false)?;
@@ -1408,6 +1440,32 @@ impl StateLock {
             return Err(
                 "client setup lock directory changed while locked; refusing mutation".into(),
             );
+        }
+        let lock_name =
+            std::ffi::CString::new(".kirolb-client-setup.lock").expect("static lock file name");
+        let mut lock_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                self._lock_directory.as_raw_fd(),
+                lock_name.as_ptr(),
+                lock_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result < 0 {
+            return Err(format!(
+                "client setup lock path changed while locked; refusing mutation: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let lock_stat = unsafe { lock_stat.assume_init() };
+        let lock_identity = FileIdentity {
+            device: lock_stat.st_dev,
+            inode: lock_stat.st_ino,
+        };
+        if lock_stat.st_mode & libc::S_IFMT != libc::S_IFREG || lock_identity != self.file_identity
+        {
+            return Err("client setup lock path changed while locked; refusing mutation".into());
         }
         Ok(())
     }
@@ -1602,6 +1660,28 @@ mod tests {
         assert!(snapshot_accepts(&snapshot, Some("old"), None));
     }
 
+    #[test]
+    fn claude_config_clears_a_competing_api_key() {
+        let options = Options {
+            clients: vec![ClientKind::Claude],
+            base_url: Url::parse("https://gateway.example/").unwrap(),
+            model: DEFAULT_MODEL.into(),
+            key_env: DEFAULT_KEY_ENV.into(),
+            key_stdin: false,
+        };
+        let generated = claude_config(
+            Some(r#"{"env":{"ANTHROPIC_API_KEY":"old-key","CUSTOM":"kept"}}"#),
+            &options,
+            "gateway-key",
+        )
+        .unwrap();
+        let document: Value = serde_json::from_str(&generated).unwrap();
+
+        assert_eq!(document["env"]["ANTHROPIC_API_KEY"], "");
+        assert_eq!(document["env"]["ANTHROPIC_AUTH_TOKEN"], "gateway-key");
+        assert_eq!(document["env"]["CUSTOM"], "kept");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_home_selection_falls_back_from_posix_home_to_userprofile() {
@@ -1711,6 +1791,60 @@ mod tests {
 
         assert!(error.contains("changed after planning"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent edit");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_staging_removes_its_private_temporary_file() {
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        let parent = open_parent_secure(&path, false).unwrap();
+
+        let error = create_staged_inner(&parent, &path, |file| {
+            file.write_all(b"sensitive staged content").unwrap();
+            Err("simulated staging failure".into())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "simulated staging failure");
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_at_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let parent = open_parent_secure(&path, false).unwrap();
+
+        let error = read_at(&parent, &path).unwrap_err();
+
+        assert!(error.contains("not a regular file"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_lock_refuses_mutation_after_its_path_is_replaced() {
+        let directory = temporary_directory();
+        let state_file = directory.join("state/client-setup.json");
+        let lock_path = directory.join(".kirolb-client-setup.lock");
+        let first_lock = StateLock::acquire_at(state_file.clone()).unwrap();
+        fs::remove_file(&lock_path).unwrap();
+        let second_lock = StateLock::acquire_at(state_file).unwrap();
+
+        let error = first_lock.verify_directory_path().unwrap_err();
+
+        assert!(error.contains("lock path changed while locked"));
+        second_lock.verify_directory_path().unwrap();
+        drop(second_lock);
+        drop(first_lock);
         fs::remove_dir_all(directory).unwrap();
     }
 

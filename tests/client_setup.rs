@@ -102,7 +102,7 @@ fn text(output: &Output) -> String {
 fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     let home = TestHome::new();
     fs::create_dir(home.path.join(".claude")).unwrap();
-    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\"}\n}\n";
+    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\", \"ANTHROPIC_API_KEY\": \"old-key\"}\n}\n";
     fs::write(home.claude(), original).unwrap();
     #[cfg(unix)]
     {
@@ -130,6 +130,7 @@ fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     assert_eq!(settings["theme"], "dark");
     assert_eq!(settings["env"]["CUSTOM"], "kept");
     assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], url);
+    assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "");
     assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], KEY);
     let codex = fs::read_to_string(home.codex()).unwrap();
     assert!(codex.contains("wire_api = \"responses\""));
