@@ -112,7 +112,8 @@ fn print_help() {
          kirolb client diagnose [--base-url URL] [--api-key-env NAME|--api-key-stdin]\n\
          kirolb client status [codex|claude|all]\n\
          kirolb client restore [codex|claude|all]\n\n\
-         setup and diagnose only call /health and /v1/models; they do not run inference."
+         setup and diagnose only call /health and /v1/models; they do not run inference.\n\
+         Automatic setup and restore are supported on Linux only."
     );
 }
 
@@ -241,6 +242,7 @@ fn read_key(options: &Options) -> Result<String, String> {
 }
 
 fn setup(options: Options) -> Result<(), String> {
+    require_mutation_platform()?;
     let key = read_key(&options)?;
     run_diagnostic(&options.base_url, &key)?;
     let _lock = StateLock::acquire()?;
@@ -484,6 +486,7 @@ fn status(clients: Vec<ClientKind>) -> Result<(), String> {
 }
 
 fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
+    require_mutation_platform()?;
     let _lock = StateLock::acquire()?;
     let mut state = load_state()?;
     let mut plans = Vec::new();
@@ -646,6 +649,19 @@ fn snapshot_accepts(snapshot: &Snapshot, current_hash: Option<&str>) -> bool {
         }
         None => snapshot.original.is_none(),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn require_mutation_platform() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_mutation_platform() -> Result<(), String> {
+    Err(
+        "automatic client setup and restore are supported only on Linux; diagnose and status remain available"
+            .into(),
+    )
 }
 
 fn inspect_expected(path: &Path, create_parent: bool) -> Result<ExpectedFile, String> {
@@ -1043,50 +1059,17 @@ fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String
 
 #[cfg(not(target_os = "linux"))]
 fn conditional_write(
-    path: &Path,
-    content: &[u8],
-    expected: &ExpectedFile,
-    mode: Option<u32>,
+    _path: &Path,
+    _content: &[u8],
+    _expected: &ExpectedFile,
+    _mode: Option<u32>,
 ) -> Result<(), String> {
-    let current = inspect_expected(path, false)?;
-    if current.content != expected.content {
-        return Err(format!(
-            "{} changed after planning; refusing update",
-            path.display()
-        ));
-    }
-    #[cfg(unix)]
-    if current.parent_identity != expected.parent_identity
-        || current.file_identity != expected.file_identity
-    {
-        return Err(format!(
-            "{} identity changed after planning; refusing update",
-            path.display()
-        ));
-    }
-    atomic_write(path, content)?;
-    set_file_mode(path, mode)
+    require_mutation_platform()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String> {
-    let current = inspect_expected(path, false)?;
-    if current.content != expected.content {
-        return Err(format!(
-            "{} changed after planning; refusing removal",
-            path.display()
-        ));
-    }
-    #[cfg(unix)]
-    if current.parent_identity != expected.parent_identity
-        || current.file_identity != expected.file_identity
-    {
-        return Err(format!(
-            "{} identity changed after planning; refusing removal",
-            path.display()
-        ));
-    }
-    fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))
+fn conditional_remove(_path: &Path, _expected: &ExpectedFile) -> Result<(), String> {
+    require_mutation_platform()
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
@@ -1207,21 +1190,6 @@ fn file_mode(_path: &Path) -> Result<Option<u32>, String> {
     Ok(None)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("cannot restore permissions on {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
-#[cfg(all(not(unix), not(target_os = "linux")))]
-fn set_file_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
-    Ok(())
-}
-
 struct StateLock {
     file: fs::File,
 }
@@ -1287,6 +1255,13 @@ mod tests {
         assert!(normalize_base_url("https://gateway.example:8443").is_ok());
         assert!(normalize_base_url("http://gateway.example:8000").is_err());
         assert!(normalize_base_url("http://192.168.1.10:8000").is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn automatic_mutation_fails_closed_off_linux() {
+        let error = require_mutation_platform().unwrap_err();
+        assert!(error.contains("supported only on Linux"));
     }
 
     #[cfg(target_os = "linux")]

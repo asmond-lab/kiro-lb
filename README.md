@@ -77,6 +77,12 @@ Issues: https://github.com/minpeter/kiro-lb/issues
 profile or requiring a paid inference request for verification. Start the
 gateway, export one of its data-plane keys, and run setup:
 
+Automatic `setup` and `restore` mutate client files on Linux only. They fail
+closed on macOS and Windows because those platforms do not provide the same
+verified conditional commit path in this workflow. Read-only `diagnose` and
+`status` remain available there; configure the clients manually using the
+contracts below. This does not affect running the gateway on those platforms.
+
 ```bash
 export KIROLB_API_KEY='your-gateway-key'
 kirolb client setup all --base-url http://127.0.0.1:8000

@@ -50,6 +50,7 @@ impl Drop for TestHome {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn gateway(requests: usize) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -83,6 +84,7 @@ fn run(home: &TestHome, arguments: &[&str]) -> Output {
     home.command().args(arguments).output().unwrap()
 }
 
+#[cfg(target_os = "linux")]
 fn setup(home: &TestHome, base_url: &str, client: &str) -> Output {
     run(home, &["client", "setup", client, "--base-url", base_url])
 }
@@ -95,6 +97,7 @@ fn text(output: &Output) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     let home = TestHome::new();
@@ -171,6 +174,7 @@ fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     assert!(again.status.success(), "{}", text(&again));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn restore_distinguishes_a_preexisting_empty_file_from_an_absent_file() {
     let home = TestHome::new();
@@ -187,6 +191,7 @@ fn restore_distinguishes_a_preexisting_empty_file_from_an_absent_file() {
     assert!(!home.claude().exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn restore_refuses_edits_made_after_setup_without_exposing_the_key() {
     let home = TestHome::new();
@@ -206,6 +211,7 @@ fn restore_refuses_edits_made_after_setup_without_exposing_the_key() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unavailable_gateway_and_malformed_settings_leave_clients_untouched() {
     let home = TestHome::new();
@@ -228,6 +234,7 @@ fn unavailable_gateway_and_malformed_settings_leave_clients_untouched() {
 }
 
 #[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn setup_refuses_symlink_targets_and_keeps_the_referent_unchanged() {
     use std::os::unix::fs::symlink;
@@ -245,6 +252,7 @@ fn setup_refuses_symlink_targets_and_keeps_the_referent_unchanged() {
     assert!(!home.codex().exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recovery_journal_can_restore_the_old_bytes_after_an_interrupted_install() {
     let home = TestHome::new();
@@ -265,6 +273,7 @@ fn recovery_journal_can_restore_the_old_bytes_after_an_interrupted_install() {
     assert!(!home.codex().exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn parallel_setup_is_serialized_and_both_runs_succeed() {
     let home = TestHome::new();
@@ -322,6 +331,7 @@ fn diagnose_rejects_malformed_discovery_without_writing_configuration() {
     assert!(!home.path.join(".env").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn setup_rejects_empty_model_discovery_without_writing_configuration() {
     let home = TestHome::new();
@@ -364,6 +374,25 @@ fn status_uses_userprofile_when_home_is_absent() {
     assert!(output.status.success(), "{}", text(&output));
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn setup_and_restore_fail_closed_without_writing_files() {
+    let home = TestHome::new();
+
+    for arguments in [
+        &["client", "setup", "all"][..],
+        &["client", "restore", "all"][..],
+    ] {
+        let output = run(&home, arguments);
+        assert!(!output.status.success());
+        assert!(text(&output).contains("supported only on Linux"));
+    }
+    assert!(!home.codex().exists());
+    assert!(!home.claude().exists());
+    assert!(!home.state().exists());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn malformed_url_and_secret_are_rejected_without_printing_the_secret() {
     let home = TestHome::new();
