@@ -102,6 +102,13 @@ pub async fn data_plane_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_owned();
+    if is_account_mutation(req.method(), &path) {
+        if state.quiesced.load(Ordering::SeqCst) {
+            return detail(503, "Gateway is quiesced for handoff");
+        }
+        let _guard = InflightGuard::enter(&state);
+        return next.run(req).await;
+    }
     if !path.starts_with("/v1/") {
         return next.run(req).await;
     }
@@ -122,13 +129,10 @@ pub async fn data_plane_middleware(
     let ctx = RequestCtx::new(None);
     let mut req = req;
     req.extensions_mut().insert(ctx.clone());
-    state.inflight.fetch_add(1, Ordering::SeqCst);
+    let guard = InflightGuard::enter(&state);
     let response = next.run(req).await;
     let status = response.status().as_u16();
     let (parts, body) = response.into_parts();
-    let guard = InflightGuard {
-        state: state.clone(),
-    };
     let mut stream = body.into_data_stream();
     let relay = async_stream::stream! {
         let _guard = guard;
@@ -154,8 +158,28 @@ pub async fn data_plane_middleware(
     Response::from_parts(parts, Body::from_stream(relay))
 }
 
-struct InflightGuard {
+/// Account mutations share the handoff gate with /v1: quiesce must mean the
+/// old slot has stopped changing the pool before the standby takes over.
+pub fn is_account_mutation(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    path.starts_with("/api/dashboard/accounts")
+        && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// Counts one unit of work toward the handoff drain. It is created before the
+/// handler is awaited, so a client disconnect that cancels the handler still
+/// drops it and the count cannot leak.
+pub struct InflightGuard {
     state: Shared,
+}
+
+impl InflightGuard {
+    pub fn enter(state: &Shared) -> Self {
+        state.inflight.fetch_add(1, Ordering::SeqCst);
+        InflightGuard {
+            state: state.clone(),
+        }
+    }
 }
 
 impl Drop for InflightGuard {

@@ -143,6 +143,7 @@ pub struct AccountManager {
     inner: Mutex<PoolInner>,
     dirty: std::sync::atomic::AtomicBool,
     http: reqwest::Client,
+    mutations: tokio::sync::Mutex<()>,
 }
 
 impl AccountManager {
@@ -151,7 +152,15 @@ impl AccountManager {
             inner: Mutex::new(PoolInner::default()),
             dirty: false.into(),
             http,
+            mutations: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Held across a whole account read/check/mutate/persist sequence
+    /// (register, delete, enable, disable) so two operators cannot both pass
+    /// the last-account check against the same snapshot.
+    pub async fn lock_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutations.lock().await
     }
 
     fn mark_dirty(&self) {
@@ -449,9 +458,19 @@ impl AccountManager {
             None => a.models.seed_fallback(),
         }
         let available = model_resolver::available_models(&a.models);
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            tracing::info!(
+                "Discarding initialization of {id}: it was removed or replaced while initializing"
+            );
+            return false;
+        }
         *a.auth.lock() = Some(auth);
         a.state.lock().models_cached_at = store::now_f64();
-        let mut inner = self.inner.lock();
         for m in &available {
             let list = inner.model_to_accounts.entry(m.clone()).or_default();
             if !list.contains(&id) {
@@ -635,7 +654,13 @@ impl AccountManager {
                     self.refresh_models(&a).await;
                 }
             }
-            if a.auth.lock().is_some() {
+            let still_member = self
+                .inner
+                .lock()
+                .accounts
+                .get(&a.id)
+                .is_some_and(|live| Arc::ptr_eq(live, &a));
+            if still_member && a.auth.lock().is_some() {
                 return Some(a);
             }
         }

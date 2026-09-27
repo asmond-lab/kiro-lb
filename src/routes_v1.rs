@@ -412,11 +412,50 @@ struct Retry {
     model_id: String,
 }
 
+fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
+    let retry = Arc::new(retry);
+    retry_on_first_token_timeout(
+        first,
+        config::get().first_token_max_retries.max(1),
+        config::get().first_token_timeout,
+        move || {
+            let retry = retry.clone();
+            async move {
+                match retry
+                    .state
+                    .transport
+                    .generate(
+                        &retry.auth,
+                        retry.body.clone(),
+                        &retry.model_id,
+                        true,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(r) if r.status == 200 => Ok(events_of(r)),
+                    Ok(r) => Err(StreamError::UpstreamStatus(r.status)),
+                    Err(e) => Err(StreamError::Upstream(e.to_string())),
+                }
+            }
+        },
+    )
+}
+
 /// Re-sends the same payload when the model produces nothing before the first-token
 /// timeout. Once an event is out, the stream is committed and no retry happens.
-fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
-    let max = config::get().first_token_max_retries.max(1);
-    let timeout = config::get().first_token_timeout;
+/// The timed-out stream is dropped before reconnecting, so the concurrency
+/// permits it holds are free for the replacement request.
+pub fn retry_on_first_token_timeout<F, Fut>(
+    first: EventStream,
+    max: u32,
+    timeout: f64,
+    reconnect: F,
+) -> EventStream
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<EventStream, StreamError>> + Send,
+{
     Box::pin(async_stream::stream! {
         let mut current = first;
         let mut attempt = 0;
@@ -429,14 +468,11 @@ fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
                         yield Err(StreamError::Upstream(format!("Model did not respond within {timeout}s after {max} attempts. Please try again.")));
                         return;
                     }
-                    match retry.state.transport.generate(&retry.auth, retry.body.clone(), &retry.model_id, true, false).await {
-                        Ok(r) if r.status == 200 => current = events_of(r),
-                        Ok(r) => {
-                            yield Err(StreamError::UpstreamStatus(r.status));
-                            return;
-                        }
+                    drop(std::mem::replace(&mut current, Box::pin(futures_util::stream::empty())));
+                    match reconnect().await {
+                        Ok(next) => current = next,
                         Err(e) => {
-                            yield Err(StreamError::Upstream(e.to_string()));
+                            yield Err(e);
                             return;
                         }
                     }

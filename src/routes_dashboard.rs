@@ -554,6 +554,7 @@ pub async fn delete_account(
     Path(label): Path<String>,
 ) -> Response {
     guard!(headers);
+    let _serial = state.pool.lock_mutations().await;
     let entries = store::load_account_sources();
     let (id, idx) = match resolve_direct(&state, &entries, &label) {
         Ok(v) => v,
@@ -600,6 +601,7 @@ pub async fn set_enabled(
         Ok(_) => return detail(400, "Expected {\"enabled\": true|false}"),
         Err(r) => return r,
     };
+    let _serial = state.pool.lock_mutations().await;
     let entries = store::load_account_sources();
     let (id, idx) = match resolve_direct(&state, &entries, &label) {
         Ok(v) => v,
@@ -643,6 +645,7 @@ pub async fn set_enabled(
 }
 
 async fn register(state: &Shared, entry: Value, requested_type: &str) -> Result<Value, Response> {
+    let _serial = state.pool.lock_mutations().await;
     let id = store::account_id_for_entry(&entry);
     if state.pool.get(&id).is_some() {
         return Err(detail(400, "This credential source is already registered"));
