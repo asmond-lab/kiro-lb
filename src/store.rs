@@ -224,6 +224,7 @@ pub fn initialize() -> rusqlite::Result<()> {
             ("output_tokens", "INTEGER"),
             ("credits", "REAL"),
             ("generation_ms", "INTEGER"),
+            ("ttft_ms", "INTEGER"),
         ] {
             if !log_cols.iter().any(|c| c == col) {
                 conn.execute_batch(&format!("ALTER TABLE request_logs ADD COLUMN {col} {ddl}"))?;

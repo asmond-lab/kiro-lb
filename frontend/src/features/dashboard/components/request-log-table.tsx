@@ -247,10 +247,11 @@ export function RequestLogDetailFields({ detail }: { detail: RequestLogDetail })
           label={t("logs.tokensPerSecond")}
           value={
             detail.tokensPerSecond != null
-              ? `${detail.tokensPerSecond.toFixed(1)} tok/s${detail.generationMs != null ? ` (${formatLatency(detail.generationMs)})` : ""}`
+              ? `${detail.tokensPerSecond.toFixed(1)} tok/s`
               : "—"
           }
         />
+        <Field label={t("logs.ttft")} value={detail.ttftMs != null ? formatLatency(detail.ttftMs) : "—"} />
         {detail.creditsSpent != null ? (
           <Field label={t("logs.creditsSpent")} value={formatCredits(detail.creditsSpent)} />
         ) : null}

@@ -21,6 +21,7 @@ pub struct RequestUsage {
     pub output_tokens: Option<i64>,
     pub credits: Option<f64>,
     pub generation_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
 }
 
 /// Everything a request needs to attribute its usage, shared with its stream task.
@@ -72,15 +73,15 @@ impl RequestCtx {
         model: &str,
         prompt: i64,
         completion: i64,
-        generation_seconds: Option<f64>,
+        timer: Option<&GenerationTimer>,
     ) {
+        let generation_seconds = timer.and_then(GenerationTimer::decode_seconds);
         {
             let mut u = self.usage.lock();
             u.input_tokens = Some(prompt.max(0));
             u.output_tokens = Some(completion.max(0));
-            u.generation_ms = generation_seconds
-                .filter(|g| *g > 0.0)
-                .map(|g| (g * 1000.0) as i64);
+            u.generation_ms = generation_seconds.map(|g| (g * 1000.0) as i64);
+            u.ttft_ms = timer.and_then(GenerationTimer::ttft_ms);
         }
         let Some(key) = self.api_key_id.clone() else {
             return;
@@ -105,9 +106,9 @@ impl RequestCtx {
         entry[0] += prompt.max(0);
         entry[1] += completion;
         entry[2] += 1;
-        if let Some(g) = generation_seconds.filter(|g| *g > 0.0) {
+        if let Some(g) = generation_seconds.filter(|_| completion > 1) {
             entry[3] += (g * 1000.0) as i64;
-            entry[4] += completion;
+            entry[4] += completion - 1;
         }
     }
 }
@@ -147,14 +148,70 @@ pub fn restore_pending(rows: Vec<UsageRow>) {
     }
 }
 
-pub struct GenerationTimer(Instant);
+/// Output speed follows the usual benchmark definition: tokens after the first
+/// one divided by the time between the first and last output event. Time to
+/// first token is measured and reported separately, never mixed into speed.
+pub struct GenerationTimer {
+    started: Instant,
+    first: Option<Instant>,
+    last: Option<Instant>,
+}
 
 impl GenerationTimer {
     pub fn start() -> Self {
-        GenerationTimer(Instant::now())
+        GenerationTimer {
+            started: Instant::now(),
+            first: None,
+            last: None,
+        }
     }
 
-    pub fn elapsed(&self) -> f64 {
-        self.0.elapsed().as_secs_f64()
+    pub fn mark(&mut self) {
+        let now = Instant::now();
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+    }
+
+    pub fn ttft_ms(&self) -> Option<i64> {
+        self.first
+            .map(|f| f.duration_since(self.started).as_millis() as i64)
+    }
+
+    pub fn decode_seconds(&self) -> Option<f64> {
+        let secs = self.last?.duration_since(self.first?).as_secs_f64();
+        (secs > 0.0).then_some(secs)
+    }
+}
+
+pub fn tokens_per_second(output_tokens: i64, decode_ms: i64) -> Option<f64> {
+    (output_tokens > 1 && decode_ms > 0)
+        .then(|| (output_tokens - 1) as f64 / (decode_ms as f64 / 1000.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn speed_excludes_time_to_first_token() {
+        let t0 = Instant::now();
+        let timer = GenerationTimer {
+            started: t0,
+            first: Some(t0 + Duration::from_millis(1500)),
+            last: Some(t0 + Duration::from_millis(3500)),
+        };
+        assert_eq!(timer.ttft_ms(), Some(1500));
+        assert_eq!(timer.decode_seconds(), Some(2.0));
+        assert_eq!(tokens_per_second(101, 2000), Some(50.0));
+    }
+
+    #[test]
+    fn speed_is_undefined_without_a_decode_window() {
+        let timer = GenerationTimer::start();
+        assert_eq!(timer.ttft_ms(), None);
+        assert_eq!(timer.decode_seconds(), None);
+        assert_eq!(tokens_per_second(1, 500), None);
+        assert_eq!(tokens_per_second(10, 0), None);
     }
 }

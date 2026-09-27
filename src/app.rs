@@ -133,6 +133,7 @@ pub async fn data_plane_middleware(
             output_tokens: u.output_tokens,
             credits: u.credits,
             generation_ms: u.generation_ms,
+            ttft_ms: u.ttft_ms,
         };
         let _ = tokio::task::spawn_blocking(move || dashboard_store::record_request(record)).await;
     };

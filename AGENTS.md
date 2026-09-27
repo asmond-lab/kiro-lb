@@ -75,10 +75,12 @@ kiro-lb/
   GPT/o-series and deepseek/qwen/minimax/glm. The CJK correction is a property of
   the script and is 1.0 for Latin text.
 - Per-key token rows are keyed by the normalized model name.
-- Throughput divides `timed_completion_tokens` by `generation_ms`, never the
-  full completion count. Generation time is measured inside the stream, not by
-  the request-log middleware (which stops at first byte). The request log also
-  stores `generation_ms` per request for the detail view's tokens per second.
+- Output speed follows the benchmark definition (Artificial Analysis, IETF
+  TPOT): `(output_tokens - 1) / (t_last - t_first)` between the first and last
+  output event. Time to first token is stored separately (`request_logs.ttft_ms`)
+  and never mixed into speed. `generation_ms` is that decode window, and
+  `timed_completion_tokens` adds `completion - 1` so the `/metrics` ratio
+  matches. Non-streaming responses have no per-token timing and record no speed.
 - Control and data planes stay separate: dashboard sessions cannot call `/v1`,
   `/v1` keys cannot call `/api/dashboard`. `/metrics` takes a `/v1` bearer key.
 - The SQLite store never holds prompts, completions or raw client keys. New

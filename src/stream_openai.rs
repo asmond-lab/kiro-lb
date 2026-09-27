@@ -34,7 +34,7 @@ pub fn stream(
     opts: OpenAIOptions,
 ) -> Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>> {
     Box::pin(async_stream::try_stream! {
-        let timer = GenerationTimer::start();
+        let mut timer = GenerationTimer::start();
         let mut v = OpenAIValidator::default();
         let id = utils::completion_id();
         let created = crate::store::now_i64();
@@ -53,7 +53,11 @@ pub fn stream(
         let mut events = events;
         while let Some(ev) = events.next().await {
             received = true;
-            match ev? {
+            let ev = ev?;
+            if matches!(ev, KiroEvent::Content(_) | KiroEvent::Thinking { .. } | KiroEvent::ToolUse(_)) {
+                timer.mark();
+            }
+            match ev {
                 KiroEvent::Content(c) if !c.is_empty() => {
                     full.push_str(&c);
                     let p = chunk(json!({"content": c}), Value::Null);
@@ -155,7 +159,7 @@ pub fn stream(
         if let Some(m) = metering {
             last["usage"]["credits_used"] = m;
         }
-        ctx.request.record_tokens(&ctx.model, prompt, completion, Some(timer.elapsed()));
+        ctx.request.record_tokens(&ctx.model, prompt, completion, Some(&timer));
         v.accept(Some(&last), false)?;
         yield data(&last);
         v.accept(None, true)?;

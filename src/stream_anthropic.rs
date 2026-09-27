@@ -102,7 +102,7 @@ pub fn stream(
     ctx: StreamCtx,
 ) -> Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>> {
     Box::pin(async_stream::try_stream! {
-        let timer = GenerationTimer::start();
+        let mut timer = GenerationTimer::start();
         let mut em = Emitter { validator: AnthropicValidator::new() };
         let message_id = utils::message_id();
         let mut index: i64 = 0;
@@ -147,6 +147,9 @@ pub fn stream(
                     for t in pending.drain(..) {
                         yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": t}}))?;
                     }
+                }
+                if matches!(ev, KiroEvent::Content(_) | KiroEvent::Thinking { .. } | KiroEvent::ToolUse(_)) {
+                    timer.mark();
                 }
                 match ev {
                     KiroEvent::Thinking { text, .. } => {
@@ -333,12 +336,11 @@ pub fn stream(
         }
         yield em.emit("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": final_reason, "stop_sequence": null}, "usage": usage}))?;
         yield em.emit("message_stop", json!({"type": "message_stop"}))?;
-        ctx.request.record_tokens(&ctx.model, input_tokens, output_tokens, Some(timer.elapsed()));
+        ctx.request.record_tokens(&ctx.model, input_tokens, output_tokens, Some(&timer));
     })
 }
 
 pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, StreamError> {
-    let timer = GenerationTimer::start();
     let message_id = utils::message_id();
     let mut result = stream_core::collect(events).await?;
     let mut native: Vec<Value> = Vec::new();
@@ -455,12 +457,8 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
     } else {
         mapped.unwrap_or("end_turn")
     };
-    ctx.request.record_tokens(
-        &ctx.model,
-        input_tokens,
-        output_tokens,
-        Some(timer.elapsed()),
-    );
+    ctx.request
+        .record_tokens(&ctx.model, input_tokens, output_tokens, None);
     let mut usage = serde_json::Map::new();
     usage.insert("input_tokens".into(), json!(input_tokens));
     usage.insert("output_tokens".into(), json!(output_tokens));

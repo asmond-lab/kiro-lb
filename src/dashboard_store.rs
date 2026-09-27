@@ -24,17 +24,18 @@ pub struct RequestRecord {
     pub output_tokens: Option<i64>,
     pub credits: Option<f64>,
     pub generation_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
 }
 
 pub fn record_request(r: RequestRecord) {
     let _ = store::with(|c| {
         c.execute(
-            "INSERT INTO request_logs(created_at, route, model, status_code, latency_ms, client_ip, user_agent, credits, input_tokens, output_tokens, generation_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO request_logs(created_at, route, model, status_code, latency_ms, client_ip, user_agent, credits, input_tokens, output_tokens, generation_ms, ttft_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 store::now_i64(), r.route, r.model, r.status, r.latency_ms, r.client_ip,
                 r.user_agent.filter(|u| !u.is_empty()).map(|u| u.chars().take(200).collect::<String>()),
-                r.credits, r.input_tokens, r.output_tokens, r.generation_ms
+                r.credits, r.input_tokens, r.output_tokens, r.generation_ms, r.ttft_ms
             ],
         )
     });

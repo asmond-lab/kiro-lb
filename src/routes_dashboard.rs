@@ -948,13 +948,14 @@ pub async fn request_log_detail(headers: HeaderMap, Path(id): Path<i64>) -> Resp
     let row = tokio::task::spawn_blocking(move || {
         store::with(|c| {
             use rusqlite::OptionalExtension;
-            c.query_row("SELECT id, created_at, route, model, status_code, latency_ms, client_ip, user_agent, input_tokens, output_tokens, credits, generation_ms FROM request_logs WHERE id = ?1", [id], |r| {
+            c.query_row("SELECT id, created_at, route, model, status_code, latency_ms, client_ip, user_agent, input_tokens, output_tokens, credits, generation_ms, ttft_ms FROM request_logs WHERE id = ?1", [id], |r| {
                 let model: Option<String> = r.get(3)?;
                 let input: Option<i64> = r.get(8)?;
                 let output: Option<i64> = r.get(9)?;
                 let gen_ms: Option<i64> = r.get(11)?;
+                let ttft_ms: Option<i64> = r.get(12)?;
                 let tps = match (output, gen_ms) {
-                    (Some(o), Some(g)) if g > 0 => json!(o as f64 / (g as f64 / 1000.0)),
+                    (Some(o), Some(g)) => crate::usage_tracking::tokens_per_second(o, g).map_or(Value::Null, |v| json!(v)),
                     _ => Value::Null,
                 };
                 Ok(json!({
@@ -962,7 +963,7 @@ pub async fn request_log_detail(headers: HeaderMap, Path(id): Path<i64>) -> Resp
                     "statusCode": r.get::<_, i64>(4)?, "latencyMs": r.get::<_, i64>(5)?, "clientIp": r.get::<_, Option<String>>(6)?,
                     "userAgent": r.get::<_, Option<String>>(7)?, "inputTokens": input, "outputTokens": output,
                     "creditsSpent": r.get::<_, Option<f64>>(10)?, "modelMultiplier": model_costs::multiplier_for(model.as_deref(), input),
-                    "generationMs": gen_ms, "tokensPerSecond": tps,
+                    "generationMs": gen_ms, "tokensPerSecond": tps, "ttftMs": ttft_ms,
                 }))
             })
             .optional()

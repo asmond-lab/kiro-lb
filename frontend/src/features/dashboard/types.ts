@@ -130,6 +130,7 @@ export type RequestLogDetail = {
   modelMultiplier: number | null;
   generationMs?: number | null;
   tokensPerSecond?: number | null;
+  ttftMs?: number | null;
 };
 
 export type DataOverview = {
