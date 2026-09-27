@@ -14,6 +14,7 @@ use uuid::Uuid;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8000";
 const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
 const DEFAULT_KEY_ENV: &str = "KIROLB_API_KEY";
+const MAX_CLIENT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ClientKind {
@@ -674,7 +675,6 @@ fn state_path() -> Result<PathBuf, String> {
 
 fn load_state() -> Result<State, String> {
     let path = state_path()?;
-    reject_symlink(&path)?;
     let Some(content) = read_optional(&path)? else {
         return Ok(State {
             version: 1,
@@ -693,14 +693,52 @@ fn parse_state(content: &str) -> Result<State, String> {
     Ok(state)
 }
 
+#[cfg(unix)]
 fn read_optional(path: &Path) -> Result<Option<String>, String> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    match fs::symlink_metadata(parent_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect parent of {}: {error}",
+                path.display()
+            ));
+        }
     }
+    let parent = open_parent_secure(path, false)?;
+    read_at(&parent, path).map(|value| value.map(|(content, _, _)| content))
 }
 
+#[cfg(not(unix))]
+fn read_optional(path: &Path) -> Result<Option<String>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        Ok(metadata) if metadata.len() > MAX_CLIENT_FILE_BYTES => {
+            return Err(format!("{} is too large", path.display()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    }
+    let file = fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_CLIENT_FILE_BYTES {
+        return Err(format!("{} is too large", path.display()));
+    }
+    read_bounded(file, path).map(Some)
+}
+
+#[cfg(not(unix))]
 fn reject_symlink(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -981,16 +1019,17 @@ fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentit
         }
         return Err(format!("cannot safely read {}: {error}", path.display()));
     }
-    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
     let metadata = file
         .metadata()
         .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if metadata.len() > MAX_CLIENT_FILE_BYTES {
+        return Err(format!("{} is too large", path.display()));
+    }
+    let content = read_bounded(file, path)?;
     Ok(Some((
         content,
         FileIdentity {
@@ -999,6 +1038,17 @@ fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentit
         },
         metadata.mode() & 0o7777,
     )))
+}
+
+fn read_bounded(file: fs::File, path: &Path) -> Result<String, String> {
+    let mut content = Vec::new();
+    file.take(MAX_CLIENT_FILE_BYTES + 1)
+        .read_to_end(&mut content)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if content.len() as u64 > MAX_CLIENT_FILE_BYTES {
+        return Err(format!("{} is too large", path.display()));
+    }
+    String::from_utf8(content).map_err(|_| format!("{} is not valid UTF-8", path.display()))
 }
 
 #[cfg(unix)]

@@ -2,9 +2,15 @@ use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::Child;
 use std::process::{Command, Output, Stdio};
 use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const KEY: &str = "test-only-not-a-real-credential";
@@ -82,6 +88,50 @@ fn gateway(requests: usize) -> (String, thread::JoinHandle<()>) {
 
 fn run(home: &TestHome, arguments: &[&str]) -> Output {
     home.command().args(arguments).output().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn wait_bounded(mut child: Child) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_end(&mut stdout)
+                .unwrap();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_end(&mut stderr)
+                .unwrap();
+            return Output {
+                status,
+                stdout,
+                stderr,
+            };
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("client command did not finish within three seconds");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_bounded(home: &TestHome, arguments: &[&str]) -> Output {
+    let mut command = home.command();
+    command
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    wait_bounded(command.spawn().unwrap())
 }
 
 #[cfg(target_os = "linux")]
@@ -327,6 +377,42 @@ fn parallel_setup_is_serialized_and_both_runs_succeed() {
     assert!(status.status.success());
     assert!(String::from_utf8_lossy(&status.stdout).contains("codex: installed"));
     assert!(String::from_utf8_lossy(&status.stdout).contains("claude: installed"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_rejects_special_client_and_journal_files_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::fs::symlink;
+
+    let home = TestHome::new();
+    let (url, server) = gateway(2);
+    let installed = setup(&home, &url, "all");
+    assert!(installed.status.success(), "{}", text(&installed));
+    server.join().unwrap();
+    let settings = fs::read(home.claude()).unwrap();
+
+    fs::remove_file(home.claude()).unwrap();
+    let fifo = CString::new(home.claude().as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let fifo_status = run_bounded(&home, &["client", "status", "all"]);
+    assert!(!fifo_status.status.success());
+    assert!(text(&fifo_status).contains("not a regular file"));
+
+    fs::remove_file(home.claude()).unwrap();
+    symlink("/dev/zero", home.claude()).unwrap();
+    let device_status = run_bounded(&home, &["client", "status", "all"]);
+    assert!(!device_status.status.success());
+    assert!(text(&device_status).contains("symlink"));
+
+    fs::remove_file(home.claude()).unwrap();
+    fs::write(home.claude(), settings).unwrap();
+    fs::remove_file(home.state()).unwrap();
+    let fifo = CString::new(home.state().as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let journal_status = run_bounded(&home, &["client", "status", "all"]);
+    assert!(!journal_status.status.success());
+    assert!(text(&journal_status).contains("not a regular file"));
 }
 
 #[test]
