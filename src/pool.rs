@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{AuthError, AuthType, KiroAuth, Source};
 use crate::errors::{is_suspension_error, ErrorType};
-use crate::model_resolver::{self, normalize_model_name, ModelInfoCache};
+use crate::model_resolver::{self, normalize_model_name, ModelInfoCache, ModelSupport};
 use crate::{config, settings, store};
 
 pub fn account_label(id: &str) -> String {
@@ -608,7 +608,7 @@ impl AccountManager {
         }
     }
 
-    fn candidate_order(&self, session: Option<u64>) -> Vec<Arc<Account>> {
+    fn candidate_order(&self, model: &str, session: Option<u64>) -> Vec<Arc<Account>> {
         let mut inner = self.inner.lock();
         let ids = inner.order.clone();
         if ids.is_empty() {
@@ -637,6 +637,7 @@ impl AccountManager {
             keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
             keyed.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         };
+        let mut pinned = None;
         let ordered: Vec<String> = if !config::get().quota_weighted_routing || strategy == "sticky"
         {
             rotate(inner.current_index)
@@ -658,7 +659,7 @@ impl AccountManager {
             v
         } else if let Some(key) = session.filter(|_| strategy == "session") {
             let ttl = Duration::from_secs(config::get().session_affinity_ttl_seconds);
-            let pinned = inner
+            let pinned_id = inner
                 .sessions
                 .get_mut(&key)
                 .filter(|e| e.touched.elapsed() < ttl)
@@ -667,7 +668,8 @@ impl AccountManager {
                     e.account.clone()
                 });
             let mut rest = weighted(&inner);
-            if let Some(p) = pinned.filter(|p| inner.accounts.contains_key(p)) {
+            if let Some(p) = pinned_id.filter(|p| inner.accounts.contains_key(p)) {
+                pinned = Some(p.clone());
                 rest.retain(|x| *x != p);
                 rest.insert(0, p);
             }
@@ -675,10 +677,32 @@ impl AccountManager {
         } else {
             weighted(&inner)
         };
-        ordered
+        let mut accounts: Vec<Arc<Account>> = ordered
             .into_iter()
             .filter_map(|id| inner.accounts.get(&id).cloned())
-            .collect()
+            .collect();
+        let pinned = pinned.and_then(|id| {
+            accounts
+                .iter()
+                .position(|a| a.id == id && a.models.support(model) != ModelSupport::Unsupported)
+                .map(|index| accounts.remove(index))
+        });
+        accounts.sort_by_key(|a| {
+            let support = a.models.support(model);
+            let load = a
+                .auth()
+                .and_then(|auth| {
+                    let key = auth.profile_arn().unwrap_or_else(|| "default".into());
+                    crate::upstream::http::account_concurrency_load(&key)
+                })
+                .map(|(held, limit)| (held >= limit, held))
+                .unwrap_or((false, 0));
+            (support, load)
+        });
+        if let Some(pinned) = pinned {
+            accounts.insert(0, pinned);
+        }
+        accounts
     }
 
     pub async fn next_account(
@@ -706,14 +730,15 @@ impl AccountManager {
 
     async fn select(
         &self,
-        _model: &str,
+        model: &str,
         exclude: &HashSet<String>,
         session: Option<u64>,
         last_resort: bool,
     ) -> Option<Arc<Account>> {
-        let candidates = self.candidate_order(session);
+        let candidates = self.candidate_order(model, session);
         let single = candidates.len() == 1;
         let cfg = config::get();
+        let mut unsupported = None;
         for a in candidates {
             if exclude.contains(&a.id) {
                 continue;
@@ -757,10 +782,14 @@ impl AccountManager {
                 .get(&a.id)
                 .is_some_and(|live| Arc::ptr_eq(live, &a));
             if still_member && a.auth.lock().is_some() {
-                return Some(a);
+                if a.models.support(model) == ModelSupport::Unsupported {
+                    unsupported.get_or_insert(a);
+                } else {
+                    return Some(a);
+                }
             }
         }
-        None
+        unsupported
     }
 
     pub fn pin_session(&self, session: Option<u64>, account_id: &str) {
@@ -845,6 +874,7 @@ impl AccountManager {
 
     pub fn report_success(&self, id: &str, model: &str) {
         let Some(a) = self.get(id) else { return };
+        a.models.record_supported(model);
         {
             let mut s = a.state.lock();
             s.failures = 0;
@@ -900,6 +930,7 @@ impl AccountManager {
         let outcome = {
             let mut s = a.state.lock();
             if reason == Some("INVALID_MODEL_ID") {
+                a.models.record_unsupported(model);
                 s.stats.total += 1;
                 tracing::warn!("Model '{model}' not available on account {id}: status={status}, reason=INVALID_MODEL_ID");
                 None

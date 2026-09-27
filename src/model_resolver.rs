@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -96,10 +96,26 @@ pub struct ModelResolution {
     pub is_verified: bool,
 }
 
-/// Model metadata from ListAvailableModels, shared per account.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ModelSupport {
+    Supported,
+    Unknown,
+    Unsupported,
+}
+
+#[derive(Default)]
+struct ModelInfoState {
+    models: HashMap<String, Value>,
+    refreshed_at: Option<Instant>,
+    authoritative: bool,
+    confirmed: HashSet<String>,
+    rejected: HashSet<String>,
+}
+
+/// Model metadata and observed capability evidence, shared per account.
 #[derive(Default)]
 pub struct ModelInfoCache {
-    inner: RwLock<(HashMap<String, Value>, Option<Instant>)>,
+    inner: RwLock<ModelInfoState>,
 }
 
 impl ModelInfoCache {
@@ -118,11 +134,16 @@ impl ModelInfoCache {
                     .map(|id| (id, m.clone()))
             })
             .collect();
-        *self.inner.write() = (map, Some(Instant::now()));
+        *self.inner.write() = ModelInfoState {
+            models: map,
+            refreshed_at: Some(Instant::now()),
+            authoritative: true,
+            ..Default::default()
+        };
     }
 
     pub fn seed_fallback(&self) {
-        let models = config::FALLBACK_MODELS
+        let models: Vec<Value> = config::FALLBACK_MODELS
             .iter()
             .map(|m| {
                 serde_json::json!({
@@ -131,15 +152,65 @@ impl ModelInfoCache {
                 })
             })
             .collect();
-        self.update(models);
+        let map = models
+            .into_iter()
+            .filter_map(|m| {
+                m.get("modelId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .map(|id| (id, m.clone()))
+            })
+            .collect();
+        let mut state = self.inner.write();
+        state.models = map;
+        state.refreshed_at = Some(Instant::now());
+        state.authoritative = false;
     }
 
     pub fn get(&self, id: &str) -> Option<Value> {
-        self.inner.read().0.get(id).cloned()
+        self.inner.read().models.get(id).cloned()
     }
 
     pub fn is_valid_model(&self, id: &str) -> bool {
-        self.inner.read().0.contains_key(id)
+        self.inner.read().models.contains_key(id)
+    }
+
+    pub fn support(&self, external: &str) -> ModelSupport {
+        let id = get_model_id_for_kiro(external);
+        let state = self.inner.read();
+        if state.confirmed.contains(&id) {
+            return ModelSupport::Supported;
+        }
+        if state.rejected.contains(&id) {
+            return ModelSupport::Unsupported;
+        }
+        if !state.authoritative
+            || state.models.is_empty()
+            || state
+                .refreshed_at
+                .is_none_or(|t| t.elapsed().as_secs() > config::MODEL_CACHE_TTL)
+        {
+            return ModelSupport::Unknown;
+        }
+        if state.models.contains_key(&id) {
+            ModelSupport::Supported
+        } else {
+            ModelSupport::Unsupported
+        }
+    }
+
+    pub fn record_supported(&self, external: &str) {
+        let id = get_model_id_for_kiro(external);
+        let mut state = self.inner.write();
+        state.rejected.remove(&id);
+        state.confirmed.insert(id);
+    }
+
+    pub fn record_unsupported(&self, external: &str) {
+        let id = get_model_id_for_kiro(external);
+        let mut state = self.inner.write();
+        state.confirmed.remove(&id);
+        state.rejected.insert(id);
     }
 
     /// The window contextUsagePercentage is a percentage of. Five models advertise
@@ -150,7 +221,7 @@ impl ModelInfoCache {
         }
         self.inner
             .read()
-            .0
+            .models
             .get(id)
             .and_then(|m| m.pointer("/tokenLimits/maxInputTokens"))
             .and_then(Value::as_u64)
@@ -159,22 +230,22 @@ impl ModelInfoCache {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().0.is_empty()
+        self.inner.read().models.is_empty()
     }
 
     pub fn is_stale(&self) -> bool {
         self.inner
             .read()
-            .1
+            .refreshed_at
             .is_none_or(|t| t.elapsed().as_secs() > config::MODEL_CACHE_TTL)
     }
 
     pub fn all_model_ids(&self) -> Vec<String> {
-        self.inner.read().0.keys().cloned().collect()
+        self.inner.read().models.keys().cloned().collect()
     }
 
     pub fn all_models(&self) -> Vec<Value> {
-        self.inner.read().0.values().cloned().collect()
+        self.inner.read().models.values().cloned().collect()
     }
 }
 
@@ -219,6 +290,7 @@ pub fn available_models(cache: &ModelInfoCache) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn documented_examples() {
@@ -255,5 +327,34 @@ mod tests {
             assert_eq!(normalize_model_name(i), o, "{i}");
         }
         assert_eq!(get_model_id_for_kiro("auto-kiro"), "auto");
+    }
+
+    #[test]
+    fn support_distinguishes_catalog_evidence_and_observations() {
+        let cache = ModelInfoCache::new();
+        assert_eq!(cache.support("model-a"), ModelSupport::Unknown);
+
+        cache.update(vec![serde_json::json!({"modelId": "model-a"})]);
+        assert_eq!(cache.support("model-a"), ModelSupport::Supported);
+        assert_eq!(cache.support("model-b"), ModelSupport::Unsupported);
+
+        cache.record_supported("model-b");
+        assert_eq!(cache.support("model-b"), ModelSupport::Supported);
+        cache.record_unsupported("model-a");
+        assert_eq!(cache.support("model-a"), ModelSupport::Unsupported);
+    }
+
+    #[test]
+    fn fallback_and_stale_catalogs_are_unknown() {
+        let fallback = ModelInfoCache::new();
+        fallback.seed_fallback();
+        assert_eq!(fallback.support("claude-sonnet-4.5"), ModelSupport::Unknown);
+
+        let stale = ModelInfoCache::new();
+        stale.update(vec![serde_json::json!({"modelId": "model-a"})]);
+        stale.inner.write().refreshed_at =
+            Some(Instant::now() - Duration::from_secs(config::MODEL_CACHE_TTL + 1));
+        assert_eq!(stale.support("model-a"), ModelSupport::Unknown);
+        assert_eq!(stale.support("model-b"), ModelSupport::Unknown);
     }
 }

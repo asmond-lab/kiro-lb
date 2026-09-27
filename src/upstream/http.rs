@@ -292,6 +292,22 @@ pub fn reset_concurrency() {
     *GATES.lock() = None;
 }
 
+/// Current use of an account's generation slots. `None` means per-account
+/// concurrency is unlimited.
+pub fn account_concurrency_load(account: &str) -> Option<(usize, usize)> {
+    let limit = settings::tunables().max_account_concurrency.max(0) as usize;
+    if limit == 0 {
+        return None;
+    }
+    let held = GATES
+        .lock()
+        .as_ref()
+        .and_then(|gates| gates.accounts.get(account))
+        .map(|gate| gate.limit.saturating_sub(gate.sem.available_permits()))
+        .unwrap_or(0);
+    Some((held, limit))
+}
+
 async fn acquire(
     sem: Arc<Semaphore>,
     timeout: f64,
