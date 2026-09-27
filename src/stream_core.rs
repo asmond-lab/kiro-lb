@@ -87,12 +87,16 @@ fn convert_batch(
     events: Vec<ParsedEvent>,
     meter: &mut Option<GenerationCredits>,
 ) -> Result<Vec<KiroEvent>, StreamError> {
+    if let Some(meter) = meter {
+        for event in &events {
+            if let ParsedEvent::Metering(reading) = event {
+                meter.report(reading);
+            }
+        }
+    }
     let mut converted = Vec::with_capacity(events.len());
     for event in events {
         if let Some(event) = convert(event)? {
-            if let (Some(meter), KiroEvent::Metering(reading)) = (meter.as_mut(), &event) {
-                meter.report(reading);
-            }
             converted.push(event);
         }
     }

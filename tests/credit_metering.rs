@@ -239,8 +239,22 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(request.usage.lock().credits, Some(0.0425));
-    assert_eq!(kiro_lb::dashboard_store::flush_key_model_usage(), 3);
+    request.set_account("account-malformed");
+    let malformed: stream_core::ByteStream =
+        Box::pin(futures_util::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                br#"{"name":"broken","toolUseId":"tool-1"}{"input":"{\"unterminated\":","toolUseId":"tool-1"}{"stop":true,"toolUseId":"tool-1"}{"unit":"credit","usage":0.07}"#,
+            )),
+        ]));
+    let mut malformed = stream_core::parse_kiro_stream_metered(malformed, 1.0, 1.0, &request);
+    assert!(matches!(
+        malformed.next().await,
+        Some(Err(StreamError::MalformedToolInput))
+    ));
+
+    let request_credits = request.usage.lock().credits.unwrap();
+    assert!((request_credits - 0.1125).abs() < f64::EPSILON * 4.0);
+    assert_eq!(kiro_lb::dashboard_store::flush_key_model_usage(), 4);
     let rows = kiro_lb::store::with(|connection| {
         let mut statement = connection.prepare(
             "SELECT account_id, credits FROM account_model_usage
@@ -256,9 +270,14 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
     .unwrap();
     assert_eq!(
         rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
-        vec!["account-a", "account-b", "account-zero"]
+        vec![
+            "account-a",
+            "account-b",
+            "account-malformed",
+            "account-zero"
+        ]
     );
-    for ((_, actual), expected) in rows.iter().zip([0.0125, 0.03, 0.0]) {
+    for ((_, actual), expected) in rows.iter().zip([0.0125, 0.03, 0.07, 0.0]) {
         assert!((actual.unwrap() - expected).abs() < f64::EPSILON * 4.0);
     }
 }
