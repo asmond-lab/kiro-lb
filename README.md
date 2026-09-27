@@ -98,8 +98,8 @@ Setup first calls only `GET /health` and authenticated `GET /v1/models`. These
 checks verify reachability, authentication, and model discovery without
 generating tokens. Discovery must return at least one object with a nonempty
 string model ID, so setup also detects a gateway with no serving account.
-Nothing is written if either check fails. You can run the same read-only check
-separately:
+Health and discovery JSON responses are limited to 1 MiB each. Nothing is
+written if either check fails. You can run the same read-only check separately:
 
 ```bash
 kirolb client diagnose --base-url http://127.0.0.1:8000

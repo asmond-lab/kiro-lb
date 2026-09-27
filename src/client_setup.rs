@@ -1,5 +1,6 @@
 //! Safe, reversible client configuration for Codex CLI and Claude Code.
 
+use futures_util::StreamExt;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,6 +16,7 @@ const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8000";
 const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
 const DEFAULT_KEY_ENV: &str = "KIROLB_API_KEY";
 const MAX_CLIENT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ClientKind {
@@ -364,10 +366,7 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
         if !response.status().is_success() {
             return Err(format!("gateway health check returned HTTP {}", response.status()));
         }
-        let health_json: Value = response
-            .json()
-            .await
-            .map_err(|_| "gateway health check returned malformed JSON".to_owned())?;
+        let health_json = read_diagnostic_json(response, "gateway health check").await?;
         if health_json.get("status").and_then(Value::as_str) != Some("healthy") {
             return Err("gateway health check did not report healthy status".into());
         }
@@ -387,10 +386,7 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
                 response.status()
             ));
         }
-        let document: Value = response
-            .json()
-            .await
-            .map_err(|_| "gateway model discovery returned malformed JSON".to_owned())?;
+        let document = read_diagnostic_json(response, "gateway model discovery").await?;
         let count = usable_model_count(&document)?;
         if count == 0 {
             return Err(
@@ -402,6 +398,31 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
         println!("Diagnostic complete. No inference request was made.");
         Ok(())
     })
+}
+
+async fn read_diagnostic_json(response: reqwest::Response, label: &str) -> Result<Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DIAGNOSTIC_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "{label} response exceeds the {} MiB diagnostic limit",
+            MAX_DIAGNOSTIC_RESPONSE_BYTES / (1024 * 1024)
+        ));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("cannot read {label} response: {e}"))?;
+        if body.len().saturating_add(chunk.len()) > MAX_DIAGNOSTIC_RESPONSE_BYTES {
+            return Err(format!(
+                "{label} response exceeds the {} MiB diagnostic limit",
+                MAX_DIAGNOSTIC_RESPONSE_BYTES / (1024 * 1024)
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| format!("{label} returned malformed JSON"))
 }
 
 fn usable_model_count(document: &Value) -> Result<usize, String> {
