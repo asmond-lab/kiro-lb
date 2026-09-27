@@ -31,6 +31,12 @@ fn source(id: &str) -> serde_json::Value {
     })
 }
 
+fn expired_source(id: &str) -> serde_json::Value {
+    let mut source = source(id);
+    source["credential"]["expiresAt"] = json!("2000-01-01T00:00:00Z");
+    source
+}
+
 fn builder_source(id: &str) -> serde_json::Value {
     json!({
         "type": "internal",
@@ -89,12 +95,13 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);
     kiro_lb::store::initialize().unwrap();
-    let sources = [
+    let sources = vec![
         source("unsupported"),
         source("known-a"),
         source("known-b"),
         source("unknown"),
         builder_source("builder"),
+        expired_source("recovering"),
     ];
     kiro_lb::store::with(|c| kiro_lb::store::replace_account_sources(c, &sources, true)).unwrap();
     kiro_lb::store::save_setting("load_balancing", &json!("session")).unwrap();
@@ -148,6 +155,64 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         .models
         .update(vec![json!({"modelId": "target-model"})]);
     pool.get("unknown").unwrap().models.seed_fallback();
+
+    hang_refresh.store(true, Ordering::SeqCst);
+    pool.warm_up(Duration::from_millis(100)).await;
+    hang_refresh.store(false, Ordering::SeqCst);
+    refresh_blocked.store(false, Ordering::SeqCst);
+    assert!(pool.get("recovering").unwrap().auth().is_none());
+    let recovered = source("recovering")["credential"].to_string();
+    kiro_lb::store::with(|c| {
+        c.execute(
+            "UPDATE account_sources SET credential_json = ?1 WHERE account_id = 'recovering'",
+            [recovered],
+        )
+    })
+    .unwrap();
+
+    for _ in 0..8 {
+        let selected = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.next_account("target-model", &excluded(&["known-b"]), None),
+        )
+        .await
+        .expect("background recovery must not block routing")
+        .unwrap();
+        assert_eq!(selected.id, "known-a");
+    }
+    assert!(
+        pool.get("recovering").unwrap().auth().is_none(),
+        "requests during the retry cooldown must not restart initialization"
+    );
+
+    tokio::time::sleep(kiro_lb::pool::WARM_UP_RETRY_AFTER + Duration::from_millis(50)).await;
+    let selected = tokio::time::timeout(
+        Duration::from_millis(100),
+        pool.next_account("target-model", &excluded(&["known-b"]), None),
+    )
+    .await
+    .expect("a due recovery must stay off the request path")
+    .unwrap();
+    assert_eq!(selected.id, "known-a");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while pool.get("recovering").unwrap().auth().is_none() && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        pool.get("recovering").unwrap().auth().is_some(),
+        "an uninitialized account must recover while a proven account keeps serving"
+    );
+    let recovered = pool
+        .next_account(
+            "target-model",
+            &excluded(&["unsupported", "known-a", "known-b", "unknown", "builder"]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.id, "recovering");
+    pool.get("recovering").unwrap().state.lock().suspended_until = f64::MAX;
 
     let fallback_cached_at =
         kiro_lb::store::now_f64() - kiro_lb::config::MODEL_CACHE_TTL as f64 - 1.0;

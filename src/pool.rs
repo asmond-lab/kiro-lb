@@ -65,6 +65,8 @@ pub struct Account {
     pub models: Arc<ModelInfoCache>,
     pub state: Mutex<AccountState>,
     init: tokio::sync::Mutex<()>,
+    init_retry_at: Mutex<Option<Instant>>,
+    init_scheduled: std::sync::atomic::AtomicBool,
     models_refresh: tokio::sync::Mutex<()>,
     models_refresh_scheduled: std::sync::atomic::AtomicBool,
 }
@@ -185,19 +187,17 @@ impl AccountManager {
         let pending: Vec<Arc<Account>> = self
             .accounts()
             .into_iter()
-            .filter(|a| a.auth.lock().is_none())
+            .filter(|a| {
+                a.auth.lock().is_none()
+                    && !a.init_scheduled.load(std::sync::atomic::Ordering::Acquire)
+            })
             .collect();
         let tasks: Vec<_> = pending
             .into_iter()
             .map(|a| {
                 let pool = self.clone();
                 tokio::spawn(async move {
-                    if tokio::time::timeout(per_account, pool.initialize(&a))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!("Account {} did not initialize within {per_account:?}; it will be retried on first use", a.id);
-                    }
+                    pool.initialize_for_maintenance(&a, per_account).await;
                 })
             })
             .collect();
@@ -313,6 +313,8 @@ impl AccountManager {
                         models: Arc::new(ModelInfoCache::new()),
                         state: Mutex::new(AccountState::default()),
                         init: tokio::sync::Mutex::new(()),
+                        init_retry_at: Mutex::new(None),
+                        init_scheduled: false.into(),
                         models_refresh: tokio::sync::Mutex::new(()),
                         models_refresh_scheduled: false.into(),
                     }),
@@ -566,6 +568,19 @@ impl AccountManager {
         }
     }
 
+    async fn initialize_for_maintenance(&self, a: &Arc<Account>, timeout: Duration) -> bool {
+        let result = tokio::time::timeout(timeout, self.initialize(a)).await;
+        let initialized = matches!(result, Ok(true));
+        *a.init_retry_at.lock() = (!initialized).then(|| Instant::now() + WARM_UP_RETRY_AFTER);
+        if result.is_err() {
+            tracing::warn!(
+                "Account {} did not initialize within {timeout:?}; it will be retried in the background",
+                a.id
+            );
+        }
+        initialized
+    }
+
     /// Single-flight per account: selectors that see the same expired cache
     /// queue on one refresh and reuse its result instead of each calling
     /// ListAvailableModels.
@@ -604,17 +619,51 @@ impl AccountManager {
         self.mark_dirty();
     }
 
-    fn schedule_model_refreshes(self: &Arc<Self>) {
+    fn schedule_account_maintenance(self: &Arc<Self>) {
+        // Hold an idle warm-up lock through scheduling so startup warm-up and
+        // background recovery cannot enqueue consecutive attempts.
+        let warm_idle = self.warm.try_lock().ok();
         let now = store::now_f64();
         for a in self.accounts() {
+            if a.auth.lock().is_none() {
+                if warm_idle.is_none() {
+                    continue;
+                }
+                if a.state.lock().auth_dead_until > now {
+                    continue;
+                }
+                let retry_due = a
+                    .init_retry_at
+                    .lock()
+                    .is_none_or(|retry_at| Instant::now() >= retry_at);
+                if retry_due
+                    && a.init_scheduled
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    let (pool, account) = (self.clone(), a.clone());
+                    tokio::spawn(async move {
+                        pool.initialize_for_maintenance(&account, WARM_UP_ACCOUNT_TIMEOUT)
+                            .await;
+                        account
+                            .init_scheduled
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    });
+                }
+                continue;
+            }
             let ttl = if a.models.is_authoritative() {
                 config::get().account_cache_ttl as f64
             } else {
                 config::MODEL_CACHE_TTL as f64
             };
             let cached = a.state.lock().models_cached_at;
-            if a.auth.lock().is_none()
-                || cached <= 0.0
+            if cached <= 0.0
                 || now - cached <= ttl
                 || a.models_refresh_scheduled
                     .compare_exchange(
@@ -753,7 +802,7 @@ impl AccountManager {
         exclude: &HashSet<String>,
         session: Option<u64>,
     ) -> Option<Arc<Account>> {
-        self.schedule_model_refreshes();
+        self.schedule_account_maintenance();
         if let Some(a) = self.select(model, exclude, session, false).await {
             return Some(a);
         }
@@ -1287,6 +1336,8 @@ mod tests {
             models: Arc::new(ModelInfoCache::new()),
             state: Mutex::new(AccountState::default()),
             init: tokio::sync::Mutex::new(()),
+            init_retry_at: Mutex::new(None),
+            init_scheduled: false.into(),
             models_refresh: tokio::sync::Mutex::new(()),
             models_refresh_scheduled: false.into(),
         })
