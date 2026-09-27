@@ -4,6 +4,7 @@
 
 use parking_lot::Mutex;
 use regex::Regex;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -264,17 +265,38 @@ impl Creds {
             tracing::error!("SQLite credential table is unavailable in {db_path}");
             return false;
         }
-        let get = |key: &str| -> Option<Value> {
-            conn.query_row("SELECT value FROM auth_kv WHERE key = ?1", [key], |r| {
-                r.get::<_, String>(0)
+        let get = |key: &str| -> Result<Option<Value>, ()> {
+            let raw = conn
+                .query_row("SELECT value FROM auth_kv WHERE key = ?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| {
+                    tracing::error!("SQLite error reading credential key {key}: {e}");
+                })?;
+            raw.map(|text| {
+                serde_json::from_str(&text).map_err(|e| {
+                    tracing::error!("SQLite credential key {key} contains invalid JSON: {e}");
+                })
             })
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
+            .transpose()
+        };
+        let first = |keys: &[&str]| -> Result<Option<Value>, ()> {
+            for key in keys {
+                if let Some(value) = get(key)? {
+                    return Ok(Some(value));
+                }
+            }
+            Ok(None)
         };
         let mut invalid_region_type = None;
         let mut invalid_profile_arn_type = None;
         let mut token_region_loaded = false;
-        if let Some(token) = SQLITE_TOKEN_KEYS.iter().find_map(|k| get(k)) {
+        let token = match first(&SQLITE_TOKEN_KEYS) {
+            Ok(token) => token,
+            Err(()) => return false,
+        };
+        if let Some(token) = token {
             if let Some(v) = s(&token, "access_token") {
                 self.access_token = Some(v);
             }
@@ -300,7 +322,11 @@ impl Creds {
                 self.expires_at = parse_iso(&e).or(self.expires_at);
             }
         }
-        if let Some(reg) = SQLITE_REGISTRATION_KEYS.iter().find_map(|k| get(k)) {
+        let registration = match first(&SQLITE_REGISTRATION_KEYS) {
+            Ok(registration) => registration,
+            Err(()) => return false,
+        };
+        if let Some(reg) = registration {
             if let Some(v) = s(&reg, "client_id") {
                 self.client_id = Some(v);
             }
@@ -1137,5 +1163,36 @@ mod tests {
         assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
         assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
         std::fs::remove_file(incomplete).unwrap();
+
+        let malformed = temp_path("malformed-sqlite", "credentials.sqlite");
+        let conn = rusqlite::Connection::open(&malformed).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv(key, value) VALUES (?1, ?2)",
+            rusqlite::params![SQLITE_TOKEN_KEYS[0], "not-json"],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!creds.replace_sqlite(malformed.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&malformed).unwrap();
+        conn.execute(
+            "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
+            rusqlite::params![vec![0xff_u8, 0xfe], SQLITE_TOKEN_KEYS[0]],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!creds.replace_sqlite(malformed.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+        std::fs::remove_file(malformed).unwrap();
     }
 }
