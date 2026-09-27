@@ -342,9 +342,13 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
         .build()
         .map_err(|e| format!("cannot start diagnostic runtime: {e}"))?;
     runtime.block_on(async {
-        let http = Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        if base_url.scheme() == "http" {
+            builder = builder.no_proxy();
+        }
+        let http = builder
             .build()
             .map_err(|e| format!("cannot create diagnostic client: {e}"))?;
         let health = base_url
@@ -489,12 +493,20 @@ fn claude_config(original: Option<&str>, options: &Options, key: &str) -> Result
     let env = env
         .as_object_mut()
         .ok_or_else(|| "existing Claude Code env setting must be a JSON object".to_owned())?;
+    let custom_headers = effective_custom_headers(
+        env.get("ANTHROPIC_CUSTOM_HEADERS"),
+        std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok().as_deref(),
+    )?;
     env.insert(
         "ANTHROPIC_BASE_URL".into(),
         Value::String(options.base_url.as_str().trim_end_matches('/').to_owned()),
     );
     env.insert("ANTHROPIC_API_KEY".into(), Value::String(String::new()));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(key.to_owned()));
+    env.insert(
+        "ANTHROPIC_CUSTOM_HEADERS".into(),
+        Value::String(custom_headers),
+    );
     env.insert(
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".into(),
         Value::String("1".into()),
@@ -505,6 +517,34 @@ fn claude_config(original: Option<&str>, options: &Options, key: &str) -> Result
             content
         })
         .map_err(|e| format!("cannot serialize Claude Code settings: {e}"))
+}
+
+fn effective_custom_headers(
+    configured: Option<&Value>,
+    inherited: Option<&str>,
+) -> Result<String, String> {
+    let headers = match configured {
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(
+                "existing Claude Code ANTHROPIC_CUSTOM_HEADERS setting must be a string".into(),
+            );
+        }
+        None => inherited.unwrap_or_default(),
+    };
+    Ok(headers
+        .split_inclusive('\n')
+        .filter(|line| {
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some((name, _)) = line.split_once(':') else {
+                return true;
+            };
+            !matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "authorization" | "x-api-key"
+            )
+        })
+        .collect())
 }
 
 fn status(clients: Vec<ClientKind>) -> Result<(), String> {
@@ -1868,7 +1908,9 @@ mod tests {
             key_stdin: false,
         };
         let generated = claude_config(
-            Some(r#"{"env":{"ANTHROPIC_API_KEY":"old-key","CUSTOM":"kept"}}"#),
+            Some(
+                r#"{"env":{"ANTHROPIC_API_KEY":"old-key","ANTHROPIC_CUSTOM_HEADERS":"X-Tenant: kept\nx-api-key: stale\r\nAuthorization: Basic stale\nX-Trace: kept\n","CUSTOM":"kept"}}"#,
+            ),
             &options,
             "gateway-key",
         )
@@ -1877,7 +1919,22 @@ mod tests {
 
         assert_eq!(document["env"]["ANTHROPIC_API_KEY"], "");
         assert_eq!(document["env"]["ANTHROPIC_AUTH_TOKEN"], "gateway-key");
+        assert_eq!(
+            document["env"]["ANTHROPIC_CUSTOM_HEADERS"],
+            "X-Tenant: kept\nX-Trace: kept\n"
+        );
         assert_eq!(document["env"]["CUSTOM"], "kept");
+    }
+
+    #[test]
+    fn inherited_custom_headers_keep_metadata_but_drop_credentials() {
+        let headers = effective_custom_headers(
+            None,
+            Some("X-Tenant: kept\nX-Api-Key: stale\nAuthorization: Bearer stale"),
+        )
+        .unwrap();
+
+        assert_eq!(headers, "X-Tenant: kept\n");
     }
 
     #[cfg(windows)]

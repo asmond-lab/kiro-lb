@@ -152,7 +152,7 @@ fn text(output: &Output) -> String {
 fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     let home = TestHome::new();
     fs::create_dir(home.path.join(".claude")).unwrap();
-    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\", \"ANTHROPIC_API_KEY\": \"old-key\"}\n}\n";
+    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\", \"ANTHROPIC_API_KEY\": \"old-key\", \"ANTHROPIC_CUSTOM_HEADERS\": \"X-Tenant: kept\\nx-api-key: stale\"}\n}\n";
     fs::write(home.claude(), original).unwrap();
     #[cfg(unix)]
     {
@@ -182,6 +182,10 @@ fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], url);
     assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "");
     assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], KEY);
+    assert_eq!(
+        settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
+        "X-Tenant: kept\n"
+    );
     let codex = fs::read_to_string(home.codex()).unwrap();
     assert!(codex.contains("wire_api = \"responses\""));
     assert!(codex.contains("env_key = \"KIROLB_API_KEY\""));
@@ -467,6 +471,27 @@ fn diagnose_rejects_malformed_discovery_without_writing_configuration() {
     assert!(!home.claude().exists());
     assert!(!home.state().exists());
     assert!(!home.path.join(".env").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn plaintext_loopback_diagnostic_ignores_environment_proxies() {
+    let home = TestHome::new();
+    let (url, server) = gateway(2);
+    let output = home
+        .command()
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("http_proxy", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("all_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .args(["client", "diagnose", "--base-url", &url])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
+    server.join().unwrap();
 }
 
 #[cfg(target_os = "linux")]
