@@ -4,6 +4,7 @@ use kiro_lb::settings;
 use kiro_lb::upstream::http::{account_concurrency_load, concurrency_slot, reset_concurrency};
 use serde_json::json;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -27,19 +28,34 @@ fn source(id: &str) -> serde_json::Value {
     })
 }
 
-async fn rejecting_client() -> reqwest::Client {
+async fn rejecting_client() -> (reqwest::Client, Arc<AtomicBool>, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let hang = Arc::new(AtomicBool::new(false));
+    let refresh_blocked = Arc::new(AtomicBool::new(false));
+    let should_hang = hang.clone();
+    let blocked = refresh_blocked.clone();
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
+            let should_hang = should_hang.clone();
+            let blocked = blocked.clone();
             tokio::spawn(async move {
+                if should_hang.load(Ordering::SeqCst) {
+                    blocked.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    return;
+                }
                 let _ = socket
                     .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
                     .await;
             });
         }
     });
-    reqwest::Client::builder().proxy(proxy).build().unwrap()
+    (
+        reqwest::Client::builder().proxy(proxy).build().unwrap(),
+        hang,
+        refresh_blocked,
+    )
 }
 
 fn excluded(ids: &[&str]) -> HashSet<String> {
@@ -67,7 +83,8 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     settings::load_tunables();
     reset_concurrency();
 
-    let pool = AccountManager::new(rejecting_client().await);
+    let (http, hang_refresh, refresh_blocked) = rejecting_client().await;
+    let pool = AccountManager::new(http);
     pool.load_credentials();
     for id in ["unsupported", "known-a", "known-b", "unknown"] {
         assert!(pool.initialize_account(id).await, "initialize {id}");
@@ -107,6 +124,28 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         pool.get("unknown").unwrap().state.lock().models_cached_at > fallback_cached_at,
         "an unknown fallback must refresh even while a supported account serves the request"
     );
+
+    let authoritative_cached_at =
+        kiro_lb::store::now_f64() - kiro_lb::config::get().account_cache_ttl as f64 - 1.0;
+    pool.get("known-b").unwrap().state.lock().models_cached_at = authoritative_cached_at;
+    hang_refresh.store(true, Ordering::SeqCst);
+    let selected = tokio::time::timeout(
+        Duration::from_millis(100),
+        pool.next_account("target-model", &excluded(&["known-b"]), None),
+    )
+    .await
+    .expect("an authoritative refresh must not block selection")
+    .unwrap();
+    assert_eq!(selected.id, "known-a");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !refresh_blocked.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        refresh_blocked.load(Ordering::SeqCst),
+        "the authoritative refresh must be held for the regression"
+    );
+    hang_refresh.store(false, Ordering::SeqCst);
 
     let selected = pool
         .next_account("target-model", &excluded(&["known-b"]), None)

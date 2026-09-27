@@ -800,17 +800,10 @@ impl AccountManager {
                     tracing::info!("Probabilistic retry for broken account {}", a.id);
                 }
             }
-            if a.auth.lock().is_none() {
-                if !self.initialize(&a).await {
-                    a.state.lock().failures += 1;
-                    self.mark_dirty();
-                    continue;
-                }
-            } else {
-                let cached = a.state.lock().models_cached_at;
-                if cached > 0.0 && now - cached > cfg.account_cache_ttl as f64 {
-                    self.refresh_models(&a).await;
-                }
+            if a.auth.lock().is_none() && !self.initialize(&a).await {
+                a.state.lock().failures += 1;
+                self.mark_dirty();
+                continue;
             }
             let still_member = self
                 .inner
