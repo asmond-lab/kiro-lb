@@ -842,6 +842,7 @@ dependencies = [
  "hmac",
  "hostname",
  "include_dir",
+ "libc",
  "mimalloc",
  "mime_guess",
  "parking_lot",

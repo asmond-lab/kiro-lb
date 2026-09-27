@@ -90,12 +90,16 @@ other local processes and shell history.
 
 Setup first calls only `GET /health` and authenticated `GET /v1/models`. These
 checks verify reachability, authentication, and model discovery without
-generating tokens. Nothing is written if either check fails. You can run the
-same read-only check separately:
+generating tokens. Discovery must return at least one model, so setup also
+detects a gateway with no serving account. Nothing is written if either check
+fails. You can run the same read-only check separately:
 
 ```bash
 kirolb client diagnose --base-url http://127.0.0.1:8000
 ```
+
+Plaintext HTTP is accepted only for `localhost` and loopback IP addresses. Use
+HTTPS for remote gateways so the bearer key is not sent in cleartext.
 
 For Codex, setup writes the dedicated profile
 `$CODEX_HOME/kirolb.config.toml` (normally

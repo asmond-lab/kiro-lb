@@ -51,6 +51,23 @@ struct PlannedWrite {
     client: ClientKind,
     content: String,
     snapshot: Snapshot,
+    expected: ExpectedFile,
+}
+
+#[derive(Clone)]
+struct ExpectedFile {
+    content: Option<String>,
+    #[cfg(unix)]
+    parent_identity: FileIdentity,
+    #[cfg(unix)]
+    file_identity: Option<FileIdentity>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 struct Options {
@@ -184,12 +201,27 @@ fn normalize_base_url(raw: &str) -> Result<Url, String> {
             "base URL must be an HTTP(S) origin without credentials, query, or fragment".into(),
         );
     }
+    if url.scheme() == "http"
+        && !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("localhost") || is_loopback(host))
+    {
+        return Err(
+            "base URL must use HTTPS unless its host is localhost or a loopback address".into(),
+        );
+    }
     match url.path().trim_end_matches('/') {
         "" => url.set_path("/"),
         "/v1" => url.set_path("/"),
         _ => return Err("base URL path must be empty, /, or /v1".into()),
     }
     Ok(url)
+}
+
+fn is_loopback(host: &str) -> bool {
+    host.trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn read_key(options: &Options) -> Result<String, String> {
@@ -227,7 +259,7 @@ fn setup(options: Options) -> Result<(), String> {
     // this point, restore accepts either the old bytes or the staged bytes.
     save_state(&state)?;
     for plan in plans {
-        atomic_write(&plan.snapshot.path, plan.content.as_bytes())?;
+        conditional_write(&plan.snapshot.path, plan.content.as_bytes(), &plan.expected)?;
     }
     for client in &options.clients {
         if let Some(snapshot) = state.clients.get_mut(client.id()) {
@@ -262,7 +294,6 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
     runtime.block_on(async {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("cannot create diagnostic client: {e}"))?;
@@ -271,6 +302,7 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
             .map_err(|_| "cannot construct health URL".to_owned())?;
         let response = http
             .get(health)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .map_err(|e| format!("gateway health check failed: {e}"))?;
@@ -290,6 +322,7 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
         let response = http
             .get(models)
             .bearer_auth(key)
+            .timeout(Duration::from_secs(20))
             .send()
             .await
             .map_err(|e| format!("gateway model discovery failed: {e}"))?;
@@ -308,6 +341,9 @@ fn run_diagnostic(base_url: &Url, key: &str) -> Result<(), String> {
             .and_then(Value::as_array)
             .ok_or_else(|| "gateway model discovery response has no data array".to_owned())?
             .len();
+        if count == 0 {
+            return Err("gateway model discovery returned no models; add a serving account first".into());
+        }
         println!("Gateway is healthy; authentication succeeded; discovered {count} model(s).");
         println!("Diagnostic complete. No inference request was made.");
         Ok(())
@@ -321,9 +357,8 @@ fn plan_install(
     state: &State,
 ) -> Result<PlannedWrite, String> {
     let path = client_path(client)?;
-    reject_symlink_parent(&path)?;
-    reject_symlink(&path)?;
-    let current = read_optional(&path)?;
+    let expected = inspect_expected(&path, true)?;
+    let current = expected.content.clone();
     let previous = state.clients.get(client.id());
     let (original, original_mode, mut recoverable_sha256) = if let Some(snapshot) = previous {
         let current_hash = current.as_deref().map(hash);
@@ -355,6 +390,7 @@ fn plan_install(
             recoverable_sha256,
         },
         content,
+        expected,
     })
 }
 
@@ -445,6 +481,7 @@ fn status(clients: Vec<ClientKind>) -> Result<(), String> {
 fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
     let _lock = StateLock::acquire()?;
     let mut state = load_state()?;
+    let mut plans = Vec::new();
     for client in &clients {
         let Some(snapshot) = state.clients.get(client.id()) else {
             continue;
@@ -455,31 +492,35 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
                 client.id()
             ));
         }
-        reject_symlink_parent(&snapshot.path)?;
-        reject_symlink(&snapshot.path)?;
-        let current = read_optional(&snapshot.path)?;
-        let current_hash = current.as_deref().map(hash);
+        let expected = inspect_expected(&snapshot.path, false)?;
+        let current = expected.content.as_deref();
+        let current_hash = current.map(hash);
         if !snapshot_accepts(snapshot, current_hash.as_deref()) {
             return Err(format!(
                 "{} configuration changed after setup; refusing destructive restore",
                 client.id()
             ));
         }
+        plans.push((*client, snapshot.clone(), expected));
     }
     for client in clients {
-        let Some(snapshot) = state.clients.remove(client.id()) else {
+        let Some((_, snapshot, expected)) = plans
+            .iter()
+            .find(|(planned, _, _)| *planned == client)
+            .cloned()
+        else {
             println!("{}: nothing to restore", client.id());
             continue;
         };
         match snapshot.original {
             Some(content) => {
-                atomic_write(&snapshot.path, content.as_bytes())?;
+                conditional_write(&snapshot.path, content.as_bytes(), &expected)?;
                 set_file_mode(&snapshot.path, snapshot.original_mode)?;
             }
-            None if snapshot.path.exists() => fs::remove_file(&snapshot.path)
-                .map_err(|e| format!("cannot remove {}: {e}", snapshot.path.display()))?,
+            None if expected.content.is_some() => conditional_remove(&snapshot.path, &expected)?,
             None => {}
         }
+        state.clients.remove(client.id());
         println!("{}: restored", client.id());
     }
     save_state(&state)
@@ -503,10 +544,10 @@ fn env_dir(variable: &str, fallback: &str) -> Result<PathBuf, String> {
         }
         return Ok(path);
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
-    let home = PathBuf::from(home);
+    let home =
+        crate::store::home_dir().ok_or_else(|| "user home directory is not set".to_owned())?;
     if !home.is_absolute() {
-        return Err("HOME must be an absolute path".into());
+        return Err("user home directory must be an absolute path".into());
     }
     Ok(home.join(fallback))
 }
@@ -596,6 +637,430 @@ fn snapshot_accepts(snapshot: &Snapshot, current_hash: Option<&str>) -> bool {
         }
         None => snapshot.original.is_none(),
     }
+}
+
+fn inspect_expected(path: &Path, create_parent: bool) -> Result<ExpectedFile, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = open_parent_secure(path, create_parent)?;
+        let parent_metadata = parent
+            .metadata()
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+        let inspected = read_at(&parent, path)?;
+        Ok(ExpectedFile {
+            content: inspected.as_ref().map(|(content, _)| content.clone()),
+            parent_identity: FileIdentity {
+                device: parent_metadata.dev(),
+                inode: parent_metadata.ino(),
+            },
+            file_identity: inspected.map(|(_, identity)| identity),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+        if create_parent && !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            set_dir_private(parent)?;
+        }
+        reject_symlink_parent(path)?;
+        reject_symlink(path)?;
+        Ok(ExpectedFile {
+            content: read_optional(path)?,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn open_parent_secure(path: &Path, create: bool) -> Result<fs::File, String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(format!("{} must be an absolute path", path.display()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let mut directory = fs::File::open("/").map_err(|e| format!("cannot open /: {e}"))?;
+    for component in parent.components() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(format!("unsafe path component in {}", path.display()));
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| format!("invalid path component in {}", path.display()))?;
+        let open = || unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        let mut descriptor = open();
+        if descriptor < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::NotFound
+        {
+            let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if created < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(format!(
+                    "cannot create directory component in {}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                ));
+            }
+            descriptor = open();
+        }
+        if descriptor < 0 {
+            return Err(format!(
+                "cannot safely open parent of {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        directory = unsafe { fs::File::from_raw_fd(descriptor) };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn leaf_name(path: &Path) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| format!("invalid file name {}", path.display()))
+}
+
+#[cfg(unix)]
+fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentity)>, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let name = leaf_name(path)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(format!("refusing to use symlink {}", path.display()));
+        }
+        return Err(format!("cannot safely read {}: {error}", path.display()));
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(Some((
+        content,
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    )))
+}
+
+#[cfg(unix)]
+fn verify_parent(parent: &fs::File, path: &Path, expected: &ExpectedFile) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = parent
+        .metadata()
+        .map_err(|e| format!("cannot inspect parent of {}: {e}", path.display()))?;
+    let actual = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if actual != expected.parent_identity {
+        return Err(format!(
+            "parent directory of {} changed after planning; refusing update",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn expected_matches(actual: &Option<(String, FileIdentity)>, expected: &ExpectedFile) -> bool {
+    match (actual, expected.content.as_deref(), expected.file_identity) {
+        (None, None, None) => true,
+        (Some((actual_content, actual_identity)), Some(content), Some(identity)) => {
+            actual_content == content && *actual_identity == identity
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_at(
+    parent: &fs::File,
+    from: &std::ffi::CStr,
+    to: &std::ffi::CStr,
+    flags: libc::c_uint,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_staged(
+    parent: &fs::File,
+    path: &Path,
+    content: &[u8],
+) -> Result<(std::ffi::CString, FileIdentity), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let name = std::ffi::CString::new(format!(".kirolb-{}.tmp", Uuid::new_v4()))
+        .expect("generated temporary name");
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(format!(
+            "cannot stage {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    file.write_all(content)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect staged file for {}: {e}", path.display()))?;
+    Ok((
+        name,
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn conditional_write(path: &Path, content: &[u8], expected: &ExpectedFile) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    let parent = open_parent_secure(path, false)?;
+    verify_parent(&parent, path, expected)?;
+    let target = leaf_name(path)?;
+    if !expected_matches(&read_at(&parent, path)?, expected) {
+        return Err(format!(
+            "{} changed after planning; refusing update",
+            path.display()
+        ));
+    }
+    let (temporary, staged_identity) = create_staged(&parent, path, content)?;
+    let temporary_path = path.with_file_name(temporary.to_string_lossy().as_ref());
+    let result = match expected.content.as_deref() {
+        None => rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE).map_err(|e| {
+            format!(
+                "{} changed after planning; refusing update: {e}",
+                path.display()
+            )
+        }),
+        Some(expected_content) => {
+            if let Err(error) = rename_at(&parent, &temporary, &target, libc::RENAME_EXCHANGE) {
+                Err(format!(
+                    "cannot atomically update {}: {error}",
+                    path.display()
+                ))
+            } else {
+                let old = read_at(&parent, &temporary_path);
+                let matches =
+                    old.as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|(actual, identity)| {
+                            actual == expected_content && Some(*identity) == expected.file_identity
+                        });
+                if matches {
+                    Ok(())
+                } else {
+                    let installed = read_at(&parent, path);
+                    let can_rollback = installed
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|(actual, identity)| {
+                            actual.as_bytes() == content && *identity == staged_identity
+                        });
+                    if can_rollback {
+                        rename_at(&parent, &temporary, &target, libc::RENAME_EXCHANGE).map_err(
+                        |e| {
+                            format!(
+                                "cannot roll back conflicted update of {}; conflicting bytes were preserved at {}: {e}",
+                                path.display(), temporary_path.display()
+                            )
+                        },
+                    )?;
+                        Err(format!(
+                            "{} changed after planning; refusing update",
+                            path.display()
+                        ))
+                    } else {
+                        return Err(format!(
+                            "{} changed during commit; conflicting bytes were preserved at {}",
+                            path.display(),
+                            temporary_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    let unlink = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
+    if unlink < 0 && io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
+        return Err(format!(
+            "cannot remove staged file for {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    parent
+        .sync_all()
+        .map_err(|e| format!("cannot sync parent of {}: {e}", path.display()))?;
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    let parent = open_parent_secure(path, false)?;
+    verify_parent(&parent, path, expected)?;
+    let target = leaf_name(path)?;
+    if !expected_matches(&read_at(&parent, path)?, expected) {
+        return Err(format!(
+            "{} changed after planning; refusing removal",
+            path.display()
+        ));
+    }
+    let temporary = std::ffi::CString::new(format!(".kirolb-{}.tmp", Uuid::new_v4()))
+        .expect("generated temporary name");
+    let temporary_path = path.with_file_name(temporary.to_string_lossy().as_ref());
+    rename_at(&parent, &target, &temporary, libc::RENAME_NOREPLACE).map_err(|e| {
+        format!(
+            "{} changed after planning; refusing removal: {e}",
+            path.display()
+        )
+    })?;
+    let moved = read_at(&parent, &temporary_path);
+    let matches = moved
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .is_some_and(|(actual, identity)| {
+            expected.content.as_deref() == Some(actual) && expected.file_identity == Some(*identity)
+        });
+    if !matches {
+        if rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE).is_err() {
+            return Err(format!(
+                "{} changed during removal; conflicting bytes were preserved at {}",
+                path.display(),
+                temporary_path.display()
+            ));
+        }
+        return Err(format!(
+            "{} changed after planning; refusing removal",
+            path.display()
+        ));
+    }
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
+    if result < 0 {
+        return Err(format!(
+            "cannot remove {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    parent
+        .sync_all()
+        .map_err(|e| format!("cannot sync parent of {}: {e}", path.display()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn conditional_write(path: &Path, content: &[u8], expected: &ExpectedFile) -> Result<(), String> {
+    let current = inspect_expected(path, false)?;
+    if current.content != expected.content {
+        return Err(format!(
+            "{} changed after planning; refusing update",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    if current.parent_identity != expected.parent_identity
+        || current.file_identity != expected.file_identity
+    {
+        return Err(format!(
+            "{} identity changed after planning; refusing update",
+            path.display()
+        ));
+    }
+    atomic_write(path, content)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String> {
+    let current = inspect_expected(path, false)?;
+    if current.content != expected.content {
+        return Err(format!(
+            "{} changed after planning; refusing removal",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    if current.parent_identity != expected.parent_identity
+        || current.file_identity != expected.file_identity
+    {
+        return Err(format!(
+            "{} identity changed after planning; refusing removal",
+            path.display()
+        ));
+    }
+    fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
@@ -775,4 +1240,88 @@ fn set_file_private(_path: &Path) -> Result<(), String> {
 
 fn hash(content: &str) -> String {
     hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn temporary_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kirolb-client-unit-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn plaintext_base_urls_are_limited_to_loopback_hosts() {
+        assert!(normalize_base_url("http://localhost:8000").is_ok());
+        assert!(normalize_base_url("http://127.255.0.1:8000").is_ok());
+        assert!(normalize_base_url("http://[::1]:8000").is_ok());
+        assert!(normalize_base_url("https://gateway.example:8443").is_ok());
+        assert!(normalize_base_url("http://gateway.example:8000").is_err());
+        assert!(normalize_base_url("http://192.168.1.10:8000").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_write_refuses_a_post_plan_edit() {
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        fs::write(&path, "before").unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+        fs::write(&path, "user edit").unwrap();
+
+        let error = conditional_write(&path, b"generated", &expected).unwrap_err();
+
+        assert!(error.contains("changed after planning"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "user edit");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_remove_refuses_a_post_plan_edit() {
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        fs::write(&path, "installed").unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+        fs::write(&path, "user edit").unwrap();
+
+        let error = conditional_remove(&path, &expected).unwrap_err();
+
+        assert!(error.contains("changed after planning"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "user edit");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_write_refuses_an_ancestor_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let home = directory.join("home");
+        let config = home.join(".claude");
+        fs::create_dir_all(&config).unwrap();
+        let path = config.join("settings.json");
+        fs::write(&path, "before").unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+
+        let moved_home = directory.join("moved-home");
+        let attacker_home = directory.join("attacker-home");
+        fs::create_dir_all(attacker_home.join(".claude")).unwrap();
+        let attacker_path = attacker_home.join(".claude/settings.json");
+        fs::write(&attacker_path, "do not touch").unwrap();
+        fs::rename(&home, &moved_home).unwrap();
+        symlink(&attacker_home, &home).unwrap();
+
+        assert!(conditional_write(&path, b"generated", &expected).is_err());
+        assert_eq!(fs::read_to_string(attacker_path).unwrap(), "do not touch");
+        assert_eq!(
+            fs::read_to_string(moved_home.join(".claude/settings.json")).unwrap(),
+            "before"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -25,6 +25,7 @@ impl TestHome {
         command
             .env_clear()
             .env("HOME", &self.path)
+            .env("USERPROFILE", &self.path)
             .env("KIROLB_API_KEY", KEY)
             .current_dir(&self.path);
         command
@@ -319,6 +320,48 @@ fn diagnose_rejects_malformed_discovery_without_writing_configuration() {
     assert!(!home.claude().exists());
     assert!(!home.state().exists());
     assert!(!home.path.join(".env").exists());
+}
+
+#[test]
+fn setup_rejects_empty_model_discovery_without_writing_configuration() {
+    let home = TestHome::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(2).enumerate() {
+            let mut stream = stream.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let body = if index == 0 {
+                r#"{"status":"healthy"}"#
+            } else {
+                r#"{"data":[]}"#
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+
+    let output = setup(&home, &url, "all");
+
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output).contains("returned no models"));
+    assert!(!home.codex().exists());
+    assert!(!home.claude().exists());
+    assert!(!home.state().exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn status_uses_userprofile_when_home_is_absent() {
+    let home = TestHome::new();
+    let output = home
+        .command()
+        .env_remove("HOME")
+        .args(["client", "status", "all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
 }
 
 #[test]
