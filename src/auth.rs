@@ -187,6 +187,12 @@ fn s(v: &Value, k: &str) -> Option<String> {
 }
 
 impl Creds {
+    fn replace_document(&mut self, data: &Value) {
+        let mut fresh = Creds::default();
+        fresh.load_document(data);
+        *self = fresh;
+    }
+
     fn load_document(&mut self, data: &Value) {
         if let Some(v) = s(data, "_kiroLbLoginIdentity") {
             self.bound_identity = Some(v);
@@ -254,6 +260,12 @@ impl Creds {
                 path.display()
             ),
         }
+    }
+
+    fn replace_sqlite(&mut self, db_path: &str) {
+        let mut fresh = Creds::default();
+        fresh.load_sqlite(db_path);
+        *self = fresh;
     }
 
     fn load_sqlite(&mut self, db_path: &str) {
@@ -491,14 +503,14 @@ impl KiroAuth {
         let mut c = Creds::default();
         match source {
             Source::Internal(id) => {
-                c.load_document(&store::load_internal_credential(id).unwrap_or(json!({})))
+                c.replace_document(&store::load_internal_credential(id).unwrap_or(json!({})))
             }
-            Source::Sqlite(p) => c.load_sqlite(p),
+            Source::Sqlite(p) => c.replace_sqlite(p),
             Source::File(p) => match std::fs::read_to_string(store::expand_home(p))
                 .ok()
                 .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             {
-                Some(d) => c.load_document(&d),
+                Some(d) => c.replace_document(&d),
                 None => tracing::warn!("Credentials file not found: {p}"),
             },
         }
@@ -793,10 +805,14 @@ impl KiroAuth {
     }
 
     fn reload_raw_external(&self) -> bool {
-        if matches!(self.source, Source::Internal(_)) || !self.is_current_login() {
+        if matches!(self.source, Source::Internal(_)) {
             return false;
         }
-        *self.creds.lock() = Self::read_source(&self.source);
+        let fresh = Self::read_source(&self.source);
+        if !self.creds_match_login(&fresh) {
+            return false;
+        }
+        *self.creds.lock() = fresh;
         true
     }
 
@@ -820,11 +836,15 @@ impl KiroAuth {
                     false
                 }
             }
-            Source::File(_) | Source::Sqlite(_) if self.is_current_login() => {
+            Source::File(_) | Source::Sqlite(_) => {
+                let fresh = Self::read_source(&self.source);
+                if !self.creds_match_login(&fresh) {
+                    return false;
+                }
+                *self.creds.lock() = fresh;
                 self.apply_overlay();
                 true
             }
-            Source::File(_) | Source::Sqlite(_) => false,
         }
     }
 
@@ -1104,9 +1124,17 @@ mod tests {
             ],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv(key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                SQLITE_TOKEN_KEYS[0],
+                json!({"profile_arn": false}).to_string()
+            ],
+        )
+        .unwrap();
         drop(conn);
         let mut reloaded = Creds::default();
-        reloaded.load_sqlite(path.to_str().unwrap());
+        reloaded.replace_sqlite(path.to_str().unwrap());
         assert!(validate_credential_regions(&reloaded).is_err());
         let (http, listener) = recording_client();
 
@@ -1117,9 +1145,10 @@ mod tests {
             http,
         );
 
-        assert!(
-            matches!(result, Err(AuthError::Other(message)) if message.starts_with("invalid credential auth region:"))
-        );
+        assert!(matches!(
+            result,
+            Err(AuthError::Other(message)) if message.starts_with("invalid ")
+        ));
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
 
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1131,11 +1160,31 @@ mod tests {
             ],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
+            rusqlite::params![json!({}).to_string(), SQLITE_TOKEN_KEYS[0]],
+        )
+        .unwrap();
         drop(conn);
-        reloaded.load_sqlite(path.to_str().unwrap());
+        reloaded.replace_sqlite(path.to_str().unwrap());
         assert_eq!(reloaded.sso_region.as_deref(), Some("us-iso-east-1"));
         assert!(!reloaded.invalid_region_type);
         assert!(!reloaded.invalid_profile_arn_type);
+        assert!(validate_credential_regions(&reloaded).is_ok());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                json!({"client_id": "client", "client_secret": "secret"}).to_string(),
+                SQLITE_REGISTRATION_KEYS[0]
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        reloaded.replace_sqlite(path.to_str().unwrap());
+        assert!(reloaded.sso_region.is_none());
+        assert!(!reloaded.invalid_region_type);
         assert!(validate_credential_regions(&reloaded).is_ok());
         std::fs::remove_file(path).unwrap();
     }
@@ -1170,9 +1219,24 @@ mod tests {
     }
 
     #[test]
-    fn corrected_credential_types_clear_stale_validation_errors() {
+    fn full_document_reload_clears_removed_validation_errors() {
         let mut creds = Creds::default();
-        creds.load_document(&json!({"region": 7, "profileArn": false}));
+        creds.replace_document(&json!({"region": 7, "profileArn": false}));
+        assert!(validate_credential_regions(&creds).is_err());
+
+        creds.replace_document(&json!({"refreshToken": "corrected"}));
+
+        assert!(creds.sso_region.is_none());
+        assert!(creds.profile_arn.is_none());
+        assert!(validate_credential_regions(&creds).is_ok());
+    }
+
+    #[test]
+    fn partial_overlay_only_clears_explicitly_corrected_validation_errors() {
+        let mut creds = Creds::default();
+        creds.replace_document(&json!({"region": 7, "profileArn": false}));
+
+        creds.load_document(&json!({"refreshToken": "overlay"}));
         assert!(validate_credential_regions(&creds).is_err());
 
         creds.load_document(&json!({
