@@ -58,8 +58,21 @@ impl RequestCtx {
     }
 
     pub fn begin_generation(&self) -> GenerationCredits {
+        let model = self.usage.lock().model.clone().map(|model| {
+            let normalized = normalize_model_name(&model);
+            if normalized.is_empty() {
+                model
+            } else {
+                normalized
+            }
+        });
+        let attribution = self.api_key_id.clone().and_then(|key| {
+            let account = self.account_id.lock().clone()?;
+            Some((key, account, model?))
+        });
         GenerationCredits {
             usage: self.usage.clone(),
+            attribution,
             snapshot: None,
         }
     }
@@ -98,13 +111,13 @@ impl RequestCtx {
         };
         let completion = completion.max(0);
         let mut pending = PENDING.lock();
-        let entry = pending.entry((key, account, model)).or_insert([0; 5]);
-        entry[0] += prompt.max(0);
-        entry[1] += completion;
-        entry[2] += 1;
+        let entry = pending.entry((key, account, model)).or_default();
+        entry.counts[0] += prompt.max(0);
+        entry.counts[1] += completion;
+        entry.counts[2] += 1;
         if let Some(g) = generation_seconds.filter(|_| completion > 1) {
-            entry[3] += (g * 1000.0) as i64;
-            entry[4] += completion - 1;
+            entry.counts[3] += (g * 1000.0) as i64;
+            entry.counts[4] += completion - 1;
         }
     }
 }
@@ -114,6 +127,7 @@ impl RequestCtx {
 /// contribute additively to the request total.
 pub struct GenerationCredits {
     usage: Arc<Mutex<RequestUsage>>,
+    attribution: Option<Key>,
     snapshot: Option<f64>,
 }
 
@@ -125,23 +139,35 @@ impl GenerationCredits {
         let previous = self.snapshot.replace(next).unwrap_or(0.0);
         let mut usage = self.usage.lock();
         usage.credits = Some(usage.credits.unwrap_or(0.0) + next - previous);
+        drop(usage);
+        if let Some(key) = &self.attribution {
+            let mut pending = PENDING.lock();
+            let entry = pending.entry(key.clone()).or_default();
+            entry.credits = Some(entry.credits.unwrap_or(0.0) + next - previous);
+        }
     }
 }
 
 type Key = (String, String, String);
-static PENDING: Mutex<Option<HashMap<Key, [i64; 5]>>> = Mutex::new(None);
-
-trait LockExt {
-    fn entry(&mut self, k: Key) -> std::collections::hash_map::Entry<'_, Key, [i64; 5]>;
+#[derive(Default)]
+struct PendingUsage {
+    counts: [i64; 5],
+    credits: Option<f64>,
 }
 
-impl LockExt for parking_lot::MutexGuard<'_, Option<HashMap<Key, [i64; 5]>>> {
-    fn entry(&mut self, k: Key) -> std::collections::hash_map::Entry<'_, Key, [i64; 5]> {
+static PENDING: Mutex<Option<HashMap<Key, PendingUsage>>> = Mutex::new(None);
+
+trait LockExt {
+    fn entry(&mut self, k: Key) -> std::collections::hash_map::Entry<'_, Key, PendingUsage>;
+}
+
+impl LockExt for parking_lot::MutexGuard<'_, Option<HashMap<Key, PendingUsage>>> {
+    fn entry(&mut self, k: Key) -> std::collections::hash_map::Entry<'_, Key, PendingUsage> {
         self.get_or_insert_with(HashMap::new).entry(k)
     }
 }
 
-pub type UsageRow = (String, String, String, i64, i64, i64, i64, i64);
+pub type UsageRow = (String, String, String, i64, i64, i64, i64, i64, Option<f64>);
 
 pub fn drain_pending() -> Vec<UsageRow> {
     let mut guard = PENDING.lock();
@@ -149,16 +175,22 @@ pub fn drain_pending() -> Vec<UsageRow> {
         .take()
         .unwrap_or_default()
         .into_iter()
-        .map(|((k, a, m), c)| (k, a, m, c[0], c[1], c[2], c[3], c[4]))
+        .map(|((k, a, m), usage)| {
+            let c = usage.counts;
+            (k, a, m, c[0], c[1], c[2], c[3], c[4], usage.credits)
+        })
         .collect()
 }
 
 pub fn restore_pending(rows: Vec<UsageRow>) {
     let mut guard = PENDING.lock();
-    for (k, a, m, p, c, r, g, t) in rows {
-        let e = guard.entry((k, a, m)).or_insert([0; 5]);
+    for (k, a, m, p, c, r, g, t, credits) in rows {
+        let e = guard.entry((k, a, m)).or_default();
         for (i, v) in [p, c, r, g, t].into_iter().enumerate() {
-            e[i] += v;
+            e.counts[i] += v;
+        }
+        if let Some(credits) = credits {
+            e.credits = Some(e.credits.unwrap_or(0.0) + credits);
         }
     }
 }

@@ -11,7 +11,7 @@ use crate::parser::{
     deduplicate_tool_calls, parse_bracket_tool_calls, AwsEventStreamParser, MeteringEvent,
     ParsedEvent,
 };
-use crate::usage_tracking::RequestCtx;
+use crate::usage_tracking::{GenerationCredits, RequestCtx};
 
 #[derive(Debug, Clone)]
 pub enum KiroEvent {
@@ -83,10 +83,27 @@ fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
     }))
 }
 
-pub fn parse_kiro_stream(
+fn convert_batch(
+    events: Vec<ParsedEvent>,
+    meter: &mut Option<GenerationCredits>,
+) -> Result<Vec<KiroEvent>, StreamError> {
+    let mut converted = Vec::with_capacity(events.len());
+    for event in events {
+        if let Some(event) = convert(event)? {
+            if let (Some(meter), KiroEvent::Metering(reading)) = (meter.as_mut(), &event) {
+                meter.report(reading);
+            }
+            converted.push(event);
+        }
+    }
+    Ok(converted)
+}
+
+fn parse_kiro_stream_inner(
     mut body: ByteStream,
     first_token_timeout: f64,
     read_timeout: f64,
+    mut meter: Option<GenerationCredits>,
 ) -> EventStream {
     Box::pin(async_stream::try_stream! {
         let mut parser = AwsEventStreamParser::new();
@@ -97,11 +114,10 @@ pub fn parse_kiro_stream(
             Ok(Some(Err(e))) => Err(StreamError::Upstream(e.to_string()))?,
             Ok(Some(Ok(b))) => b,
         };
-        for e in parser.feed(&first) {
-            if let Some(ev) = convert(e)? {
-                received = true;
-                yield ev;
-            }
+        let events = convert_batch(parser.feed(&first), &mut meter)?;
+        received |= !events.is_empty();
+        for event in events {
+            yield event;
         }
         loop {
             let next = match tokio::time::timeout(Duration::from_secs_f64(read_timeout), body.next()).await {
@@ -110,11 +126,10 @@ pub fn parse_kiro_stream(
             };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| StreamError::Upstream(e.to_string()))?;
-            for e in parser.feed(&chunk) {
-                if let Some(ev) = convert(e)? {
-                    received = true;
-                    yield ev;
-                }
+            let events = convert_batch(parser.feed(&chunk), &mut meter)?;
+            received |= !events.is_empty();
+            for event in events {
+                yield event;
             }
         }
         for tc in parser.get_unemitted_tool_calls() {
@@ -128,6 +143,28 @@ pub fn parse_kiro_stream(
             Err(StreamError::Protocol(NO_EVENTS))?;
         }
     })
+}
+
+pub fn parse_kiro_stream(
+    body: ByteStream,
+    first_token_timeout: f64,
+    read_timeout: f64,
+) -> EventStream {
+    parse_kiro_stream_inner(body, first_token_timeout, read_timeout, None)
+}
+
+pub fn parse_kiro_stream_metered(
+    body: ByteStream,
+    first_token_timeout: f64,
+    read_timeout: f64,
+    request: &RequestCtx,
+) -> EventStream {
+    parse_kiro_stream_inner(
+        body,
+        first_token_timeout,
+        read_timeout,
+        Some(request.begin_generation()),
+    )
 }
 
 /// Attributes metering to one physical upstream generation while leaving the

@@ -9,7 +9,7 @@ use kiro_lb::stream_openai::{self, OpenAIOptions};
 use kiro_lb::upstream::http::Transport;
 use kiro_lb::usage_tracking::RequestCtx;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 fn reading(value: Value) -> MeteringEvent {
     MeteringEvent::parse(value).expect("valid metering event")
@@ -176,28 +176,91 @@ async fn error_and_disconnect_retain_the_latest_observed_snapshot() {
     assert_eq!(disconnected.usage.lock().credits, Some(0.04));
 }
 
+fn initialize_store() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "kirolb-credit-metering-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DASHBOARD_DATA_DIR", dir);
+        kiro_lb::store::initialize().unwrap();
+    });
+}
+
 #[tokio::test]
-async fn account_changes_do_not_relabel_or_erase_request_credits() {
-    let request = RequestCtx::new(None);
+async fn account_changes_persist_credits_to_the_generation_origin() {
+    initialize_store();
+    let _ = kiro_lb::usage_tracking::drain_pending();
+    let request = RequestCtx::new(Some("meter-key".into()));
+    request.note_model("claude-sonnet-4.5");
     request.set_account("account-a");
-    metered(
+    let mut account_a = metered(
         &request,
-        vec![Ok(KiroEvent::Metering(reading(
-            json!({"unit": "credit", "usage": 0.02}),
-        )))],
-    )
-    .collect::<Vec<_>>()
-    .await;
+        vec![
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.04}),
+            ))),
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.0125}),
+            ))),
+            Ok(KiroEvent::Content("unread".into())),
+        ],
+    );
+    assert!(account_a.next().await.unwrap().is_ok());
+    assert!(account_a.next().await.unwrap().is_ok());
+    drop(account_a);
+
     request.set_account("account-b");
+    let mut account_b = metered(
+        &request,
+        vec![
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credits", "usage": 0.03}),
+            ))),
+            Err(StreamError::Upstream("failed after metering".into())),
+        ],
+    );
+    assert!(account_b.next().await.unwrap().is_ok());
+    assert!(account_b.next().await.unwrap().is_err());
+
+    request.set_account("account-zero");
     metered(
         &request,
         vec![Ok(KiroEvent::Metering(reading(
-            json!({"unit": "credits", "usage": 0.01}),
+            json!({"unit": "credit", "usage": 0}),
         )))],
     )
     .collect::<Vec<_>>()
     .await;
-    assert_eq!(request.usage.lock().credits, Some(0.03));
+    request.set_account("account-unknown");
+    metered(&request, vec![Ok(KiroEvent::Content("no meter".into()))])
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(request.usage.lock().credits, Some(0.0425));
+    assert_eq!(kiro_lb::dashboard_store::flush_key_model_usage(), 3);
+    let rows = kiro_lb::store::with(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT account_id, credits FROM account_model_usage
+             WHERE key_id = 'meter-key' ORDER BY account_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        vec!["account-a", "account-b", "account-zero"]
+    );
+    for ((_, actual), expected) in rows.iter().zip([0.0125, 0.03, 0.0]) {
+        assert!((actual.unwrap() - expected).abs() < f64::EPSILON * 4.0);
+    }
 }
 
 #[tokio::test]
@@ -231,6 +294,50 @@ async fn openai_stream_exposes_the_final_generation_snapshot_including_zero() {
 }
 
 #[tokio::test]
+async fn legacy_usage_still_completes_an_openai_stream_without_counting_credits() {
+    let request = RequestCtx::new(None);
+    let upstream = events(vec![
+        Ok(KiroEvent::Content("complete".into())),
+        Ok(KiroEvent::Usage(json!(1.0))),
+    ]);
+    let chunks: Vec<String> = stream_openai::stream(upstream, context(request.clone()), options())
+        .map(|chunk| chunk.unwrap())
+        .collect()
+        .await;
+    let terminal = chunks
+        .iter()
+        .filter_map(|chunk| chunk.strip_prefix("data: "))
+        .filter_map(|body| serde_json::from_str::<Value>(body.trim()).ok())
+        .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("terminal chunk");
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    assert!(terminal["usage"].get("credits_used").is_none());
+    assert_eq!(request.usage.lock().credits, None);
+}
+
+#[tokio::test]
+async fn non_streaming_anthropic_merges_legacy_and_metering_cache_fields() {
+    let request = RequestCtx::new(None);
+    let response = kiro_lb::stream_anthropic::collect(
+        events(vec![
+            Ok(KiroEvent::Content("answer".into())),
+            Ok(KiroEvent::Usage(json!({"cacheReadInputTokens": 7}))),
+            Ok(KiroEvent::Metering(reading(json!({
+                "unit": "credit",
+                "usage": 0.01,
+                "cacheCreationInputTokens": 3
+            })))),
+            Ok(KiroEvent::ContextUsage(1.0)),
+        ]),
+        context(request),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["usage"]["cache_read_input_tokens"], 7);
+    assert_eq!(response["usage"]["cache_creation_input_tokens"], 3);
+}
+
+#[tokio::test]
 async fn parsed_route_pipeline_records_metering_for_non_streaming_openai() {
     let request = RequestCtx::new(None);
     let bytes: stream_core::ByteStream =
@@ -239,8 +346,7 @@ async fn parsed_route_pipeline_records_metering_for_non_streaming_openai() {
                 br#"{"content":"answer"}{"unit":"credit","usage":0.0125}{"stopReason":"end_turn"}"#,
             )),
         ]));
-    let parsed = stream_core::parse_kiro_stream(bytes, 1.0, 1.0);
-    let metered = stream_core::meter_generation(parsed, &request);
+    let metered = stream_core::parse_kiro_stream_metered(bytes, 1.0, 1.0, &request);
 
     let response = stream_openai::collect(metered, context(request.clone()), options(), false)
         .await
@@ -248,4 +354,24 @@ async fn parsed_route_pipeline_records_metering_for_non_streaming_openai() {
 
     assert_eq!(response["usage"]["credits_used"], 0.0125);
     assert_eq!(request.usage.lock().credits, Some(0.0125));
+}
+
+#[tokio::test]
+async fn same_chunk_metering_is_recorded_before_earlier_content_is_yielded() {
+    let request = RequestCtx::new(None);
+    let bytes: stream_core::ByteStream = Box::pin(futures_util::stream::iter(vec![Ok::<
+        Bytes,
+        reqwest::Error,
+    >(
+        Bytes::from_static(br#"{"content":"answer"}{"unit":"credit","usage":0.025}"#),
+    )]));
+    let mut parsed = stream_core::parse_kiro_stream_metered(bytes, 1.0, 1.0, &request);
+
+    assert!(matches!(
+        parsed.next().await,
+        Some(Ok(KiroEvent::Content(content))) if content == "answer"
+    ));
+    drop(parsed);
+
+    assert_eq!(request.usage.lock().credits, Some(0.025));
 }

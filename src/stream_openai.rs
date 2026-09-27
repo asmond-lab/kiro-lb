@@ -43,6 +43,7 @@ pub fn stream(
         v.accept(Some(&first), false)?;
         yield data(&first);
         let mut metering: Option<f64> = None;
+        let mut legacy_usage_reported = false;
         let mut context_usage: Option<f64> = None;
         let mut full = String::new();
         let mut thinking = String::new();
@@ -99,14 +100,14 @@ pub fn stream(
                         metering = Some(credits);
                     }
                 }
-                KiroEvent::Usage(_) => {}
+                KiroEvent::Usage(_) => legacy_usage_reported = true,
                 KiroEvent::ContextUsage(p) => context_usage = Some(p),
                 KiroEvent::StopReason(s) if !s.is_empty() => stop = Some(s),
                 _ => {}
             }
         }
         if !received { Err(StreamError::Protocol(stream_core::NO_EVENTS))?; }
-        let completed = metering.is_some() || context_usage.is_some();
+        let completed = metering.is_some() || legacy_usage_reported || context_usage.is_some();
         let mut all = tools;
         all.extend(parse_bracket_tool_calls(&full));
         let mut all = deduplicate_tool_calls(&all);
