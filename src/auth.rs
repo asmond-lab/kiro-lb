@@ -5,6 +5,7 @@
 use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -73,6 +74,42 @@ struct Creds {
     client_id: Option<String>,
     client_secret: Option<String>,
     expires_at: Option<f64>,
+    bound_identity: Option<String>,
+}
+
+fn fingerprint(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn stable_login_identity(c: &Creds) -> Option<String> {
+    if let Some(identity) = c.bound_identity.as_deref() {
+        return Some(identity.to_owned());
+    }
+    let descriptor = c
+        .profile_arn
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| format!("profile:{}", v.trim()))
+        .or_else(|| {
+            c.client_id
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    format!(
+                        "builder:{}:{}",
+                        c.sso_region.as_deref().unwrap_or_default().trim(),
+                        v.trim()
+                    )
+                })
+        })?;
+    Some(format!("login:{}", fingerprint(&descriptor)))
+}
+
+fn source_fingerprint(c: &Creds) -> Option<String> {
+    c.refresh_token
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("source:{}", fingerprint(v)))
 }
 
 pub fn parse_iso(value: &str) -> Option<f64> {
@@ -161,6 +198,9 @@ fn s(v: &Value, k: &str) -> Option<String> {
 
 impl Creds {
     fn load_document(&mut self, data: &Value) {
+        if let Some(v) = s(data, "_kiroLbLoginIdentity") {
+            self.bound_identity = Some(v);
+        }
         if let Some(v) = data.get("refreshToken") {
             self.refresh_token = v.as_str().map(str::to_owned);
         }
@@ -307,6 +347,8 @@ pub enum Source {
 pub struct KiroAuth {
     source: Source,
     creds: Mutex<Creds>,
+    login_identity: Option<String>,
+    source_fingerprint: Mutex<Option<String>>,
     refresh_lock: tokio::sync::Mutex<()>,
     auth_type: AuthType,
     refresh_url: String,
@@ -323,23 +365,14 @@ impl KiroAuth {
         api_region: Option<&str>,
         http: reqwest::Client,
     ) -> KiroAuth {
-        let mut c = Creds::default();
-        match &source {
-            Source::Internal(id) => {
-                c.load_document(&store::load_internal_credential(id).unwrap_or(json!({})))
-            }
-            Source::Sqlite(p) => c.load_sqlite(p),
-            Source::File(p) => match std::fs::read_to_string(store::expand_home(p))
-                .ok()
-                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            {
-                Some(d) => c.load_document(&d),
-                None => tracing::warn!("Credentials file not found: {p}"),
-            },
-        }
+        let c = Self::read_source(&source);
+        let source_fingerprint = source_fingerprint(&c);
+        let login_identity = Self::bind_source_creds(&source, &c);
         let mut auth = KiroAuth {
             source,
             creds: Mutex::new(c),
+            login_identity,
+            source_fingerprint: Mutex::new(source_fingerprint),
             refresh_lock: tokio::sync::Mutex::new(()),
             auth_type: AuthType::KiroDesktop,
             refresh_url: String::new(),
@@ -368,9 +401,46 @@ impl KiroAuth {
         auth
     }
 
-    fn external_account_id(&self) -> Option<String> {
-        match &self.source {
-            Source::Internal(_) => None,
+    /// Reads only the local credential source and binds its durable login
+    /// lineage. This lets startup restore matching state before lazy auth and
+    /// model initialization performs any network I/O.
+    pub fn bind_source_login(source: &Source) -> Option<String> {
+        let creds = Self::read_source(source);
+        Self::bind_source_creds(source, &creds)
+    }
+
+    fn bind_source_creds(source: &Source, creds: &Creds) -> Option<String> {
+        let account_id = Self::source_account_id(source)?;
+        let stable = stable_login_identity(creds);
+        let source_fingerprint = source_fingerprint(creds);
+        store::bind_login_identity(
+            &account_id,
+            stable.as_deref(),
+            source_fingerprint.as_deref(),
+        )
+    }
+
+    fn read_source(source: &Source) -> Creds {
+        let mut c = Creds::default();
+        match source {
+            Source::Internal(id) => {
+                c.load_document(&store::load_internal_credential(id).unwrap_or(json!({})))
+            }
+            Source::Sqlite(p) => c.load_sqlite(p),
+            Source::File(p) => match std::fs::read_to_string(store::expand_home(p))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            {
+                Some(d) => c.load_document(&d),
+                None => tracing::warn!("Credentials file not found: {p}"),
+            },
+        }
+        c
+    }
+
+    fn source_account_id(source: &Source) -> Option<String> {
+        match source {
+            Source::Internal(id) => Some(id.clone()),
             Source::File(p) | Source::Sqlite(p) => {
                 let expanded = store::expand_home(p);
                 Some(
@@ -382,11 +452,19 @@ impl KiroAuth {
         }
     }
 
-    fn lease_account_id(&self) -> Option<String> {
+    fn external_account_id(&self) -> Option<String> {
         match &self.source {
-            Source::Internal(id) => Some(id.clone()),
-            _ => self.external_account_id(),
+            Source::Internal(_) => None,
+            _ => Self::source_account_id(&self.source),
         }
+    }
+
+    fn lease_account_id(&self) -> Option<String> {
+        let source = Self::source_account_id(&self.source)?;
+        Some(match &self.login_identity {
+            Some(identity) => format!("{source}#{identity}"),
+            None => source,
+        })
     }
 
     fn apply_overlay(&self) {
@@ -396,6 +474,11 @@ impl KiroAuth {
         let Some(overlay) = store::load_internal_credential(&id) else {
             return;
         };
+        if overlay.get("_kiroLbLoginIdentity").and_then(Value::as_str)
+            != self.login_identity.as_deref()
+        {
+            return;
+        }
         let mut c = self.creds.lock();
         let Some(refresh) = s(&overlay, "refreshToken") else {
             return;
@@ -409,6 +492,36 @@ impl KiroAuth {
 
     pub fn auth_type(&self) -> AuthType {
         self.auth_type
+    }
+
+    pub fn login_identity(&self) -> Option<&str> {
+        self.login_identity.as_deref()
+    }
+
+    pub fn is_current_login(&self) -> bool {
+        let current = Self::read_source(&self.source);
+        if let Some(stable) = stable_login_identity(&current) {
+            return self.login_identity.as_deref() == Some(stable.as_str());
+        }
+        let bound = Self::source_account_id(&self.source).and_then(|id| store::login_identity(&id));
+        if bound.as_deref() != self.login_identity.as_deref() {
+            return false;
+        }
+        match &self.source {
+            Source::Internal(id) => {
+                let marker = store::load_internal_credential(id).and_then(|d| {
+                    d.get("_kiroLbLoginIdentity")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+                marker.as_deref() == self.login_identity.as_deref()
+                    || (marker.is_none()
+                        && source_fingerprint(&current) == *self.source_fingerprint.lock())
+            }
+            Source::File(_) | Source::Sqlite(_) => {
+                source_fingerprint(&current) == *self.source_fingerprint.lock()
+            }
+        }
     }
 
     pub fn profile_arn(&self) -> Option<String> {
@@ -458,8 +571,12 @@ impl KiroAuth {
         if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
             return Ok(t);
         }
-        if let Source::Sqlite(p) = &self.source {
-            self.creds.lock().load_sqlite(p);
+        if matches!(self.source, Source::Sqlite(_)) {
+            if !self.reload_raw_external() {
+                return Err(AuthError::Other(
+                    "Credential source changed to a different login".into(),
+                ));
+            }
             self.apply_overlay();
             if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
                 return Ok(t);
@@ -527,9 +644,7 @@ impl KiroAuth {
                 break lease;
             }
             if tokio::time::Instant::now() >= deadline {
-                if let Some(latest) = store::load_internal_credential(&account) {
-                    self.creds.lock().load_document(&latest);
-                }
+                self.reload_persisted_for_login();
                 if self.cached_token().is_some() && !self.expired() {
                     return Ok(());
                 }
@@ -541,9 +656,7 @@ impl KiroAuth {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         async {
-            if let Some(latest) = store::load_internal_credential(&account) {
-                self.creds.lock().load_document(&latest);
-            }
+            self.reload_persisted_for_login();
             let renewed_elsewhere = self.cached_token() != previous;
             if self.cached_token().is_some()
                 && !self.expiring_soon()
@@ -560,7 +673,14 @@ impl KiroAuth {
         if let Source::Internal(id) = &self.source {
             let doc = store::load_internal_credential(id)
                 .ok_or_else(|| AuthError::Other(format!("Unknown internal account: {id}")))?;
-            self.creds.lock().load_document(&doc);
+            if !self.is_current_login() {
+                return Err(AuthError::Other(
+                    "Credential source changed to a different login".into(),
+                ));
+            }
+            let mut fresh = Creds::default();
+            fresh.load_document(&doc);
+            *self.creds.lock() = fresh;
         }
         let first = match self.auth_type {
             AuthType::AwsSsoOidc => self.do_oidc_refresh().await,
@@ -581,21 +701,24 @@ impl KiroAuth {
     }
 
     fn reload_raw_external(&self) -> bool {
+        if matches!(self.source, Source::Internal(_)) || !self.is_current_login() {
+            return false;
+        }
+        *self.creds.lock() = Self::read_source(&self.source);
+        true
+    }
+
+    fn reload_persisted_for_login(&self) {
         match &self.source {
-            Source::Sqlite(p) => {
-                self.creds.lock().load_sqlite(p);
-                true
-            }
-            Source::File(p) => {
-                if let Some(d) = std::fs::read_to_string(store::expand_home(p))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                {
-                    self.creds.lock().load_document(&d);
+            Source::Internal(id) if self.is_current_login() => {
+                if let Some(doc) = store::load_internal_credential(id) {
+                    let mut fresh = Creds::default();
+                    fresh.load_document(&doc);
+                    *self.creds.lock() = fresh;
                 }
-                true
             }
-            Source::Internal(_) => false,
+            Source::File(_) | Source::Sqlite(_) => self.apply_overlay(),
+            Source::Internal(_) => {}
         }
     }
 
@@ -638,13 +761,19 @@ impl KiroAuth {
             .ok_or_else(|| AuthError::Other("Refresh token is not set".into()))?;
         tracing::info!("Refreshing Kiro token via Kiro Desktop Auth...");
         let ua = format!("KiroIDE-0.7.45-{}", crate::utils::machine_fingerprint());
-        let data = self
+        let response = self
             .post(
                 &self.refresh_url,
                 json!({"refreshToken": refresh}),
                 &[("User-Agent", ua)],
             )
-            .await?;
+            .await;
+        if !self.is_current_login() {
+            return Err(AuthError::Other(
+                "Discarded token refresh completed for a replaced login".into(),
+            ));
+        }
+        let data = response?;
         let access = s(&data, "accessToken")
             .ok_or_else(|| AuthError::Other("Response does not contain accessToken".into()))?;
         let expires_in = data
@@ -662,8 +791,7 @@ impl KiroAuth {
             }
             c.expires_at = Some(now().floor() + expires_in - 60.0);
         }
-        self.persist();
-        Ok(())
+        self.persist()
     }
 
     async fn do_oidc_refresh(&self) -> Result<(), AuthError> {
@@ -679,9 +807,15 @@ impl KiroAuth {
         })?;
         tracing::info!("Refreshing Kiro token via AWS SSO OIDC...");
         let url = config::aws_sso_oidc_url(c.sso_region.as_deref().unwrap_or(config::REGION));
-        let data = self
+        let response = self
             .post(&url, json!({"grantType": "refresh_token", "clientId": client_id, "clientSecret": secret, "refreshToken": refresh}), &[])
-            .await?;
+            .await;
+        if !self.is_current_login() {
+            return Err(AuthError::Other(
+                "Discarded token refresh completed for a replaced login".into(),
+            ));
+        }
+        let data = response?;
         let access = s(&data, "accessToken").ok_or_else(|| {
             AuthError::Other("AWS SSO OIDC response does not contain accessToken".into())
         })?;
@@ -697,11 +831,20 @@ impl KiroAuth {
             }
             c.expires_at = Some(now() + expires_in - 60.0);
         }
-        self.persist();
-        Ok(())
+        self.persist()
     }
 
-    fn persist(&self) {
+    fn persist(&self) -> Result<(), AuthError> {
+        if !self.is_current_login() {
+            return Err(AuthError::Other(
+                "Refused to persist credentials for a replaced login".into(),
+            ));
+        }
+        let Some(identity) = self.login_identity.as_deref() else {
+            return Err(AuthError::Other(
+                "Credential login identity is unavailable".into(),
+            ));
+        };
         let c = self.creds.lock().clone();
         let expires = c.expires_at.map(iso_from_epoch);
         match &self.source {
@@ -710,37 +853,39 @@ impl KiroAuth {
                 doc["accessToken"] = json!(c.access_token);
                 doc["refreshToken"] = json!(c.refresh_token);
                 doc["expiresAt"] = json!(expires);
+                doc["_kiroLbLoginIdentity"] = json!(identity);
                 if let Some(p) = c.profile_arn.filter(|p| !p.is_empty()) {
                     doc["profileArn"] = json!(p);
                 }
-                if let Err(e) = store::save_internal_credential(id, &doc) {
-                    tracing::error!("Could not persist refreshed credential for {id}: {e}");
-                }
+                let next_fingerprint = source_fingerprint(&self.creds.lock());
+                let expected_fingerprint = self.source_fingerprint.lock().clone();
+                store::save_credential_for_login(
+                    id,
+                    identity,
+                    &doc,
+                    expected_fingerprint.as_deref(),
+                    next_fingerprint.as_deref(),
+                )
+                .map_err(|e| {
+                    AuthError::Other(format!("Could not persist refreshed credential: {e}"))
+                })?;
+                *self.source_fingerprint.lock() = next_fingerprint;
             }
             Source::File(_) | Source::Sqlite(_) => {
                 let Some(id) = self.external_account_id() else {
-                    return;
+                    return Ok(());
                 };
                 let mut doc = json!({"accessToken": c.access_token, "refreshToken": c.refresh_token, "expiresAt": expires});
+                doc["_kiroLbLoginIdentity"] = json!(identity);
                 if let Some(p) = c.profile_arn.filter(|p| !p.is_empty()) {
                     doc["profileArn"] = json!(p);
                 }
-                let payload = doc.to_string();
-                let updated = store::with(|conn| {
-                    store::require_runtime_writer(conn)?;
-                    conn.execute(
-                        "UPDATE account_sources SET credential_json = ?1 WHERE account_id = ?2",
-                        rusqlite::params![payload, id],
-                    )
-                })
-                .unwrap_or(0);
-                if updated == 0 {
-                    tracing::warn!(
-                        "Could not persist credential overlay for unregistered account {id}"
-                    );
-                }
+                store::save_credential_for_login(&id, identity, &doc, None, None).map_err(|e| {
+                    AuthError::Other(format!("Could not persist credential overlay: {e}"))
+                })?;
             }
         }
+        Ok(())
     }
 }
 

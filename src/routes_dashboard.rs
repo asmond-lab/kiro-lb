@@ -389,12 +389,10 @@ fn summarize_usage_error(e: &str) -> String {
 
 pub async fn refresh_account_usage(state: &Shared, a: &pool::Account) -> Value {
     let Some(auth) = a.auth() else {
-        let id = a.id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            ds::save_account_usage_error(&id, "account is not initialized")
-        })
-        .await;
         return json!({"updatedAt": store::now_i64(), "error": "account is not initialized"});
+    };
+    let Some(login_identity) = auth.login_identity().map(str::to_owned) else {
+        return json!({"updatedAt": store::now_i64(), "error": "account login identity is unavailable"});
     };
     let stored_arn = store::load_internal_credential(&a.id).and_then(|d| {
         d.get("profileArn")
@@ -405,15 +403,22 @@ pub async fn refresh_account_usage(state: &Shared, a: &pool::Account) -> Value {
     });
     let now = store::now_i64();
     match crate::model_catalog::fetch_account_usage(&auth, &state.http, stored_arn).await {
-        Ok(u) => {
-            let (id, u2) = (a.id.clone(), u.clone());
-            let _ = tokio::task::spawn_blocking(move || ds::save_account_usage(&id, &u2)).await;
-            apply_weight(state, &a.id, &u);
+        Ok(u) if auth.is_current_login() => {
+            let (id, identity, u2) = (a.id.clone(), login_identity.clone(), u.clone());
+            let saved =
+                tokio::task::spawn_blocking(move || ds::save_account_usage(&id, &identity, &u2))
+                    .await
+                    .unwrap_or(false);
+            if !saved {
+                return json!({"updatedAt": now, "error": "discarded usage for a replaced login"});
+            }
+            apply_weight(state, &a.id, &login_identity, &u);
             let mut out = u;
             out["updatedAt"] = json!(now);
             out["error"] = Value::Null;
             out
         }
+        Ok(_) => json!({"updatedAt": now, "error": "discarded usage for a replaced login"}),
         Err(e) => {
             let msg = if e.contains("management host answered") {
                 format!(
@@ -423,16 +428,20 @@ pub async fn refresh_account_usage(state: &Shared, a: &pool::Account) -> Value {
             } else {
                 summarize_usage_error(&e)
             };
-            let (id, m2) = (a.id.clone(), msg.clone());
-            let _ =
-                tokio::task::spawn_blocking(move || ds::save_account_usage_error(&id, &m2)).await;
-            state.pool.set_quota(&a.id, None, None, None);
+            let (id, identity, m2) = (a.id.clone(), login_identity.clone(), msg.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                ds::save_account_usage_error(&id, &identity, &m2)
+            })
+            .await;
+            state
+                .pool
+                .set_quota(&a.id, &login_identity, None, None, None);
             json!({"updatedAt": now, "error": msg})
         }
     }
 }
 
-fn apply_weight(state: &Shared, id: &str, u: &Value) {
+fn apply_weight(state: &Shared, id: &str, login_identity: &str, u: &Value) {
     let headroom = match (u["currentUsage"].as_f64(), u["usageLimit"].as_f64()) {
         (Some(c), Some(l)) if l > 0.0 => Some((1.0 - c / l).clamp(0.0, 1.0)),
         _ => None,
@@ -451,7 +460,9 @@ fn apply_weight(state: &Shared, id: &str, u: &Value) {
             "DISABLED" => Some(false),
             _ => None,
         });
-    state.pool.set_quota(id, headroom, reset, overage);
+    state
+        .pool
+        .set_quota(id, login_identity, headroom, reset, overage);
 }
 
 pub async fn refresh_all_usage(state: &Shared) -> Vec<Value> {

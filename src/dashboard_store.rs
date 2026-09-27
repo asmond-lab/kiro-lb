@@ -190,8 +190,11 @@ pub fn account_model_usage() -> Vec<(String, Vec<Value>)> {
 
 pub fn account_emails() -> HashMap<String, String> {
     store::with(|c| {
-        let mut stmt =
-            c.prepare("SELECT account_id, email FROM account_usage WHERE email IS NOT NULL")?;
+        let mut stmt = c.prepare(
+            "SELECT u.account_id, u.email FROM account_usage u
+             JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity
+             WHERE u.email IS NOT NULL",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.collect()
     })
@@ -200,7 +203,7 @@ pub fn account_emails() -> HashMap<String, String> {
 
 pub fn cached_usage(account_id: &str) -> Value {
     store::with(|c| {
-        c.query_row("SELECT * FROM account_usage WHERE account_id = ?1", [account_id], |r| {
+        c.query_row("SELECT u.* FROM account_usage u JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity WHERE u.account_id = ?1", [account_id], |r| {
             Ok(json!({
                 "email": r.get::<_, Option<String>>("email")?,
                 "subscriptionTitle": r.get::<_, Option<String>>("subscription_title")?,
@@ -235,7 +238,7 @@ pub fn sql_to_json(v: rusqlite::types::Value) -> Value {
     }
 }
 
-pub fn save_account_usage(account_id: &str, usage: &Value) {
+pub fn save_account_usage(account_id: &str, login_identity: &str, usage: &Value) -> bool {
     let now = store::now_i64();
     let reset = match usage.get("nextDateReset") {
         Some(Value::Null) | None => String::new(),
@@ -252,25 +255,30 @@ pub fn save_account_usage(account_id: &str, usage: &Value) {
     };
     let s = |k: &str| usage.get(k).and_then(Value::as_str).map(str::to_owned);
     let f = |k: &str| usage.get(k).and_then(Value::as_f64);
-    let _ = store::with(|c| {
+    store::with(|c| {
         c.execute(
-            "INSERT INTO account_usage(account_id, email, subscription_title, subscription_type, resource_type, current_usage, usage_limit, usage_percent, unit, next_date_reset, days_until_reset, overage_status, overage_used, updated_at, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)
-             ON CONFLICT(account_id) DO UPDATE SET email=excluded.email, subscription_title=excluded.subscription_title, subscription_type=excluded.subscription_type, resource_type=excluded.resource_type, current_usage=excluded.current_usage, usage_limit=excluded.usage_limit, usage_percent=excluded.usage_percent, unit=excluded.unit, next_date_reset=excluded.next_date_reset, days_until_reset=excluded.days_until_reset, overage_status=excluded.overage_status, overage_used=excluded.overage_used, updated_at=excluded.updated_at, error=NULL",
-            params![account_id, s("email"), s("subscriptionTitle"), s("subscriptionType"), s("resourceType"), f("currentUsage"), f("usageLimit"), f("usagePercent"), s("unit"), reset, f("daysUntilReset"), s("overageStatus"), f("overageUsed"), now],
+            "INSERT INTO account_usage(account_id, login_identity, email, subscription_title, subscription_type, resource_type, current_usage, usage_limit, usage_percent, unit, next_date_reset, days_until_reset, overage_status, overage_used, updated_at, error)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL
+             WHERE EXISTS (SELECT 1 FROM account_sources WHERE account_id = ?1 AND login_identity = ?2)
+             ON CONFLICT(account_id) DO UPDATE SET login_identity=excluded.login_identity, email=excluded.email, subscription_title=excluded.subscription_title, subscription_type=excluded.subscription_type, resource_type=excluded.resource_type, current_usage=excluded.current_usage, usage_limit=excluded.usage_limit, usage_percent=excluded.usage_percent, unit=excluded.unit, next_date_reset=excluded.next_date_reset, days_until_reset=excluded.days_until_reset, overage_status=excluded.overage_status, overage_used=excluded.overage_used, updated_at=excluded.updated_at, error=NULL",
+            params![account_id, login_identity, s("email"), s("subscriptionTitle"), s("subscriptionType"), s("resourceType"), f("currentUsage"), f("usageLimit"), f("usagePercent"), s("unit"), reset, f("daysUntilReset"), s("overageStatus"), f("overageUsed"), now],
         )
-    });
+    })
+    .is_ok_and(|rows| rows > 0)
 }
 
-pub fn save_account_usage_error(account_id: &str, error: &str) {
+pub fn save_account_usage_error(account_id: &str, login_identity: &str, error: &str) -> bool {
     let now = store::now_i64();
-    let _ = store::with(|c| {
+    store::with(|c| {
         c.execute(
-            "INSERT INTO account_usage(account_id, updated_at, error) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id) DO UPDATE SET updated_at=excluded.updated_at, error=excluded.error",
-            params![account_id, now, error],
+            "INSERT INTO account_usage(account_id, login_identity, updated_at, error)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (SELECT 1 FROM account_sources WHERE account_id = ?1 AND login_identity = ?2)
+             ON CONFLICT(account_id) DO UPDATE SET login_identity=excluded.login_identity, updated_at=excluded.updated_at, error=excluded.error",
+            params![account_id, login_identity, now, error],
         )
-    });
+    })
+    .is_ok_and(|rows| rows > 0)
 }
 
 // ----- API keys --------------------------------------------------------------------------
