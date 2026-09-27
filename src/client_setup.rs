@@ -30,7 +30,7 @@ impl ClientKind {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct State {
     version: u8,
     clients: BTreeMap<String, Snapshot>,
@@ -56,7 +56,13 @@ struct PlannedWrite {
     expected: ExpectedFile,
 }
 
-#[derive(Clone)]
+struct AppliedChange {
+    path: PathBuf,
+    before: ExpectedFile,
+    after: ExpectedFile,
+}
+
+#[derive(Clone, Debug)]
 struct ExpectedFile {
     content: Option<String>,
     #[cfg(unix)]
@@ -250,6 +256,7 @@ fn setup(options: Options) -> Result<(), String> {
     run_diagnostic(&options.base_url, &key)?;
     let lock = StateLock::acquire()?;
     let mut state = load_state_locked(&lock)?;
+    let previous_state = state.clone();
     let plans: Vec<PlannedWrite> = options
         .clients
         .iter()
@@ -263,21 +270,7 @@ fn setup(options: Options) -> Result<(), String> {
     // The private state file is a recovery journal. If the process stops after
     // this point, restore accepts either the old bytes or the staged bytes.
     save_state_locked(&lock, &state)?;
-    for plan in plans {
-        lock.verify_directory_path()?;
-        conditional_write(
-            &plan.snapshot.path,
-            plan.content.as_bytes(),
-            &plan.expected,
-            Some(0o600),
-        )?;
-    }
-    for client in &options.clients {
-        if let Some(snapshot) = state.clients.get_mut(client.id()) {
-            snapshot.recoverable_sha256.clear();
-        }
-    }
-    save_state_locked(&lock, &state)?;
+    commit_setup_plans(&lock, &plans, &mut state, &previous_state, |_| {})?;
     println!("Client configuration installed. No inference request was made.");
     println!("Run `kirolb client status` to inspect it or `kirolb client restore` to undo it.");
     if options.clients.contains(&ClientKind::Codex) {
@@ -288,6 +281,48 @@ fn setup(options: Options) -> Result<(), String> {
     }
     if options.clients.contains(&ClientKind::Claude) {
         println!("Start Claude Code with `claude`; use `/status` to confirm routing.");
+    }
+    Ok(())
+}
+
+fn commit_setup_plans(
+    lock: &StateLock,
+    plans: &[PlannedWrite],
+    state: &mut State,
+    previous_state: &State,
+    mut before_commit: impl FnMut(usize),
+) -> Result<(), String> {
+    let mut applied = Vec::new();
+    for (index, plan) in plans.iter().enumerate() {
+        if let Err(error) = lock.verify_directory_path() {
+            return abort_transaction(lock, previous_state, &applied, error);
+        }
+        before_commit(index);
+        let installed = match conditional_write(
+            &plan.snapshot.path,
+            plan.content.as_bytes(),
+            &plan.expected,
+            Some(0o600),
+        ) {
+            Ok(installed) => installed,
+            Err(error) => return abort_transaction(lock, previous_state, &applied, error),
+        };
+        applied.push(AppliedChange {
+            path: plan.snapshot.path.clone(),
+            before: plan.expected.clone(),
+            after: installed,
+        });
+        if let Err(error) = lock.verify_directory_path() {
+            return abort_transaction(lock, previous_state, &applied, error);
+        }
+    }
+    for plan in plans {
+        if let Some(snapshot) = state.clients.get_mut(plan.client.id()) {
+            snapshot.recoverable_sha256.clear();
+        }
+    }
+    if let Err(error) = save_state_locked(lock, state) {
+        return abort_transaction(lock, previous_state, &applied, error);
     }
     Ok(())
 }
@@ -499,6 +534,7 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
     require_mutation_platform()?;
     let lock = StateLock::acquire()?;
     let mut state = load_state_locked(&lock)?;
+    let previous_state = state.clone();
     let mut plans = Vec::new();
     for client in &clients {
         let Some(snapshot) = state.clients.get(client.id()) else {
@@ -521,35 +557,74 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
         }
         plans.push((*client, snapshot.clone(), expected));
     }
-    for client in clients {
-        let Some((_, snapshot, expected)) = plans
-            .iter()
-            .find(|(planned, _, _)| *planned == client)
-            .cloned()
-        else {
+    for client in &clients {
+        if !plans.iter().any(|(planned, _, _)| planned == client) {
             println!("{}: nothing to restore", client.id());
-            continue;
-        };
-        match snapshot.original {
+        }
+    }
+    commit_restore_plans(&lock, &plans, &mut state, &previous_state, |_| {})?;
+    for (client, _, _) in plans {
+        println!("{}: restored", client.id());
+    }
+    Ok(())
+}
+
+fn commit_restore_plans(
+    lock: &StateLock,
+    plans: &[(ClientKind, Snapshot, ExpectedFile)],
+    state: &mut State,
+    previous_state: &State,
+    mut before_commit: impl FnMut(usize),
+) -> Result<(), String> {
+    let mut applied = Vec::new();
+    for (index, (client, snapshot, expected)) in plans.iter().enumerate() {
+        if let Err(error) = lock.verify_directory_path() {
+            return abort_transaction(lock, previous_state, &applied, error);
+        }
+        before_commit(index);
+        match snapshot.original.as_deref() {
             Some(content) => {
-                lock.verify_directory_path()?;
-                conditional_write(
+                let restored = match conditional_write(
                     &snapshot.path,
                     content.as_bytes(),
-                    &expected,
+                    expected,
                     snapshot.original_mode,
-                )?;
+                ) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        return abort_transaction(lock, previous_state, &applied, error);
+                    }
+                };
+                applied.push(AppliedChange {
+                    path: snapshot.path.clone(),
+                    before: expected.clone(),
+                    after: restored,
+                });
             }
             None if expected.content.is_some() => {
-                lock.verify_directory_path()?;
-                conditional_remove(&snapshot.path, &expected)?
+                let restored = match conditional_remove(&snapshot.path, expected) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        return abort_transaction(lock, previous_state, &applied, error);
+                    }
+                };
+                applied.push(AppliedChange {
+                    path: snapshot.path.clone(),
+                    before: expected.clone(),
+                    after: restored,
+                });
             }
             None => {}
         }
+        if let Err(error) = lock.verify_directory_path() {
+            return abort_transaction(lock, previous_state, &applied, error);
+        }
         state.clients.remove(client.id());
-        println!("{}: restored", client.id());
     }
-    save_state_locked(&lock, &state)
+    if let Err(error) = save_state_locked(lock, state) {
+        return abort_transaction(lock, previous_state, &applied, error);
+    }
+    Ok(())
 }
 
 fn client_path(client: ClientKind) -> Result<PathBuf, String> {
@@ -686,6 +761,58 @@ fn snapshot_mode_matches(expected: Option<u32>, current: Option<u32>) -> bool {
 #[cfg(not(unix))]
 fn snapshot_mode_matches(_expected: Option<u32>, _current: Option<u32>) -> bool {
     true
+}
+
+fn abort_transaction(
+    lock: &StateLock,
+    previous_state: &State,
+    applied: &[AppliedChange],
+    error: String,
+) -> Result<(), String> {
+    let rollback = rollback_changes(applied);
+    let journal = if rollback.is_ok() {
+        save_state_locked(lock, previous_state)
+            .or_else(|_| save_recovery_state(lock, previous_state))
+    } else {
+        Ok(())
+    };
+    match (rollback, journal) {
+        (Ok(()), Ok(())) => Err(error),
+        (rollback, journal) => {
+            let mut details = Vec::new();
+            if let Err(rollback_error) = rollback {
+                details.push(format!("client rollback failed: {rollback_error}"));
+            }
+            if let Err(journal_error) = journal {
+                details.push(format!("journal rollback failed: {journal_error}"));
+            }
+            Err(format!("{error}; {}", details.join("; ")))
+        }
+    }
+}
+
+fn rollback_changes(applied: &[AppliedChange]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for change in applied.iter().rev() {
+        let result = match change.before.content.as_deref() {
+            Some(content) => conditional_write(
+                &change.path,
+                content.as_bytes(),
+                &change.after,
+                change.before.file_mode,
+            )
+            .map(|_| ()),
+            None => conditional_remove(&change.path, &change.after).map(|_| ()),
+        };
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[cfg(unix)]
@@ -983,7 +1110,7 @@ fn conditional_write(
     content: &[u8],
     expected: &ExpectedFile,
     mode: Option<u32>,
-) -> Result<(), String> {
+) -> Result<ExpectedFile, String> {
     use std::os::fd::AsRawFd;
 
     let parent = open_parent_secure(path, false)?;
@@ -1067,11 +1194,20 @@ fn conditional_write(
     parent
         .sync_all()
         .map_err(|e| format!("cannot sync parent of {}: {e}", path.display()))?;
-    result
+    result?;
+    Ok(ExpectedFile {
+        content: Some(
+            String::from_utf8(content.to_vec())
+                .map_err(|_| format!("generated content for {} is not UTF-8", path.display()))?,
+        ),
+        parent_identity: expected.parent_identity,
+        file_identity: Some(staged_identity),
+        file_mode: Some(staged_mode),
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String> {
+fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<ExpectedFile, String> {
     use std::os::fd::AsRawFd;
 
     let parent = open_parent_secure(path, false)?;
@@ -1123,7 +1259,13 @@ fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String
     }
     parent
         .sync_all()
-        .map_err(|e| format!("cannot sync parent of {}: {e}", path.display()))
+        .map_err(|e| format!("cannot sync parent of {}: {e}", path.display()))?;
+    Ok(ExpectedFile {
+        content: None,
+        parent_identity: expected.parent_identity,
+        file_identity: None,
+        file_mode: None,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1132,12 +1274,12 @@ fn conditional_write(
     _content: &[u8],
     _expected: &ExpectedFile,
     _mode: Option<u32>,
-) -> Result<(), String> {
+) -> Result<ExpectedFile, String> {
     require_mutation_platform()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn conditional_remove(_path: &Path, _expected: &ExpectedFile) -> Result<(), String> {
+fn conditional_remove(_path: &Path, _expected: &ExpectedFile) -> Result<ExpectedFile, String> {
     require_mutation_platform()
 }
 
@@ -1146,6 +1288,9 @@ struct StateLock {
     file: fs::File,
     directory: fs::File,
     directory_identity: FileIdentity,
+    _lock_directory: fs::File,
+    lock_directory_identity: FileIdentity,
+    state_directory: PathBuf,
     state_file: PathBuf,
 }
 
@@ -1159,18 +1304,23 @@ impl StateLock {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
 
-        let directory = open_parent_secure(&state_file, true)?;
-        let metadata = directory
+        let state_directory = state_file
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", state_file.display()))?
+            .to_owned();
+        let lock_directory = open_parent_secure(&state_directory, true)?;
+        let lock_metadata = lock_directory
             .metadata()
-            .map_err(|e| format!("cannot inspect state directory: {e}"))?;
-        let directory_identity = FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            .map_err(|e| format!("cannot inspect client setup lock directory: {e}"))?;
+        let lock_directory_identity = FileIdentity {
+            device: lock_metadata.dev(),
+            inode: lock_metadata.ino(),
         };
-        let lock_name = leaf_name(&state_file.with_extension("lock"))?;
+        let lock_name =
+            std::ffi::CString::new(".kirolb-client-setup.lock").expect("static lock file name");
         let descriptor = unsafe {
             libc::openat(
-                directory.as_raw_fd(),
+                lock_directory.as_raw_fd(),
                 lock_name.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
@@ -1192,10 +1342,21 @@ impl StateLock {
         }
         file.lock()
             .map_err(|e| format!("cannot lock client setup state: {e}"))?;
+        let directory = open_parent_secure(&state_file, true)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|e| format!("cannot inspect state directory: {e}"))?;
+        let directory_identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
         let lock = Self {
             file,
             directory,
             directory_identity,
+            _lock_directory: lock_directory,
+            lock_directory_identity,
+            state_directory,
             state_file,
         };
         lock.verify_directory_path()?;
@@ -1205,6 +1366,7 @@ impl StateLock {
     fn verify_directory_path(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
 
+        self.verify_lock_directory_path()?;
         let current = open_parent_secure(&self.state_file, false)?;
         let metadata = current
             .metadata()
@@ -1216,6 +1378,25 @@ impl StateLock {
         if identity != self.directory_identity {
             return Err(
                 "client setup state directory changed while locked; refusing mutation".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_lock_directory_path(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let current = open_parent_secure(&self.state_directory, false)?;
+        let metadata = current
+            .metadata()
+            .map_err(|e| format!("cannot inspect client setup lock directory: {e}"))?;
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if identity != self.lock_directory_identity {
+            return Err(
+                "client setup lock directory changed while locked; refusing mutation".into(),
             );
         }
         Ok(())
@@ -1276,6 +1457,60 @@ fn save_state_locked(lock: &StateLock, state: &State) -> Result<(), String> {
     lock.verify_directory_path()
 }
 
+#[cfg(target_os = "linux")]
+fn save_recovery_state(lock: &StateLock, state: &State) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if state.clients.is_empty() {
+        return Ok(());
+    }
+    lock.verify_lock_directory_path()?;
+    let directory = open_parent_secure(&lock.state_file, false)?;
+    let metadata = directory
+        .metadata()
+        .map_err(|e| format!("cannot inspect replacement state directory: {e}"))?;
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if read_at(&directory, &lock.state_file)?.is_some() {
+        return Err(format!(
+            "refusing to overwrite recovery state at {}",
+            lock.state_file.display()
+        ));
+    }
+    let mut content = serde_json::to_vec_pretty(state)
+        .map_err(|e| format!("cannot serialize restoration state: {e}"))?;
+    content.push(b'\n');
+    let target = leaf_name(&lock.state_file)?;
+    let (temporary, _, _) = create_staged(&directory, &lock.state_file, &content, Some(0o600))?;
+    if let Err(error) = rename_at(&directory, &temporary, &target, libc::RENAME_NOREPLACE) {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        return Err(format!(
+            "cannot preserve recovery state at {}: {error}",
+            lock.state_file.display()
+        ));
+    }
+    directory
+        .sync_all()
+        .map_err(|e| format!("cannot sync replacement state directory: {e}"))?;
+    lock.verify_lock_directory_path()?;
+    let current = open_parent_secure(&lock.state_file, false)?;
+    let current_metadata = current
+        .metadata()
+        .map_err(|e| format!("cannot inspect replacement state directory: {e}"))?;
+    if identity
+        != (FileIdentity {
+            device: current_metadata.dev(),
+            inode: current_metadata.ino(),
+        })
+    {
+        return Err("replacement state directory changed while preserving recovery state".into());
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 struct StateLock;
 
@@ -1299,6 +1534,11 @@ fn load_state_locked(_lock: &StateLock) -> Result<State, String> {
 
 #[cfg(not(target_os = "linux"))]
 fn save_state_locked(_lock: &StateLock, _state: &State) -> Result<(), String> {
+    require_mutation_platform()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn save_recovery_state(_lock: &StateLock, _state: &State) -> Result<(), String> {
     require_mutation_platform()
 }
 
@@ -1408,6 +1648,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn transaction_rollback_preserves_a_concurrent_client_edit() {
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        fs::write(&path, "before").unwrap();
+        let before = inspect_expected(&path, false).unwrap();
+        let after = conditional_write(&path, b"installed", &before, Some(0o600)).unwrap();
+        fs::write(&path, "concurrent edit").unwrap();
+
+        let error = rollback_changes(&[AppliedChange {
+            path: path.clone(),
+            before,
+            after,
+        }])
+        .unwrap_err();
+
+        assert!(error.contains("changed after planning"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent edit");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn state_lock_refuses_to_write_after_its_directory_is_replaced() {
         let directory = temporary_directory();
         let state_directory = directory.join("state");
@@ -1419,7 +1681,6 @@ mod tests {
 
         fs::rename(&state_directory, &moved_directory).unwrap();
         fs::create_dir(&state_directory).unwrap();
-        let second_lock = StateLock::acquire_at(state_file.clone()).unwrap();
         let replacement_state = test_state("replacement");
 
         let error = save_state_locked(&first_lock, &test_state("stale writer")).unwrap_err();
@@ -1431,16 +1692,143 @@ mod tests {
         .unwrap();
         assert_eq!(moved.clients["codex"].original.as_deref(), Some("first"));
 
-        save_state_locked(&second_lock, &replacement_state).unwrap();
+        save_recovery_state(&first_lock, &replacement_state).unwrap();
         let replacement: State =
             serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
         assert_eq!(
             replacement.clients["codex"].original.as_deref(),
             Some("replacement")
         );
-        drop(second_lock);
         drop(first_lock);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_rolls_back_all_clients_when_state_directory_changes_after_verification() {
+        for swap_index in [0, 1] {
+            let directory = temporary_directory();
+            let state_directory = directory.join("state");
+            let moved_directory = directory.join("moved-state");
+            let state_file = state_directory.join("client-setup.json");
+            let first_path = directory.join("first.conf");
+            let second_path = directory.join("second.conf");
+            fs::write(&first_path, "first before").unwrap();
+            fs::write(&second_path, "second before").unwrap();
+            let plans = vec![
+                test_plan(ClientKind::Codex, first_path.clone(), "first installed"),
+                test_plan(ClientKind::Claude, second_path.clone(), "second installed"),
+            ];
+            let previous_state = State {
+                version: 1,
+                clients: BTreeMap::new(),
+            };
+            let mut state = previous_state.clone();
+            for plan in &plans {
+                state
+                    .clients
+                    .insert(plan.client.id().to_owned(), plan.snapshot.clone());
+            }
+            let lock = StateLock::acquire_at(state_file.clone()).unwrap();
+            save_state_locked(&lock, &state).unwrap();
+
+            let error = commit_setup_plans(&lock, &plans, &mut state, &previous_state, |index| {
+                if index == swap_index {
+                    fs::rename(&state_directory, &moved_directory).unwrap();
+                    fs::create_dir(&state_directory).unwrap();
+                }
+            })
+            .unwrap_err();
+
+            assert!(error.contains("state directory changed while locked"));
+            assert_eq!(fs::read_to_string(&first_path).unwrap(), "first before");
+            assert_eq!(fs::read_to_string(&second_path).unwrap(), "second before");
+            assert!(!state_file.exists());
+            assert!(moved_directory.join("client-setup.json").exists());
+            drop(lock);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_rolls_back_all_clients_when_state_directory_changes_after_verification() {
+        let directory = temporary_directory();
+        let state_directory = directory.join("state");
+        let moved_directory = directory.join("moved-state");
+        let state_file = state_directory.join("client-setup.json");
+        let first_path = directory.join("first.conf");
+        let second_path = directory.join("second.conf");
+        fs::write(&first_path, "first installed").unwrap();
+        fs::write(&second_path, "second installed").unwrap();
+        let first = test_snapshot(&first_path, Some("first before"), "first installed");
+        let second = test_snapshot(&second_path, None, "second installed");
+        let previous_state = State {
+            version: 1,
+            clients: BTreeMap::from([
+                (ClientKind::Codex.id().to_owned(), first.clone()),
+                (ClientKind::Claude.id().to_owned(), second.clone()),
+            ]),
+        };
+        let mut state = previous_state.clone();
+        let plans = vec![
+            (
+                ClientKind::Codex,
+                first,
+                inspect_expected(&first_path, false).unwrap(),
+            ),
+            (
+                ClientKind::Claude,
+                second,
+                inspect_expected(&second_path, false).unwrap(),
+            ),
+        ];
+        let lock = StateLock::acquire_at(state_file.clone()).unwrap();
+        save_state_locked(&lock, &state).unwrap();
+
+        let error = commit_restore_plans(&lock, &plans, &mut state, &previous_state, |index| {
+            if index == 1 {
+                fs::rename(&state_directory, &moved_directory).unwrap();
+                fs::create_dir(&state_directory).unwrap();
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.contains("state directory changed while locked"));
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), "first installed");
+        assert_eq!(
+            fs::read_to_string(&second_path).unwrap(),
+            "second installed"
+        );
+        let recovery: State =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(recovery.clients.len(), 2);
+        assert!(moved_directory.join("client-setup.json").exists());
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_plan(client: ClientKind, path: PathBuf, installed: &str) -> PlannedWrite {
+        let expected = inspect_expected(&path, false).unwrap();
+        PlannedWrite {
+            client,
+            content: installed.to_owned(),
+            snapshot: test_snapshot(&path, expected.content.as_deref(), installed),
+            expected,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_snapshot(path: &Path, original: Option<&str>, installed: &str) -> Snapshot {
+        Snapshot {
+            path: path.to_owned(),
+            original: original.map(str::to_owned),
+            original_mode: original.map(|_| 0o644),
+            installed_sha256: hash(installed),
+            installed_mode: Some(0o600),
+            recoverable_sha256: Vec::new(),
+        }
     }
 
     #[cfg(target_os = "linux")]
