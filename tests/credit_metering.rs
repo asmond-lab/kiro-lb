@@ -404,7 +404,7 @@ async fn non_credit_metering_completes_openai_and_responses_without_counting_cre
 
 #[tokio::test]
 async fn malformed_metering_remains_an_incomplete_openai_and_responses_stream() {
-    const FRAMES: &[u8] = br#"{"content":"incomplete"}{"usage":1,"unitPlural":"credits"}"#;
+    const FRAMES: &[u8] = br#"{"content":"incomplete"}{"unit":"credit","usage":false}{"usage":1,"unitPlural":"credits"}"#;
 
     let chat_request = RequestCtx::new(None);
     let chunks: Vec<String> = stream_openai::stream(
