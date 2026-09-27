@@ -360,7 +360,7 @@ pub async fn concurrency_slot(account: &str) -> Result<Vec<OwnedSemaphorePermit>
             permits.push(acquire(g, timeout, "global", global_limit).await?);
         }
         if let Some(a) = a {
-            permits.push(acquire(a, timeout, &format!("account {account}"), account_limit).await?);
+            permits.push(acquire(a, timeout, "per-account", account_limit).await?);
         }
         Ok::<(), TransportError>(())
     }
