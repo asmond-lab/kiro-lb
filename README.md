@@ -99,8 +99,9 @@ kirolb client diagnose --base-url http://127.0.0.1:8000
 
 For Codex, setup writes the dedicated profile
 `$CODEX_HOME/kirolb.config.toml` (normally
-`~/.codex/kirolb.config.toml`). The profile reads the key from
-`KIROLB_API_KEY`; it does not contain the key itself:
+`~/.codex/kirolb.config.toml`). Separate profile files require Codex 0.134.0 or
+later. The profile reads the key from `KIROLB_API_KEY`; it does not contain the
+key itself:
 
 ```bash
 codex --profile kirolb
