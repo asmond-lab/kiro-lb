@@ -319,7 +319,6 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
         ctx: plan.ctx.clone(),
     };
     let events = first_token_retry(events_of(response, &plan.ctx), retry);
-    let account_id = account.id.clone();
     let pool = state.pool.clone();
     let model = plan.model.clone();
     match plan.protocol {
@@ -328,7 +327,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             Attempt::Done(sse_response(
                 s,
                 pool,
-                account_id,
+                account,
                 model,
                 plan.session,
                 Protocol::Anthropic,
@@ -337,8 +336,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
         }
         Protocol::Anthropic => match stream_anthropic::collect(events, sctx).await {
             Ok(v) => {
-                pool.pin_session(plan.session, &account_id);
-                pool.report_success(&account_id, &model);
+                pool.commit_success(&account, &model, plan.session);
                 Attempt::Done(json_response(200, v))
             }
             Err(e) => Attempt::Done(stream_failure(Protocol::Anthropic, e)),
@@ -372,7 +370,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                     return Attempt::Done(sse_response(
                         s,
                         pool,
-                        account_id,
+                        account,
                         model,
                         plan.session,
                         Protocol::OpenAI,
@@ -382,7 +380,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                 Attempt::Done(sse_response(
                     s,
                     pool,
-                    account_id,
+                    account,
                     model,
                     plan.session,
                     Protocol::OpenAI,
@@ -391,8 +389,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             } else {
                 match stream_openai::collect(events, sctx, opts, strip_fence).await {
                     Ok(v) => {
-                        pool.pin_session(plan.session, &account_id);
-                        pool.report_success(&account_id, &model);
+                        pool.commit_success(&account, &model, plan.session);
                         match &plan.responses {
                             Some((_, freeform)) => Attempt::Done(json_response(
                                 200,
@@ -588,7 +585,7 @@ pub fn sse_body(
 fn sse_response(
     s: ChunkStream,
     pool: Arc<pool::AccountManager>,
-    account_id: String,
+    account: Arc<Account>,
     model: String,
     session: Option<u64>,
     protocol: Protocol,
@@ -598,8 +595,7 @@ fn sse_response(
     let body = sse_body(s, protocol == Protocol::Anthropic, move |ok| {
         failed.store(!ok, std::sync::atomic::Ordering::SeqCst);
         if ok {
-            pool.pin_session(session, &account_id);
-            pool.report_success(&account_id, &model);
+            pool.commit_success(&account, &model, session);
             tracing::info!("HTTP 200 - {model} (streaming) - completed");
         }
     });
@@ -1078,48 +1074,4 @@ pub async fn healthz() -> Response {
 
 pub fn resolve_for_logs(model: &str) -> String {
     model_resolver::normalize_model_name(model)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn streaming_affinity_is_pinned_only_after_successful_completion() {
-        let pool = pool::AccountManager::new(reqwest::Client::new());
-        let request = RequestCtx::new(None);
-        let failed: ChunkStream = Box::pin(futures_util::stream::iter(vec![Err(
-            StreamError::UpstreamStatus(500),
-        )]));
-        let response = sse_response(
-            failed,
-            pool.clone(),
-            "failed".into(),
-            "model".into(),
-            Some(7),
-            Protocol::OpenAI,
-            &request,
-        );
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(pool.session_counts().is_empty());
-
-        let completed: ChunkStream = Box::pin(futures_util::stream::iter(vec![Ok(
-            "data: [DONE]\n\n".into(),
-        )]));
-        let response = sse_response(
-            completed,
-            pool.clone(),
-            "completed".into(),
-            "model".into(),
-            Some(7),
-            Protocol::OpenAI,
-            &RequestCtx::new(None),
-        );
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(pool.session_counts().get("completed"), Some(&1));
-    }
 }

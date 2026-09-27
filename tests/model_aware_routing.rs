@@ -1,4 +1,3 @@
-use kiro_lb::auth::{KiroAuth, Source};
 use kiro_lb::errors::ErrorType;
 use kiro_lb::pool::AccountManager;
 use kiro_lb::settings;
@@ -7,6 +6,12 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+
+fn profile_arn(id: &str) -> String {
+    format!("arn:aws:codewhisperer:us-east-1:123456789012:profile/{id}")
+}
 
 fn source(id: &str) -> serde_json::Value {
     json!({
@@ -16,10 +21,25 @@ fn source(id: &str) -> serde_json::Value {
             "refreshToken": format!("refresh-{id}"),
             "accessToken": format!("access-{id}"),
             "expiresAt": "2999-01-01T00:00:00Z",
-            "profileArn": format!("arn:{id}"),
+            "profileArn": profile_arn(id),
             "region": "us-east-1"
         }
     })
+}
+
+async fn rejecting_client() -> reqwest::Client {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    reqwest::Client::builder().proxy(proxy).build().unwrap()
 }
 
 fn excluded(ids: &[&str]) -> HashSet<String> {
@@ -47,15 +67,10 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     settings::load_tunables();
     reset_concurrency();
 
-    let pool = AccountManager::new(reqwest::Client::new());
+    let pool = AccountManager::new(rejecting_client().await);
     pool.load_credentials();
-    for account in pool.accounts() {
-        *account.auth.lock() = Some(Arc::new(KiroAuth::new(
-            Source::Internal(account.id.clone()),
-            "us-east-1",
-            None,
-            reqwest::Client::new(),
-        )));
+    for id in ["unsupported", "known-a", "known-b", "unknown"] {
+        assert!(pool.initialize_account(id).await, "initialize {id}");
     }
     pool.get("unsupported")
         .unwrap()
@@ -132,8 +147,13 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         .unwrap();
     assert_eq!(selected.id, "unknown", "unhealthy affinity must fail over");
 
-    pool.get("known-a").unwrap().state.lock().rate_limited_until = 0.0;
-    pool.set_quota("known-a", Some(0.0), None, Some(false));
+    {
+        let known_a = pool.get("known-a").unwrap();
+        let mut state = known_a.state.lock();
+        state.rate_limited_until = 0.0;
+        state.quota_headroom = Some(0.0);
+        state.quota_overage_enabled = Some(false);
+    }
     let selected = pool
         .next_account(
             "target-model",
@@ -146,10 +166,11 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         selected.id, "known-a",
         "quota-depleted account remains the last resort"
     );
-    pool.set_quota("known-a", Some(1.0), None, Some(false));
+    pool.get("known-a").unwrap().state.lock().quota_headroom = Some(1.0);
 
-    let held = concurrency_slot("arn:known-a").await.unwrap();
-    assert_eq!(account_concurrency_load("arn:known-a"), Some((1, 1)));
+    let known_a_arn = profile_arn("known-a");
+    let held = concurrency_slot(&known_a_arn).await.unwrap();
+    assert_eq!(account_concurrency_load(&known_a_arn), Some((1, 1)));
     let selected = pool
         .next_account("target-model", &excluded(&["unknown", "unsupported"]), None)
         .await
@@ -159,16 +180,17 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         "a saturated account must not receive new work"
     );
 
-    let waiter = tokio::spawn(async { concurrency_slot("arn:known-a").await });
+    let waiter_arn = known_a_arn.clone();
+    let waiter = tokio::spawn(async move { concurrency_slot(&waiter_arn).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     waiter.abort();
     drop(held);
-    let reacquired = tokio::time::timeout(Duration::from_secs(1), concurrency_slot("arn:known-a"))
+    let reacquired = tokio::time::timeout(Duration::from_secs(1), concurrency_slot(&known_a_arn))
         .await
         .expect("a cancelled waiter must not retain capacity")
         .unwrap();
     drop(reacquired);
-    assert_eq!(account_concurrency_load("arn:known-a"), Some((0, 1)));
+    assert_eq!(account_concurrency_load(&known_a_arn), Some((0, 1)));
 
     pool.report_failure(
         "known-a",
@@ -195,12 +217,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         .update(vec![json!({"modelId": "target-model"})]);
     pool.load_credentials();
     let replacement = pool.get("known-b").unwrap();
-    *replacement.auth.lock() = Some(Arc::new(KiroAuth::new(
-        Source::Internal("known-b".into()),
-        "us-east-1",
-        None,
-        reqwest::Client::new(),
-    )));
+    assert!(pool.initialize_account("known-b").await);
     replacement
         .models
         .update(vec![json!({"modelId": "target-model"})]);

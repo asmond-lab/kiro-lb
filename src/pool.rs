@@ -609,7 +609,7 @@ impl AccountManager {
     }
 
     fn candidate_order(&self, model: &str, session: Option<u64>) -> Vec<Arc<Account>> {
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
         let ids = inner.order.clone();
         if ids.is_empty() {
             return vec![];
@@ -661,12 +661,9 @@ impl AccountManager {
             let ttl = Duration::from_secs(config::get().session_affinity_ttl_seconds);
             let pinned_id = inner
                 .sessions
-                .get_mut(&key)
+                .get(&key)
                 .filter(|e| e.touched.elapsed() < ttl)
-                .map(|e| {
-                    e.touched = Instant::now();
-                    e.account.clone()
-                });
+                .map(|e| e.account.clone());
             let mut rest = weighted(&inner);
             if let Some(p) = pinned_id.filter(|p| inner.accounts.contains_key(p)) {
                 pinned = Some(p.clone());
@@ -798,6 +795,10 @@ impl AccountManager {
             return;
         }
         let mut inner = self.inner.lock();
+        Self::pin_session_locked(&mut inner, key, account_id);
+    }
+
+    fn pin_session_locked(inner: &mut PoolInner, key: u64, account_id: &str) {
         let cap = config::get().session_affinity_capacity.max(1);
         let previous = inner.sessions.get(&key).map(|e| e.account.clone());
         if previous.as_deref() == Some(account_id) {
@@ -849,9 +850,8 @@ impl AccountManager {
         out
     }
 
-    fn record_event(&self, id: &str, outcome: &str) {
+    fn record_event_locked(inner: &mut PoolInner, id: &str, outcome: &str) {
         let at = store::now_f64();
-        let mut inner = self.inner.lock();
         let cutoff = at - config::get().rate_window_seconds as f64;
         let rpm = inner
             .observations
@@ -872,8 +872,28 @@ impl AccountManager {
         inner.unsaved.push(obs);
     }
 
+    fn record_event(&self, id: &str, outcome: &str) {
+        Self::record_event_locked(&mut self.inner.lock(), id, outcome);
+    }
+
     pub fn report_success(&self, id: &str, model: &str) {
         let Some(a) = self.get(id) else { return };
+        self.commit_success(&a, model, None);
+    }
+
+    /// Commits a successful request only if its original account object is
+    /// still the live pool member. Membership, affinity, model evidence and
+    /// account statistics change under one pool lock so a same-ID replacement
+    /// cannot receive an old request's completion.
+    pub fn commit_success(&self, a: &Arc<Account>, model: &str, session: Option<u64>) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&a.id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            return false;
+        }
         a.models.record_supported(model);
         {
             let mut s = a.state.lock();
@@ -882,27 +902,35 @@ impl AccountManager {
             s.auth_dead_until = 0.0;
             if s.suspended_until > 0.0 {
                 s.suspended_until = 0.0;
-                tracing::info!("Account {id} is serving again; suspension lifted");
+                tracing::info!("Account {} is serving again; suspension lifted", a.id);
             }
             if s.quota_exhausted_until > 0.0 {
                 s.quota_exhausted_until = 0.0;
-                tracing::info!("Account {id} is serving again; quota quarantine cleared");
+                tracing::info!(
+                    "Account {} is serving again; quota quarantine cleared",
+                    a.id
+                );
             }
             s.stats.total += 1;
             s.stats.success += 1;
         }
-        self.record_event(id, "success");
+        Self::record_event_locked(&mut inner, &a.id, "success");
         let normalized = normalize_model_name(model);
-        let mut inner = self.inner.lock();
         let list = inner.model_to_accounts.entry(normalized).or_default();
-        if !list.iter().any(|x| x == id) {
-            list.push(id.to_owned());
+        if !list.iter().any(|x| x == &a.id) {
+            list.push(a.id.clone());
         }
-        if let Some(i) = inner.order.iter().position(|x| x == id) {
+        if let Some(i) = inner.order.iter().position(|x| x == &a.id) {
             inner.current_index = i;
+        }
+        if settings::tunables().load_balancing == "session" {
+            if let Some(key) = session {
+                Self::pin_session_locked(&mut inner, key, &a.id);
+            }
         }
         drop(inner);
         self.mark_dirty();
+        true
     }
 
     fn quota_quarantine_until(s: &AccountState, now: f64) -> f64 {
@@ -1171,4 +1199,71 @@ pub fn session_key(system: &str, first_user: &str) -> Option<u64> {
         .chain_update(first_user.as_bytes())
         .finalize();
     Some(u64::from_be_bytes(digest[..8].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(id: &str) -> Arc<Account> {
+        Arc::new(Account {
+            id: id.into(),
+            config: json!({}),
+            auth: Mutex::new(None),
+            models: Arc::new(ModelInfoCache::new()),
+            state: Mutex::new(AccountState::default()),
+            init: tokio::sync::Mutex::new(()),
+            models_refresh: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    #[test]
+    fn affinity_lookup_does_not_extend_a_near_expiry_pin() {
+        assert_eq!(settings::tunables().load_balancing, "session");
+        let pool = AccountManager::new(reqwest::Client::new());
+        let a = account("a");
+        let touched = Instant::now()
+            - Duration::from_secs(config::get().session_affinity_ttl_seconds.saturating_sub(1));
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push(a.id.clone());
+            inner.accounts.insert(a.id.clone(), a);
+            inner.sessions.insert(
+                7,
+                SessionEntry {
+                    account: "a".into(),
+                    touched,
+                },
+            );
+        }
+
+        pool.candidate_order("model", Some(7));
+        pool.candidate_order("model", Some(7));
+
+        assert_eq!(pool.inner.lock().sessions.get(&7).unwrap().touched, touched);
+    }
+
+    #[test]
+    fn old_completion_cannot_mutate_or_pin_a_same_id_replacement() {
+        assert_eq!(settings::tunables().load_balancing, "session");
+        let pool = AccountManager::new(reqwest::Client::new());
+        let old = account("a");
+        let replacement = account("a");
+        replacement.state.lock().failures = 3;
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("a".into());
+            inner.accounts.insert("a".into(), replacement.clone());
+        }
+
+        assert!(!pool.commit_success(&old, "model", Some(9)));
+        assert_eq!(replacement.state.lock().failures, 3);
+        assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
+        assert!(pool.session_counts().is_empty());
+
+        assert!(pool.commit_success(&replacement, "model", Some(9)));
+        assert_eq!(replacement.state.lock().failures, 0);
+        assert_eq!(replacement.models.support("model"), ModelSupport::Supported);
+        assert_eq!(pool.session_counts().get("a"), Some(&1));
+    }
 }
