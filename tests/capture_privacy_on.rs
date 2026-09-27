@@ -80,7 +80,7 @@ async fn content_capture_on_keeps_prompt_text_but_redacts_secrets() {
         "model": "claude-sonnet-4.5",
         "input": "PRIVATE_INPUT_SENTINEL",
         "instructions": "PRIVATE_INSTRUCTIONS_SENTINEL",
-        "metadata": {"note": "PRIVATE_METADATA_SENTINEL"},
+        "metadata": {"note": "{\"klb_ABCDEFGHIJKLMNOP\":\"PRIVATE_METADATA_SENTINEL\"}"},
         "x-api-key": "klb_ABCDEFGHIJKLMNOP"
     });
     let res = router
@@ -112,6 +112,7 @@ async fn content_capture_on_keeps_prompt_text_but_redacts_secrets() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(text.contains("PRIVATE_INPUT_SENTINEL"), "{text}");
     assert!(text.contains("PRIVATE_INSTRUCTIONS_SENTINEL"), "{text}");
+    assert!(text.contains("PRIVATE_METADATA_SENTINEL"), "{text}");
     assert!(!text.contains("klb_ABCDEFGHIJKLMNOP"), "{text}");
     let bundle: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(bundle["status"], 400);

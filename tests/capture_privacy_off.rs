@@ -137,14 +137,14 @@ async fn content_capture_off_redacts_every_prompt_string() {
             "model": "gpt-4o",
             "messages": [
                 {"role": "system", "content": "CHAT_SYSTEM_SENTINEL"},
-                {"role": "user", "content": [{"type": "text", "text": "CHAT_USER_SENTINEL"}]}
+                {"role": "user", "content": [{"type": "text", "text": "{\"name\":\"CHAT_USER_SENTINEL\"}"}]}
             ],
             "tools": [{"type": "function", "function": {
                 "name": "lookup",
                 "description": "CHAT_TOOL_DESC_SENTINEL",
                 "parameters": {"type": "object", "properties": {"q": {"type": "string", "description": "CHAT_PARAM_SENTINEL"}}}
             }}],
-            "metadata": {"note": "CHAT_METADATA_SENTINEL"},
+            "metadata": {"name": "CHAT_METADATA_SENTINEL"},
             "api_key": "klb_CHATKEY12345678"
         }),
     )

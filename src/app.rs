@@ -167,6 +167,8 @@ pub async fn data_plane_middleware(
         while let Some(chunk) = stream.next().await {
             if let Ok(b) = &chunk {
                 log.ctx.capture(|c| c.chunk("client", b));
+            } else {
+                log.ctx.stream_failed.store(true, Ordering::SeqCst);
             }
             yield chunk;
         }
@@ -239,7 +241,7 @@ impl Drop for RequestLogGuard {
             dashboard_store::record_request(record);
             if let Some(c) = capture {
                 let (code, error) = if failed_stream && status < 400 {
-                    (500, "stream ended with an error event")
+                    (500, "stream failed")
                 } else if status == CLIENT_CLOSED_REQUEST {
                     (status, "client closed the request")
                 } else {
