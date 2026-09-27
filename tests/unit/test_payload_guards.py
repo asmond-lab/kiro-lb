@@ -324,6 +324,36 @@ class TestTrimStripsHistoryImagesFirst:
         for entry in payload["conversationState"].get("history", []):
             assert "images" not in entry.get("userInputMessage", {})
 
+    def test_shrinks_current_image_before_dropping_text_turns(self):
+        """An oversized current-turn screenshot is re-encoded before any history text goes."""
+        import base64
+        import io
+        import random
+
+        from PIL import Image
+
+        rng = random.Random(3)
+        img = Image.new("RGB", (1600, 1200))
+        img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(1600 * 1200)])
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        blob = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        payload = _image_payload(num_pairs=6, image_chars=4, text_size=300)
+        for entry in payload["conversationState"]["history"]:
+            entry.get("userInputMessage", {}).pop("images", None)
+        text_tokens = check_payload_tokens(payload)
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        current["images"] = [{"format": "png", "source": {"bytes": blob}}]
+        limit = text_tokens + 700_000
+        assert check_payload_tokens(payload) > limit
+
+        stats = trim_payload_to_limit(payload, max_tokens=limit)
+
+        assert stats.final_entries == stats.original_entries == 12
+        assert current["images"][0]["format"] == "jpeg"
+        assert stats.final_tokens <= limit
+
     def test_under_limit_keeps_images(self):
         payload = _image_payload(num_pairs=2)
         stats = trim_payload_to_limit(payload, max_tokens=check_payload_tokens(payload) * 2)

@@ -507,6 +507,14 @@ def trim_payload_to_limit(
             payload, history, max_bytes, max_tokens, original_tokens, original_bytes
         )
 
+    # A screenshot in the current turn can exceed the cap on its own. Shrinking it
+    # (JPEG re-encode) costs less than the whole conversation: dropping turns
+    # first emptied the history ("108 -> 0 messages") and only then shrank the
+    # image that caused it.
+    if _known_over_limit(current_tokens, current_bytes, max_bytes, max_tokens):
+        _shrink_current_images_until_fit(payload, max_bytes, max_tokens)
+        current_tokens, current_bytes = measure_payload(payload)
+
     # Trim pairs from the beginning until under limit or no history remains.
     # The per-entry estimate handles the bulk without re-tokenizing the whole
     # payload; the exact check below covers the tokenizer's boundary difference
