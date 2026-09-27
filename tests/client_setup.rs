@@ -152,7 +152,7 @@ fn text(output: &Output) -> String {
 fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     let home = TestHome::new();
     fs::create_dir(home.path.join(".claude")).unwrap();
-    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\", \"ANTHROPIC_API_KEY\": \"old-key\", \"ANTHROPIC_CUSTOM_HEADERS\": \"X-Tenant: kept\\nx-api-key: stale\"}\n}\n";
+    let original = "{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"kept\", \"ANTHROPIC_API_KEY\": \"old-key\", \"ANTHROPIC_CUSTOM_HEADERS\": \"X-Tenant: kept\\nx-api-key: stale\", \"CLAUDE_CODE_USE_BEDROCK\": \"1\", \"CLAUDE_CODE_USE_VERTEX\": \"1\"}\n}\n";
     fs::write(home.claude(), original).unwrap();
     #[cfg(unix)]
     {
@@ -169,7 +169,14 @@ fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
             & 0o777
     };
     let (url, server) = gateway(4);
-    let first = setup(&home, &url, "all");
+    let first = home
+        .command()
+        .env("CLAUDE_CODE_USE_BEDROCK", "1")
+        .env("CLAUDE_CODE_USE_VERTEX", "1")
+        .env("CLAUDE_CODE_USE_FOUNDRY", "1")
+        .args(["client", "setup", "all", "--base-url", &url])
+        .output()
+        .unwrap();
     assert!(first.status.success(), "{}", text(&first));
     let second = setup(&home, &url, "all");
     assert!(second.status.success(), "{}", text(&second));
@@ -182,6 +189,9 @@ fn setup_is_repeatable_preserves_settings_and_restores_exact_bytes_and_mode() {
     assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], url);
     assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "");
     assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], KEY);
+    assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
+    assert_eq!(settings["env"]["CLAUDE_CODE_USE_VERTEX"], "");
+    assert_eq!(settings["env"]["CLAUDE_CODE_USE_FOUNDRY"], "");
     assert_eq!(
         settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
         "X-Tenant: kept\n"

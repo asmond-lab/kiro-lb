@@ -627,6 +627,13 @@ fn claude_config(original: Option<&str>, options: &Options, key: &str) -> Result
     );
     env.insert("ANTHROPIC_API_KEY".into(), Value::String(String::new()));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(key.to_owned()));
+    for selector in [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        env.insert(selector.into(), Value::String(String::new()));
+    }
     env.insert(
         "ANTHROPIC_CUSTOM_HEADERS".into(),
         Value::String(custom_headers),
@@ -2109,7 +2116,7 @@ mod tests {
         };
         let generated = claude_config(
             Some(
-                r#"{"env":{"ANTHROPIC_API_KEY":"old-key","ANTHROPIC_CUSTOM_HEADERS":"X-Tenant: kept\nx-api-key: stale\r\nAuthorization: Basic stale\nX-Trace: kept\n","CUSTOM":"kept"}}"#,
+                r#"{"env":{"ANTHROPIC_API_KEY":"old-key","ANTHROPIC_CUSTOM_HEADERS":"X-Tenant: kept\nx-api-key: stale\r\nAuthorization: Basic stale\nX-Trace: kept\n","CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_USE_VERTEX":"1","CLAUDE_CODE_USE_FOUNDRY":"1","CUSTOM":"kept"}}"#,
             ),
             &options,
             "gateway-key",
@@ -2119,6 +2126,9 @@ mod tests {
 
         assert_eq!(document["env"]["ANTHROPIC_API_KEY"], "");
         assert_eq!(document["env"]["ANTHROPIC_AUTH_TOKEN"], "gateway-key");
+        assert_eq!(document["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
+        assert_eq!(document["env"]["CLAUDE_CODE_USE_VERTEX"], "");
+        assert_eq!(document["env"]["CLAUDE_CODE_USE_FOUNDRY"], "");
         assert_eq!(
             document["env"]["ANTHROPIC_CUSTOM_HEADERS"],
             "X-Tenant: kept\nX-Trace: kept\n"
