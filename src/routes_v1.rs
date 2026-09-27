@@ -987,8 +987,32 @@ fn model_views(state: &Shared) -> Vec<Value> {
         .collect()
 }
 
+/// Bound on how long model discovery waits for the catalog after startup or
+/// activation before answering 503 instead of a misleading empty list.
+const CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn catalog_unavailable(state: &Shared, protocol: Protocol) -> Option<Response> {
+    if state.quiesced.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    if state.pool.ensure_catalog(CATALOG_WAIT).await {
+        return None;
+    }
+    let mut r = error_for(
+        protocol,
+        503,
+        "Model catalog is not ready yet; retry shortly",
+    );
+    r.headers_mut()
+        .insert("retry-after", axum::http::HeaderValue::from_static("10"));
+    Some(r)
+}
+
 pub async fn models(State(state): State<Shared>, headers: HeaderMap) -> Response {
     if let Err(r) = authenticate(&headers, Protocol::OpenAI, true).await {
+        return r;
+    }
+    if let Some(r) = catalog_unavailable(&state, Protocol::OpenAI).await {
         return r;
     }
     let data = model_views(&state);
@@ -1006,6 +1030,9 @@ pub async fn model(
     Path(id): Path<String>,
 ) -> Response {
     if let Err(r) = authenticate(&headers, Protocol::OpenAI, true).await {
+        return r;
+    }
+    if let Some(r) = catalog_unavailable(&state, Protocol::OpenAI).await {
         return r;
     }
     match model_views(&state)

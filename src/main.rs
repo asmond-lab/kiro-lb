@@ -336,12 +336,12 @@ async fn serve(host: String, port: u16) {
     } else {
         let p = pool.clone();
         tokio::spawn(async move {
-            for a in p.accounts() {
-                if p.initialize_account(&a.id).await {
-                    return;
-                }
+            p.warm_up(kiro_lb::pool::WARM_UP_ACCOUNT_TIMEOUT).await;
+            if !p.catalog_ready() && !p.accounts().is_empty() {
+                tracing::warn!(
+                    "No account initialized at startup; they will be retried on first use"
+                );
             }
-            tracing::warn!("No account initialized at startup; they will be retried on first use");
         });
     }
     let observations = dashboard_store::load_rate_observations(

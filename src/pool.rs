@@ -140,12 +140,21 @@ struct PoolInner {
     sessions: HashMap<u64, SessionEntry>,
 }
 
+/// Per-account bound for one warm-up initialization.
+pub const WARM_UP_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub struct AccountManager {
     inner: Mutex<PoolInner>,
     dirty: std::sync::atomic::AtomicBool,
     http: reqwest::Client,
     mutations: tokio::sync::Mutex<()>,
+    warm: tokio::sync::Mutex<()>,
+    warm_failed_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// After a warm-up that initialized nothing, discovery answers "not ready"
+/// immediately for this long instead of sweeping dead accounts on every poll.
+pub const WARM_UP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AccountManager {
     pub fn new(http: reqwest::Client) -> Arc<AccountManager> {
@@ -154,7 +163,70 @@ impl AccountManager {
             dirty: false.into(),
             http,
             mutations: tokio::sync::Mutex::new(()),
+            warm: tokio::sync::Mutex::new(()),
+            warm_failed_at: Mutex::new(None),
         })
+    }
+
+    /// True when at least one account has initialized auth and a model list,
+    /// which is what model discovery and handoff readiness need.
+    pub fn catalog_ready(&self) -> bool {
+        self.accounts().iter().any(|a| a.auth.lock().is_some())
+    }
+
+    /// Initializes every uninitialized account concurrently, each bounded by
+    /// `per_account`, so a dead or slow account never holds up a healthy one.
+    /// Single-flight: a caller that arrives while a warm-up runs waits for it
+    /// instead of starting another. Only the runtime writer may call this; it
+    /// can refresh credentials through the lease.
+    pub async fn warm_up(self: &Arc<Self>, per_account: std::time::Duration) {
+        let _flight = self.warm.lock().await;
+        let pending: Vec<Arc<Account>> = self
+            .accounts()
+            .into_iter()
+            .filter(|a| a.auth.lock().is_none())
+            .collect();
+        let tasks: Vec<_> = pending
+            .into_iter()
+            .map(|a| {
+                let pool = self.clone();
+                tokio::spawn(async move {
+                    if tokio::time::timeout(per_account, pool.initialize(&a))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Account {} did not initialize within {per_account:?}; it will be retried on first use", a.id);
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            let _ = t.await;
+        }
+        *self.warm_failed_at.lock() =
+            (!self.catalog_ready() && !self.accounts().is_empty()).then(std::time::Instant::now);
+    }
+
+    /// Waits up to `limit` for a warm-up in progress (or starts one) so model
+    /// discovery right after activation does not return an empty list.
+    pub async fn ensure_catalog(self: &Arc<Self>, limit: std::time::Duration) -> bool {
+        if self.catalog_ready() || self.accounts().is_empty() {
+            return true;
+        }
+        let recently_failed = self
+            .warm_failed_at
+            .lock()
+            .is_some_and(|t| t.elapsed() < WARM_UP_RETRY_AFTER);
+        if recently_failed && self.warm.try_lock().is_ok() {
+            return false;
+        }
+        let pool = self.clone();
+        let _ = tokio::time::timeout(
+            limit,
+            async move { pool.warm_up(WARM_UP_ACCOUNT_TIMEOUT).await },
+        )
+        .await;
+        self.catalog_ready()
     }
 
     /// Held across a whole account read/check/mutate/persist sequence

@@ -356,7 +356,7 @@ cmd_deploy() {
       set_runtime_writer "$next"
       "${COMPOSE[@]}" up -d --no-build --force-recreate "$next_svc"
       wait_http "http://127.0.0.1:${next_port}/health" 90 || die "$next slot health failed"
-      wait_handoff_ready "$next_port" 30 || die "new slot readiness failed"
+      wait_handoff_ready "$next_port" 60 || die "new slot readiness failed"
       render_haproxy_cfg "$next"
       soft_reload_edge
       prove_slot "$next"
@@ -389,7 +389,7 @@ cmd_deploy() {
   log "handoff writer=$next; reload standby"
   set_runtime_writer "$next"
   handoff_post "$next_port" activate || die "new slot activation failed"
-  wait_handoff_ready "$next_port" 30 || die "new slot handoff readiness failed"
+  wait_handoff_ready "$next_port" 60 || die "new slot handoff readiness failed"
   render_haproxy_cfg "$next"
   soft_reload_edge
   prove_slot "$next"
