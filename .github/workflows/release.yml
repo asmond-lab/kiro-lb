@@ -11,9 +11,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release-automation
@@ -22,6 +20,9 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -60,6 +61,9 @@ jobs:
   binaries:
     needs: prepare
     if: needs.prepare.outputs.tag != ''
+    permissions:
+      contents: write
+      packages: write
     uses: ./.github/workflows/build.yml
     with:
       release_tag: ${{ needs.prepare.outputs.tag }}
@@ -67,21 +71,30 @@ jobs:
   release-pr:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
     steps:
-      - name: Require release PR credentials
-        env:
-          TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-        run: |
-          test -n "$TOKEN" || { echo 'Configure RELEASE_PLZ_TOKEN as documented in README.md'; exit 1; }
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: release-plz/action@d9c19fb28c0cf7a73ae587be4417cf5233962400
+        id: release-pr
         with:
           command: release-pr
           version: '0.3.169'
         env:
-          # A separate token makes the bot PR trigger normal pull_request CI.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Run validation on the release PR branch
+        if: steps.release-pr.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.release-pr.outputs.pr }}
+        run: |
+          branch=$(jq -er '.head_branch | select(startswith("release-plz-"))' <<< "$PR")
+          # Dispatch works with GITHUB_TOKEN without requiring approval of a bot PR event.
+          # Build's workflow_dispatch path is validation-only, including on tag refs.
+          gh workflow run build.yml --ref "$branch"

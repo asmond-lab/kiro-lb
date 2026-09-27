@@ -79,13 +79,20 @@ Commits (`fix:`, `feat:`, and `!` / `BREAKING CHANGE:`) for useful release notes
 The baseline is `v0.2.0`; versions and tags are not reset. This is GitHub-only
 distribution: `git_only = true` disables publishing to crates.io.
 
-Before merging the automation setup, add the repository Actions secret
-`RELEASE_PLZ_TOKEN`: a fine-grained personal access token scoped only to this
-repository, with **Contents: read/write** and **Pull requests: read/write**.
-Use a bot account if available, set an expiry, and rotate it before expiry.
-Do not put the token in a file or PR. This separate token lets release PRs
-trigger normal PR CI; the default `GITHUB_TOKEN` would suppress those events.
-The release PR job fails explicitly if the secret is missing.
+No personal access token or release secret is required. In Settings → Actions →
+General → Workflow permissions, enable **Allow GitHub Actions to create and
+approve pull requests**; keep the default token permissions read-only. The
+release PR job grants its short-lived `GITHUB_TOKEN` Contents and Pull requests
+write access, plus Actions write access to explicitly dispatch validation.
+It does not approve or merge PRs.
+
+After creating/updating a release PR, the job dispatches **Build** on that PR's
+branch. This avoids depending on bot-generated PR events, which may require
+approval. Dispatched builds check the branch commit and cannot publish Docker
+images or releases, even when manually dispatched on a tag. Review the Build
+checks on the release PR before merging. No dispatch is made when release-plz
+reports no PR changes. The old `RELEASE_PLZ_TOKEN` secret is no longer read and
+can be removed after verifying the token-free workflow.
 
 The release workflow uses the default `GITHUB_TOKEN` to create a tag and a
 **draft** release, then directly calls the existing build workflow for that
