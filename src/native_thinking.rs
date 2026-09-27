@@ -1,10 +1,11 @@
-//! Native reasoning request fields. Kiro accepts only the adaptive form; the
-//! legacy budget form is translated, never forwarded. Unknown members of
-//! additionalModelRequestFields are rejected upstream, so the object is attached
-//! only when reasoning was actually requested.
+//! Native reasoning request fields. GPT and Claude use different upstream
+//! fields, while the legacy Anthropic budget form is translated, never forwarded.
+//! Unknown members of additionalModelRequestFields are rejected upstream, so the
+//! object is attached only for an explicitly supported model and effort.
 
 use serde_json::{json, Value};
 
+const GPT_NATIVE_THINKING_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 pub const NATIVE_THINKING_MODELS: &[&str] = &[
     "claude-opus-4.6",
     "claude-opus-4.7",
@@ -12,6 +13,9 @@ pub const NATIVE_THINKING_MODELS: &[&str] = &[
     "claude-opus-5",
     "claude-opus-5.5",
     "claude-sonnet-4.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
 ];
 const SUPPORTED: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DISABLING: &[&str] = &["none", "off", "disabled", "0"];
@@ -91,8 +95,9 @@ pub fn apply_native_thinking(payload: &mut Value, model_id: &str, effort: Option
     let Some(e) = normalize_effort(effort) else {
         return;
     };
-    if !supports_native_thinking(model_id) {
-        return;
+    if GPT_NATIVE_THINKING_MODELS.contains(&model_id) {
+        payload["additionalModelRequestFields"] = json!({"reasoning": {"effort": e}});
+    } else if supports_native_thinking(model_id) {
+        payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
     }
-    payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
 }
