@@ -430,6 +430,7 @@ fn plan_install(
         ClientKind::Codex => codex_config(options),
         ClientKind::Claude => claude_config(original.as_deref(), options, key)?,
     };
+    ensure_file_size(&path, content.len())?;
     recoverable_sha256.sort();
     recoverable_sha256.dedup();
     Ok(PlannedWrite {
@@ -1051,6 +1052,14 @@ fn read_bounded(file: fs::File, path: &Path) -> Result<String, String> {
     String::from_utf8(content).map_err(|_| format!("{} is not valid UTF-8", path.display()))
 }
 
+fn ensure_file_size(path: &Path, size: usize) -> Result<(), String> {
+    if size as u64 > MAX_CLIENT_FILE_BYTES {
+        Err(format!("{} is too large", path.display()))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn verify_parent(parent: &fs::File, path: &Path, expected: &ExpectedFile) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
@@ -1165,6 +1174,7 @@ fn create_staged(
 ) -> Result<(std::ffi::CString, FileIdentity, u32), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    ensure_file_size(path, content.len())?;
     create_staged_inner(parent, path, |file| {
         file.write_all(content)
             .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;

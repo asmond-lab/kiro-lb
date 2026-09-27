@@ -305,6 +305,32 @@ fn unavailable_gateway_and_malformed_settings_leave_clients_untouched() {
     assert!(!home.state().exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_recovery_journal_is_rejected_before_client_mutation() {
+    let home = TestHome::new();
+    fs::create_dir(home.path.join(".codex")).unwrap();
+    fs::create_dir(home.path.join(".claude")).unwrap();
+    let codex_original = "c".repeat(4_300_000);
+    let claude_original = format!(r#"{{"padding":"{}"}}"#, "d".repeat(4_300_000));
+    fs::write(home.codex(), &codex_original).unwrap();
+    fs::write(home.claude(), &claude_original).unwrap();
+    let (url, server) = gateway(2);
+
+    let output = setup(&home, &url, "all");
+
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output).contains("client-setup.json is too large"));
+    assert_eq!(fs::read_to_string(home.codex()).unwrap(), codex_original);
+    assert_eq!(fs::read_to_string(home.claude()).unwrap(), claude_original);
+    assert!(!home.state().exists());
+    assert!(fs::read_dir(home.path.join(".kirolb"))
+        .unwrap()
+        .next()
+        .is_none());
+}
+
 #[cfg(unix)]
 #[cfg(target_os = "linux")]
 #[test]
