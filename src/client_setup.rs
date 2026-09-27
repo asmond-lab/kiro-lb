@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,6 +44,8 @@ struct Snapshot {
     original_mode: Option<u32>,
     installed_sha256: String,
     #[serde(default)]
+    installed_mode: Option<u32>,
+    #[serde(default)]
     recoverable_sha256: Vec<String>,
 }
 
@@ -61,6 +63,7 @@ struct ExpectedFile {
     parent_identity: FileIdentity,
     #[cfg(unix)]
     file_identity: Option<FileIdentity>,
+    file_mode: Option<u32>,
 }
 
 #[cfg(unix)]
@@ -245,8 +248,8 @@ fn setup(options: Options) -> Result<(), String> {
     require_mutation_platform()?;
     let key = read_key(&options)?;
     run_diagnostic(&options.base_url, &key)?;
-    let _lock = StateLock::acquire()?;
-    let mut state = load_state()?;
+    let lock = StateLock::acquire()?;
+    let mut state = load_state_locked(&lock)?;
     let plans: Vec<PlannedWrite> = options
         .clients
         .iter()
@@ -259,13 +262,14 @@ fn setup(options: Options) -> Result<(), String> {
     }
     // The private state file is a recovery journal. If the process stops after
     // this point, restore accepts either the old bytes or the staged bytes.
-    save_state(&state)?;
+    save_state_locked(&lock, &state)?;
     for plan in plans {
+        lock.verify_directory_path()?;
         conditional_write(
             &plan.snapshot.path,
             plan.content.as_bytes(),
             &plan.expected,
-            None,
+            Some(0o600),
         )?;
     }
     for client in &options.clients {
@@ -273,7 +277,7 @@ fn setup(options: Options) -> Result<(), String> {
             snapshot.recoverable_sha256.clear();
         }
     }
-    save_state(&state)?;
+    save_state_locked(&lock, &state)?;
     println!("Client configuration installed. No inference request was made.");
     println!("Run `kirolb client status` to inspect it or `kirolb client restore` to undo it.");
     if options.clients.contains(&ClientKind::Codex) {
@@ -369,7 +373,9 @@ fn plan_install(
     let previous = state.clients.get(client.id());
     let (original, original_mode, mut recoverable_sha256) = if let Some(snapshot) = previous {
         let current_hash = current.as_deref().map(hash);
-        if snapshot.path != path || !snapshot_accepts(snapshot, current_hash.as_deref()) {
+        if snapshot.path != path
+            || !snapshot_accepts(snapshot, current_hash.as_deref(), expected.file_mode)
+        {
             return Err(format!(
                 "{} configuration changed after setup; restore or reconcile it manually before setup",
                 client.id()
@@ -379,7 +385,7 @@ fn plan_install(
         hashes.push(snapshot.installed_sha256.clone());
         (snapshot.original.clone(), snapshot.original_mode, hashes)
     } else {
-        (current, file_mode(&path)?, Vec::new())
+        (current, expected.file_mode, Vec::new())
     };
     let content = match client {
         ClientKind::Codex => codex_config(options),
@@ -394,6 +400,7 @@ fn plan_install(
             original,
             original_mode,
             installed_sha256: hash(&content),
+            installed_mode: Some(0o600),
             recoverable_sha256,
         },
         content,
@@ -473,9 +480,12 @@ fn status(clients: Vec<ClientKind>) -> Result<(), String> {
                 }
                 let current = read_optional(&snapshot.path)?;
                 let current_hash = current.as_deref().map(hash);
+                let current_mode = readonly_file_mode(&snapshot.path)?;
                 let state = match current_hash.as_deref() {
-                    Some(value) if value == snapshot.installed_sha256 => "installed",
-                    value if snapshot_accepts(snapshot, value) => "recovery pending",
+                    Some(value) if snapshot_matches_installed(snapshot, value, current_mode) => {
+                        "installed"
+                    }
+                    value if snapshot_accepts(snapshot, value, current_mode) => "recovery pending",
                     _ => "modified (restore blocked)",
                 };
                 println!("{}: {state} at {}", client.id(), snapshot.path.display());
@@ -487,8 +497,8 @@ fn status(clients: Vec<ClientKind>) -> Result<(), String> {
 
 fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
     require_mutation_platform()?;
-    let _lock = StateLock::acquire()?;
-    let mut state = load_state()?;
+    let lock = StateLock::acquire()?;
+    let mut state = load_state_locked(&lock)?;
     let mut plans = Vec::new();
     for client in &clients {
         let Some(snapshot) = state.clients.get(client.id()) else {
@@ -503,7 +513,7 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
         let expected = inspect_expected(&snapshot.path, false)?;
         let current = expected.content.as_deref();
         let current_hash = current.map(hash);
-        if !snapshot_accepts(snapshot, current_hash.as_deref()) {
+        if !snapshot_accepts(snapshot, current_hash.as_deref(), expected.file_mode) {
             return Err(format!(
                 "{} configuration changed after setup; refusing destructive restore",
                 client.id()
@@ -522,6 +532,7 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
         };
         match snapshot.original {
             Some(content) => {
+                lock.verify_directory_path()?;
                 conditional_write(
                     &snapshot.path,
                     content.as_bytes(),
@@ -529,13 +540,16 @@ fn restore(clients: Vec<ClientKind>) -> Result<(), String> {
                     snapshot.original_mode,
                 )?;
             }
-            None if expected.content.is_some() => conditional_remove(&snapshot.path, &expected)?,
+            None if expected.content.is_some() => {
+                lock.verify_directory_path()?;
+                conditional_remove(&snapshot.path, &expected)?
+            }
             None => {}
         }
         state.clients.remove(client.id());
         println!("{}: restored", client.id());
     }
-    save_state(&state)
+    save_state_locked(&lock, &state)
 }
 
 fn client_path(client: ClientKind) -> Result<PathBuf, String> {
@@ -577,26 +591,16 @@ fn load_state() -> Result<State, String> {
             clients: BTreeMap::new(),
         });
     };
-    let state: State = serde_json::from_str(&content)
+    parse_state(&content)
+}
+
+fn parse_state(content: &str) -> Result<State, String> {
+    let state: State = serde_json::from_str(content)
         .map_err(|_| "client setup restoration state is malformed".to_owned())?;
     if state.version != 1 {
         return Err("client setup restoration state has an unsupported version".into());
     }
     Ok(state)
-}
-
-fn save_state(state: &State) -> Result<(), String> {
-    let path = state_path()?;
-    if state.clients.is_empty() {
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
-        }
-        return Ok(());
-    }
-    let mut content = serde_json::to_vec_pretty(state)
-        .map_err(|e| format!("cannot serialize restoration state: {e}"))?;
-    content.push(b'\n');
-    atomic_write(&path, &content)
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, String> {
@@ -619,6 +623,7 @@ fn reject_symlink(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(not(unix))]
 fn reject_symlink_parent(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -637,18 +642,67 @@ fn reject_symlink_parent(path: &Path) -> Result<(), String> {
     }
 }
 
-fn snapshot_accepts(snapshot: &Snapshot, current_hash: Option<&str>) -> bool {
+#[cfg(not(unix))]
+fn set_dir_private(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn snapshot_accepts(
+    snapshot: &Snapshot,
+    current_hash: Option<&str>,
+    current_mode: Option<u32>,
+) -> bool {
     match current_hash {
         Some(value) => {
-            value == snapshot.installed_sha256
-                || snapshot.recoverable_sha256.iter().any(|hash| hash == value)
-                || snapshot
+            snapshot_matches_installed(snapshot, value, current_mode)
+                || (snapshot
                     .original
                     .as_deref()
                     .is_some_and(|original| hash(original) == value)
+                    && snapshot_mode_matches(snapshot.original_mode, current_mode))
         }
         None => snapshot.original.is_none(),
     }
+}
+
+fn snapshot_matches_installed(
+    snapshot: &Snapshot,
+    current_hash: &str,
+    current_mode: Option<u32>,
+) -> bool {
+    (current_hash == snapshot.installed_sha256
+        || snapshot
+            .recoverable_sha256
+            .iter()
+            .any(|hash| hash == current_hash))
+        && snapshot_mode_matches(snapshot.installed_mode, current_mode)
+}
+
+#[cfg(unix)]
+fn snapshot_mode_matches(expected: Option<u32>, current: Option<u32>) -> bool {
+    expected.is_none_or(|mode| Some(mode) == current)
+}
+
+#[cfg(not(unix))]
+fn snapshot_mode_matches(_expected: Option<u32>, _current: Option<u32>) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn readonly_file_mode(path: &Path) -> Result<Option<u32>, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Ok(None),
+        Ok(metadata) => Ok(Some(metadata.mode() & 0o7777)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn readonly_file_mode(_path: &Path) -> Result<Option<u32>, String> {
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -675,12 +729,13 @@ fn inspect_expected(path: &Path, create_parent: bool) -> Result<ExpectedFile, St
             .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
         let inspected = read_at(&parent, path)?;
         Ok(ExpectedFile {
-            content: inspected.as_ref().map(|(content, _)| content.clone()),
+            content: inspected.as_ref().map(|(content, _, _)| content.clone()),
             parent_identity: FileIdentity {
                 device: parent_metadata.dev(),
                 inode: parent_metadata.ino(),
             },
-            file_identity: inspected.map(|(_, identity)| identity),
+            file_identity: inspected.as_ref().map(|(_, identity, _)| *identity),
+            file_mode: inspected.map(|(_, _, mode)| mode),
         })
     }
     #[cfg(not(unix))]
@@ -697,6 +752,7 @@ fn inspect_expected(path: &Path, create_parent: bool) -> Result<ExpectedFile, St
         reject_symlink(path)?;
         Ok(ExpectedFile {
             content: read_optional(path)?,
+            file_mode: None,
         })
     }
 }
@@ -767,7 +823,7 @@ fn leaf_name(path: &Path) -> Result<std::ffi::CString, String> {
 }
 
 #[cfg(unix)]
-fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentity)>, String> {
+fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentity, u32)>, String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
 
@@ -805,6 +861,7 @@ fn read_at(parent: &fs::File, path: &Path) -> Result<Option<(String, FileIdentit
             device: metadata.dev(),
             inode: metadata.ino(),
         },
+        metadata.mode() & 0o7777,
     )))
 }
 
@@ -828,12 +885,20 @@ fn verify_parent(parent: &fs::File, path: &Path, expected: &ExpectedFile) -> Res
 }
 
 #[cfg(target_os = "linux")]
-fn expected_matches(actual: &Option<(String, FileIdentity)>, expected: &ExpectedFile) -> bool {
-    match (actual, expected.content.as_deref(), expected.file_identity) {
-        (None, None, None) => true,
-        (Some((actual_content, actual_identity)), Some(content), Some(identity)) => {
-            actual_content == content && *actual_identity == identity
-        }
+fn expected_matches(actual: &Option<(String, FileIdentity, u32)>, expected: &ExpectedFile) -> bool {
+    match (
+        actual,
+        expected.content.as_deref(),
+        expected.file_identity,
+        expected.file_mode,
+    ) {
+        (None, None, None, None) => true,
+        (
+            Some((actual_content, actual_identity, actual_mode)),
+            Some(content),
+            Some(identity),
+            Some(mode),
+        ) => actual_content == content && *actual_identity == identity && *actual_mode == mode,
         _ => false,
     }
 }
@@ -869,7 +934,7 @@ fn create_staged(
     path: &Path,
     content: &[u8],
     mode: Option<u32>,
-) -> Result<(std::ffi::CString, FileIdentity), String> {
+) -> Result<(std::ffi::CString, FileIdentity, u32), String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -908,6 +973,7 @@ fn create_staged(
             device: metadata.dev(),
             inode: metadata.ino(),
         },
+        metadata.mode() & 0o7777,
     ))
 }
 
@@ -929,7 +995,7 @@ fn conditional_write(
             path.display()
         ));
     }
-    let (temporary, staged_identity) = create_staged(&parent, path, content, mode)?;
+    let (temporary, staged_identity, staged_mode) = create_staged(&parent, path, content, mode)?;
     let temporary_path = path.with_file_name(temporary.to_string_lossy().as_ref());
     let result = match expected.content.as_deref() {
         None => rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE).map_err(|e| {
@@ -946,13 +1012,13 @@ fn conditional_write(
                 ))
             } else {
                 let old = read_at(&parent, &temporary_path);
-                let matches =
-                    old.as_ref()
-                        .ok()
-                        .and_then(Option::as_ref)
-                        .is_some_and(|(actual, identity)| {
-                            actual == expected_content && Some(*identity) == expected.file_identity
-                        });
+                let matches = old.as_ref().ok().and_then(Option::as_ref).is_some_and(
+                    |(actual, identity, actual_mode)| {
+                        actual == expected_content
+                            && Some(*identity) == expected.file_identity
+                            && Some(*actual_mode) == expected.file_mode
+                    },
+                );
                 if matches {
                     Ok(())
                 } else {
@@ -961,8 +1027,10 @@ fn conditional_write(
                         .as_ref()
                         .ok()
                         .and_then(Option::as_ref)
-                        .is_some_and(|(actual, identity)| {
-                            actual.as_bytes() == content && *identity == staged_identity
+                        .is_some_and(|(actual, identity, actual_mode)| {
+                            actual.as_bytes() == content
+                                && *identity == staged_identity
+                                && *actual_mode == staged_mode
                         });
                     if can_rollback {
                         rename_at(&parent, &temporary, &target, libc::RENAME_EXCHANGE).map_err(
@@ -1025,13 +1093,13 @@ fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<(), String
         )
     })?;
     let moved = read_at(&parent, &temporary_path);
-    let matches = moved
-        .as_ref()
-        .ok()
-        .and_then(Option::as_ref)
-        .is_some_and(|(actual, identity)| {
-            expected.content.as_deref() == Some(actual) && expected.file_identity == Some(*identity)
-        });
+    let matches = moved.as_ref().ok().and_then(Option::as_ref).is_some_and(
+        |(actual, identity, actual_mode)| {
+            expected.content.as_deref() == Some(actual)
+                && expected.file_identity == Some(*identity)
+                && expected.file_mode == Some(*actual_mode)
+        },
+    );
     if !matches {
         if rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE).is_err() {
             return Err(format!(
@@ -1073,164 +1141,165 @@ fn conditional_remove(_path: &Path, _expected: &ExpectedFile) -> Result<(), Stri
     require_mutation_platform()
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
-    reject_symlink(path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    if !parent.exists() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        set_dir_private(parent)?;
+#[cfg(target_os = "linux")]
+struct StateLock {
+    file: fs::File,
+    directory: fs::File,
+    directory_identity: FileIdentity,
+    state_file: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl StateLock {
+    fn acquire() -> Result<Self, String> {
+        Self::acquire_at(state_path()?)
     }
-    let temporary = parent.join(format!(".kirolb-{}.tmp", Uuid::new_v4()));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+
+    fn acquire_at(state_file: PathBuf) -> Result<Self, String> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = open_parent_secure(&state_file, true)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|e| format!("cannot inspect state directory: {e}"))?;
+        let directory_identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let lock_name = leaf_name(&state_file.with_extension("lock"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                lock_name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(format!(
+                "cannot safely open client setup lock: {}",
+                io::Error::last_os_error()
+            ));
         }
-        let mut file = options
-            .open(&temporary)
-            .map_err(|e| format!("cannot create temporary file: {e}"))?;
-        file.write_all(content)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| format!("cannot write temporary file: {e}"))?;
-        replace_atomic(&temporary, path)?;
-        sync_directory(parent)?;
-        set_file_private(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let file = unsafe { fs::File::from_raw_fd(descriptor) };
+        if !file
+            .metadata()
+            .map_err(|e| format!("cannot inspect client setup lock: {e}"))?
+            .is_file()
+        {
+            return Err("client setup lock is not a regular file".into());
+        }
+        file.lock()
+            .map_err(|e| format!("cannot lock client setup state: {e}"))?;
+        let lock = Self {
+            file,
+            directory,
+            directory_identity,
+            state_file,
+        };
+        lock.verify_directory_path()?;
+        Ok(lock)
     }
-    result
-}
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), String> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| format!("cannot sync {}: {e}", path.display()))
-}
+    fn verify_directory_path(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_atomic(temporary: &Path, path: &Path) -> Result<(), String> {
-    fs::rename(temporary, path)
-        .map_err(|e| format!("cannot atomically replace {}: {e}", path.display()))
-}
-
-#[cfg(windows)]
-fn replace_atomic(temporary: &Path, path: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // MoveFileExW replaces an existing destination without an unlink window.
-    let result = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(format!(
-            "cannot atomically replace {}: {}",
-            path.display(),
-            io::Error::last_os_error()
-        ))
-    } else {
+        let current = open_parent_secure(&self.state_file, false)?;
+        let metadata = current
+            .metadata()
+            .map_err(|e| format!("cannot inspect state directory: {e}"))?;
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if identity != self.directory_identity {
+            return Err(
+                "client setup state directory changed while locked; refusing mutation".into(),
+            );
+        }
         Ok(())
     }
 }
 
-#[cfg(unix)]
-fn set_dir_private(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot secure {}: {e}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_dir_private(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_file_private(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("cannot secure {}: {e}", path.display()))
-}
-
-#[cfg(unix)]
-fn file_mode(path: &Path) -> Result<Option<u32>, String> {
-    use std::os::unix::fs::MetadataExt;
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(metadata.mode() & 0o7777)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "cannot inspect permissions on {}: {error}",
-            path.display()
-        )),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_mode(_path: &Path) -> Result<Option<u32>, String> {
-    Ok(None)
-}
-
-struct StateLock {
-    file: fs::File,
-}
-
-impl StateLock {
-    fn acquire() -> Result<Self, String> {
-        let path = state_path()?.with_extension("lock");
-        let parent = path.parent().expect("state lock parent");
-        if !parent.exists() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-            set_dir_private(parent)?;
-        }
-        reject_symlink_parent(&path)?;
-        reject_symlink(&path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .map_err(|e| format!("cannot open client setup lock: {e}"))?;
-        file.lock()
-            .map_err(|e| format!("cannot lock client setup state: {e}"))?;
-        Ok(Self { file })
-    }
-}
-
+#[cfg(target_os = "linux")]
 impl Drop for StateLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
 }
 
-#[cfg(not(unix))]
-fn set_file_private(_path: &Path) -> Result<(), String> {
-    Ok(())
+#[cfg(target_os = "linux")]
+fn load_state_locked(lock: &StateLock) -> Result<State, String> {
+    lock.verify_directory_path()?;
+    match read_at(&lock.directory, &lock.state_file)? {
+        Some((content, _, _)) => parse_state(&content),
+        None => Ok(State {
+            version: 1,
+            clients: BTreeMap::new(),
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn save_state_locked(lock: &StateLock, state: &State) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    lock.verify_directory_path()?;
+    let target = leaf_name(&lock.state_file)?;
+    if state.clients.is_empty() {
+        let result = unsafe { libc::unlinkat(lock.directory.as_raw_fd(), target.as_ptr(), 0) };
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
+            return Err(format!(
+                "cannot remove {}: {}",
+                lock.state_file.display(),
+                io::Error::last_os_error()
+            ));
+        }
+    } else {
+        let mut content = serde_json::to_vec_pretty(state)
+            .map_err(|e| format!("cannot serialize restoration state: {e}"))?;
+        content.push(b'\n');
+        let (temporary, _, _) =
+            create_staged(&lock.directory, &lock.state_file, &content, Some(0o600))?;
+        if let Err(error) = rename_at(&lock.directory, &temporary, &target, 0) {
+            let _ = unsafe { libc::unlinkat(lock.directory.as_raw_fd(), temporary.as_ptr(), 0) };
+            return Err(format!(
+                "cannot save {}: {error}",
+                lock.state_file.display()
+            ));
+        }
+    }
+    lock.directory
+        .sync_all()
+        .map_err(|e| format!("cannot sync state directory: {e}"))?;
+    lock.verify_directory_path()
+}
+
+#[cfg(not(target_os = "linux"))]
+struct StateLock;
+
+#[cfg(not(target_os = "linux"))]
+impl StateLock {
+    fn acquire() -> Result<Self, String> {
+        require_mutation_platform()?;
+        Ok(Self)
+    }
+
+    fn verify_directory_path(&self) -> Result<(), String> {
+        require_mutation_platform()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_state_locked(_lock: &StateLock) -> Result<State, String> {
+    require_mutation_platform()?;
+    unreachable!()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn save_state_locked(_lock: &StateLock, _state: &State) -> Result<(), String> {
+    require_mutation_platform()
 }
 
 fn hash(content: &str) -> String {
@@ -1295,6 +1364,101 @@ mod tests {
         assert!(error.contains("changed after planning"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "user edit");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_write_refuses_a_post_plan_permission_edit() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = conditional_write(&path, b"generated", &expected, None).unwrap_err();
+
+        assert!(error.contains("changed after planning"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_remove_refuses_a_post_plan_permission_edit() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = temporary_directory();
+        let path = directory.join("settings.json");
+        fs::write(&path, "installed").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = conditional_remove(&path, &expected).unwrap_err();
+
+        assert!(error.contains("changed after planning"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "installed");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_lock_refuses_to_write_after_its_directory_is_replaced() {
+        let directory = temporary_directory();
+        let state_directory = directory.join("state");
+        let moved_directory = directory.join("moved-state");
+        let state_file = state_directory.join("client-setup.json");
+        let first_lock = StateLock::acquire_at(state_file.clone()).unwrap();
+        let first_state = test_state("first");
+        save_state_locked(&first_lock, &first_state).unwrap();
+
+        fs::rename(&state_directory, &moved_directory).unwrap();
+        fs::create_dir(&state_directory).unwrap();
+        let second_lock = StateLock::acquire_at(state_file.clone()).unwrap();
+        let replacement_state = test_state("replacement");
+
+        let error = save_state_locked(&first_lock, &test_state("stale writer")).unwrap_err();
+        assert!(error.contains("state directory changed while locked"));
+        assert!(!state_file.exists());
+        let moved: State = serde_json::from_str(
+            &fs::read_to_string(moved_directory.join("client-setup.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(moved.clients["codex"].original.as_deref(), Some("first"));
+
+        save_state_locked(&second_lock, &replacement_state).unwrap();
+        let replacement: State =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(
+            replacement.clients["codex"].original.as_deref(),
+            Some("replacement")
+        );
+        drop(second_lock);
+        drop(first_lock);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_state(original: &str) -> State {
+        State {
+            version: 1,
+            clients: BTreeMap::from([(
+                "codex".to_owned(),
+                Snapshot {
+                    path: PathBuf::from("/tmp/test-config"),
+                    original: Some(original.to_owned()),
+                    original_mode: Some(0o600),
+                    installed_sha256: hash("installed"),
+                    installed_mode: Some(0o600),
+                    recoverable_sha256: Vec::new(),
+                },
+            )]),
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -213,6 +213,27 @@ fn restore_refuses_edits_made_after_setup_without_exposing_the_key() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn restore_refuses_permission_edits_made_after_setup() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let home = TestHome::new();
+    let (url, server) = gateway(2);
+    let installed = setup(&home, &url, "all");
+    assert!(installed.status.success(), "{}", text(&installed));
+    server.join().unwrap();
+    fs::set_permissions(home.claude(), fs::Permissions::from_mode(0o640)).unwrap();
+
+    let restored = run(&home, &["client", "restore", "all"]);
+
+    assert!(!restored.status.success());
+    assert!(text(&restored).contains("refusing destructive restore"));
+    assert_eq!(fs::metadata(home.claude()).unwrap().mode() & 0o7777, 0o640);
+    assert!(home.codex().exists());
+    assert!(home.state().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn unavailable_gateway_and_malformed_settings_leave_clients_untouched() {
     let home = TestHome::new();
     let unavailable = setup(&home, "http://127.0.0.1:1", "all");
@@ -255,10 +276,13 @@ fn setup_refuses_symlink_targets_and_keeps_the_referent_unchanged() {
 #[cfg(target_os = "linux")]
 #[test]
 fn recovery_journal_can_restore_the_old_bytes_after_an_interrupted_install() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     let home = TestHome::new();
     fs::create_dir(home.path.join(".claude")).unwrap();
     let original = "{\"before\":true}\n";
     fs::write(home.claude(), original).unwrap();
+    let original_mode = fs::metadata(home.claude()).unwrap().mode() & 0o7777;
     let (url, server) = gateway(2);
     let output = setup(&home, &url, "all");
     assert!(output.status.success(), "{}", text(&output));
@@ -267,6 +291,7 @@ fn recovery_journal_can_restore_the_old_bytes_after_an_interrupted_install() {
     // This is the observable on-disk state if setup stops after journaling but
     // before replacing the Claude settings file.
     fs::write(home.claude(), original).unwrap();
+    fs::set_permissions(home.claude(), fs::Permissions::from_mode(original_mode)).unwrap();
     let restored = run(&home, &["client", "restore", "all"]);
     assert!(restored.status.success(), "{}", text(&restored));
     assert_eq!(fs::read_to_string(home.claude()).unwrap(), original);
