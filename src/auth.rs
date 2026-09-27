@@ -73,6 +73,8 @@ struct Creds {
     client_id: Option<String>,
     client_secret: Option<String>,
     expires_at: Option<f64>,
+    invalid_region_type: bool,
+    invalid_profile_arn_type: bool,
 }
 
 pub fn parse_iso(value: &str) -> Option<f64> {
@@ -169,10 +171,16 @@ impl Creds {
         }
         if let Some(v) = data.get("profileArn") {
             self.profile_arn = v.as_str().map(str::to_owned);
+            self.invalid_profile_arn_type = !v.is_string();
         }
-        if let Some(r) = s(data, "region") {
-            self.sso_region = Some(r.clone());
-            self.detected_api_region = Some(r);
+        if let Some(region) = data.get("region") {
+            match region.as_str() {
+                Some(r) => {
+                    self.sso_region = Some(r.to_owned());
+                    self.detected_api_region = Some(r.to_owned());
+                }
+                None => self.invalid_region_type = true,
+            }
         }
         if let Some(h) = s(data, "clientIdHash") {
             self.load_enterprise_registration(&h);
@@ -246,11 +254,17 @@ impl Creds {
             if let Some(v) = s(&token, "refresh_token") {
                 self.refresh_token = Some(v);
             }
-            if let Some(v) = s(&token, "profile_arn") {
-                self.profile_arn = Some(v);
+            if let Some(profile_arn) = token.get("profile_arn") {
+                match profile_arn.as_str() {
+                    Some(v) => self.profile_arn = Some(v.to_owned()),
+                    None => self.invalid_profile_arn_type = true,
+                }
             }
-            if let Some(v) = s(&token, "region") {
-                self.sso_region = Some(v);
+            if let Some(region) = token.get("region") {
+                match region.as_str() {
+                    Some(v) => self.sso_region = Some(v.to_owned()),
+                    None => self.invalid_region_type = true,
+                }
             }
             if let Some(e) = s(&token, "expires_at") {
                 self.expires_at = parse_iso(&e).or(self.expires_at);
@@ -263,8 +277,12 @@ impl Creds {
             if let Some(v) = s(&reg, "client_secret") {
                 self.client_secret = Some(v);
             }
-            if self.sso_region.is_none() {
-                self.sso_region = s(&reg, "region");
+            if let Some(region) = reg.get("region") {
+                match region.as_str() {
+                    Some(v) if self.sso_region.is_none() => self.sso_region = Some(v.to_owned()),
+                    Some(_) => {}
+                    None => self.invalid_region_type = true,
+                }
             }
         }
         let profile: Option<Value> = conn
@@ -291,11 +309,49 @@ impl Creds {
 }
 
 pub fn region_from_arn(arn: &str) -> Option<String> {
-    static R: OnceLock<Regex> = OnceLock::new();
     let part = arn.split(':').nth(3).filter(|p| !p.is_empty())?;
-    R.get_or_init(|| Regex::new(r"^[a-z]+-[a-z]+-\d+$").unwrap())
-        .is_match(part)
+    config::validate_region(part)
+        .is_ok()
         .then(|| part.to_owned())
+}
+
+fn validate_named_region(kind: &str, region: &str) -> Result<(), AuthError> {
+    config::validate_region(region)
+        .map(|_| ())
+        .map_err(|_| AuthError::Other(format!("invalid {kind} region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1")))
+}
+
+fn validate_credential_regions(c: &Creds) -> Result<(), AuthError> {
+    if c.invalid_region_type {
+        return Err(AuthError::Other(
+            "invalid credential region: expected a string containing a lowercase AWS region".into(),
+        ));
+    }
+    if c.invalid_profile_arn_type {
+        return Err(AuthError::Other(
+            "invalid profile ARN: expected a string".into(),
+        ));
+    }
+    if let Some(region) = c.sso_region.as_deref() {
+        validate_named_region("credential auth", region)?;
+    }
+    if let Some(region) = c.detected_api_region.as_deref() {
+        validate_named_region("credential API", region)?;
+    }
+    if let Some(arn) = c.profile_arn.as_deref() {
+        let parts: Vec<&str> = arn.split(':').collect();
+        if parts.get(2) == Some(&"codewhisperer")
+            && parts.get(3).is_none_or(|region| region.is_empty())
+        {
+            return Err(AuthError::Other(
+                "invalid profile ARN region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1".into(),
+            ));
+        }
+        if let Some(region) = parts.get(3).filter(|region| !region.is_empty()) {
+            validate_named_region("profile ARN", region)?;
+        }
+    }
+    Ok(())
 }
 
 pub enum Source {
@@ -322,7 +378,7 @@ impl KiroAuth {
         region: &str,
         api_region: Option<&str>,
         http: reqwest::Client,
-    ) -> KiroAuth {
+    ) -> Result<KiroAuth, AuthError> {
         let mut c = Creds::default();
         match &source {
             Source::Internal(id) => {
@@ -350,6 +406,11 @@ impl KiroAuth {
         };
         auth.apply_overlay();
         let c = auth.creds.lock().clone();
+        validate_named_region("configured auth", region)?;
+        if let Some(region) = api_region {
+            validate_named_region("configured API", region)?;
+        }
+        validate_credential_regions(&c)?;
         auth.auth_type = if c.client_id.is_some() && c.client_secret.is_some() {
             AuthType::AwsSsoOidc
         } else {
@@ -361,11 +422,14 @@ impl KiroAuth {
             .or(c.sso_region.clone())
             .unwrap_or_else(|| region.to_owned());
         let builder_id = auth.auth_type == AuthType::AwsSsoOidc && c.profile_arn.is_none();
-        auth.refresh_url = config::kiro_refresh_url(c.sso_region.as_deref().unwrap_or(region));
-        auth.api_host = config::kiro_api_host(&final_region);
-        auth.q_host = config::kiro_q_host(&final_region, builder_id);
+        auth.refresh_url = config::kiro_refresh_url(c.sso_region.as_deref().unwrap_or(region))
+            .map_err(|e| AuthError::Other(e.to_string()))?;
+        auth.api_host =
+            config::kiro_api_host(&final_region).map_err(|e| AuthError::Other(e.to_string()))?;
+        auth.q_host = config::kiro_q_host(&final_region, builder_id)
+            .map_err(|e| AuthError::Other(e.to_string()))?;
         auth.api_region = final_region;
-        auth
+        Ok(auth)
     }
 
     fn external_account_id(&self) -> Option<String> {
@@ -461,6 +525,7 @@ impl KiroAuth {
         if let Source::Sqlite(p) = &self.source {
             self.creds.lock().load_sqlite(p);
             self.apply_overlay();
+            validate_credential_regions(&self.creds.lock().clone())?;
             if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
                 return Ok(t);
             }
@@ -530,6 +595,7 @@ impl KiroAuth {
                 if let Some(latest) = store::load_internal_credential(&account) {
                     self.creds.lock().load_document(&latest);
                 }
+                validate_credential_regions(&self.creds.lock().clone())?;
                 if self.cached_token().is_some() && !self.expired() {
                     return Ok(());
                 }
@@ -544,6 +610,7 @@ impl KiroAuth {
             if let Some(latest) = store::load_internal_credential(&account) {
                 self.creds.lock().load_document(&latest);
             }
+            validate_credential_regions(&self.creds.lock().clone())?;
             let renewed_elsewhere = self.cached_token() != previous;
             if self.cached_token().is_some()
                 && !self.expiring_soon()
@@ -562,6 +629,7 @@ impl KiroAuth {
                 .ok_or_else(|| AuthError::Other(format!("Unknown internal account: {id}")))?;
             self.creds.lock().load_document(&doc);
         }
+        validate_credential_regions(&self.creds.lock().clone())?;
         let first = match self.auth_type {
             AuthType::AwsSsoOidc => self.do_oidc_refresh().await,
             AuthType::KiroDesktop => self.do_desktop_refresh().await,
@@ -571,6 +639,7 @@ impl KiroAuth {
                 tracing::warn!(
                     "Token refresh failed with 400; retrying with raw external credentials"
                 );
+                validate_credential_regions(&self.creds.lock().clone())?;
                 match self.auth_type {
                     AuthType::AwsSsoOidc => self.do_oidc_refresh().await,
                     AuthType::KiroDesktop => self.do_desktop_refresh().await,
@@ -678,7 +747,8 @@ impl KiroAuth {
             AuthError::Other("Client secret is not set (required for AWS SSO OIDC)".into())
         })?;
         tracing::info!("Refreshing Kiro token via AWS SSO OIDC...");
-        let url = config::aws_sso_oidc_url(c.sso_region.as_deref().unwrap_or(config::REGION));
+        let url = config::aws_sso_oidc_url(c.sso_region.as_deref().unwrap_or(config::REGION))
+            .map_err(|e| AuthError::Other(e.to_string()))?;
         let data = self
             .post(&url, json!({"grantType": "refresh_token", "clientId": client_id, "clientSecret": secret, "refreshToken": refresh}), &[])
             .await?;
@@ -747,6 +817,24 @@ impl KiroAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
+
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kiro-lb-{label}-{}-{extension}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn recording_client() -> (reqwest::Client, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let client = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        (client, listener)
+    }
 
     #[test]
     fn iso_round_trip() {
@@ -758,5 +846,125 @@ mod tests {
             parse_iso("2026-09-26T15:54:25.123456789Z").map(|v| (v * 1e6).round() / 1e6),
             Some(t + 0.123456)
         );
+    }
+
+    #[test]
+    fn explicit_api_region_stays_distinct_from_imported_sso_region() {
+        let path = temp_path("region-precedence", "credentials.json");
+        std::fs::write(
+            &path,
+            json!({
+                "refreshToken": "unused-refresh-token",
+                "region": "us-gov-west-1",
+                "profileArn": "arn:aws-iso:codewhisperer:us-iso-east-1:123456789012:profile/test"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let auth = KiroAuth::new(
+            Source::File(path.to_string_lossy().into_owned()),
+            "ap-southeast-2",
+            Some("eu-isoe-west-1"),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert_eq!(auth.api_region, "eu-isoe-west-1");
+        assert_eq!(
+            auth.refresh_url,
+            "https://prod.us-gov-west-1.auth.desktop.kiro.dev/refreshToken"
+        );
+        assert_eq!(auth.api_host, "https://runtime.eu-isoe-west-1.kiro.dev");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_imported_region_is_rejected_before_any_request() {
+        let path = temp_path("bad-region", "credentials.json");
+        std::fs::write(
+            &path,
+            json!({"refreshToken": "unused-refresh-token", "region": "us-east-1@localhost"})
+                .to_string(),
+        )
+        .unwrap();
+        let (http, listener) = recording_client();
+
+        let result = KiroAuth::new(
+            Source::File(path.to_string_lossy().into_owned()),
+            config::REGION,
+            None,
+            http,
+        );
+
+        assert!(
+            matches!(result, Err(AuthError::Other(message)) if message.starts_with("invalid credential auth region:"))
+        );
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_imported_registration_region_is_rejected_before_any_request() {
+        let path = temp_path("bad-registration-region", "credentials.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv(key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                SQLITE_REGISTRATION_KEYS[0],
+                json!({"client_id": "client", "client_secret": "secret", "region": "bad/region-1"})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let (http, listener) = recording_client();
+
+        let result = KiroAuth::new(
+            Source::Sqlite(path.to_string_lossy().into_owned()),
+            config::REGION,
+            None,
+            http,
+        );
+
+        assert!(
+            matches!(result, Err(AuthError::Other(message)) if message.starts_with("invalid credential auth region:"))
+        );
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_profile_arn_region_is_rejected_before_any_request() {
+        let path = temp_path("bad-arn-region", "credentials.json");
+        std::fs::write(
+            &path,
+            json!({
+                "refreshToken": "unused-refresh-token",
+                "region": "us-east-1",
+                "profileArn": "arn:aws:codewhisperer:us-east-1.example.com:123456789012:profile/test"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (http, listener) = recording_client();
+
+        let result = KiroAuth::new(
+            Source::File(path.to_string_lossy().into_owned()),
+            config::REGION,
+            None,
+            http,
+        );
+
+        assert!(
+            matches!(result, Err(AuthError::Other(message)) if message.starts_with("invalid profile ARN region:"))
+        );
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::store::now_f64;
+use crate::{config, store::now_f64};
 
 const AUTH_HOST: &str = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const CLIENT_ID: &str = "kiro-cli";
@@ -93,6 +93,7 @@ async fn oidc_call(
     path: &str,
     body: Value,
 ) -> Result<Value, String> {
+    let region = config::validate_region(region).map_err(|e| e.to_string())?;
     let resp = http
         .post(format!("https://oidc.{region}.amazonaws.com{path}"))
         .json(&body)
@@ -350,6 +351,8 @@ pub fn internal_credentials(flow: &DeviceFlow) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
 
     fn flow(id: &str) -> DeviceFlow {
         DeviceFlow {
@@ -366,6 +369,27 @@ mod tests {
             token: None,
             registration: None,
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_registration_region_is_rejected_without_an_outbound_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let http = reqwest::Client::builder().proxy(proxy).build().unwrap();
+
+        let error = oidc_call(
+            &http,
+            "us-east-1@localhost",
+            "/token",
+            json!({"refreshToken": "unused"}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.starts_with("invalid region:"));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
     }
 
     #[test]

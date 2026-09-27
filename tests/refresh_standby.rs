@@ -27,7 +27,8 @@ async fn a_standby_slot_never_refreshes_without_the_lease() {
         "us-east-1",
         None,
         reqwest::Client::new(),
-    );
+    )
+    .unwrap();
 
     let started = Instant::now();
     let result = auth.access_token().await;

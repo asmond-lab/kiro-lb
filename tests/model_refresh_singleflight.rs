@@ -23,12 +23,15 @@ async fn concurrent_expired_cache_readers_share_one_model_refresh() {
     let pool = Arc::new(AccountManager::new(reqwest::Client::new()));
     pool.load_credentials();
     let acct = pool.get("a").expect("account loaded");
-    *acct.auth.lock() = Some(Arc::new(KiroAuth::new(
-        Source::Internal("a".into()),
-        "us-east-1",
-        None,
-        reqwest::Client::new(),
-    )));
+    *acct.auth.lock() = Some(Arc::new(
+        KiroAuth::new(
+            Source::Internal("a".into()),
+            "us-east-1",
+            None,
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    ));
     acct.state.lock().models_cached_at = 1.0;
 
     let calls = Arc::new(AtomicUsize::new(0));
