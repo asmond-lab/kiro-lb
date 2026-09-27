@@ -25,6 +25,10 @@ pub fn supports_native_thinking(model_id: &str) -> bool {
     NATIVE_THINKING_MODELS.contains(&model_id)
 }
 
+fn is_disabling_effort(effort: &str) -> bool {
+    DISABLING.contains(&effort.trim().to_lowercase().as_str())
+}
+
 pub fn normalize_effort(effort: Option<&str>) -> Option<&'static str> {
     let value = effort?.trim().to_lowercase();
     if value.is_empty() || DISABLING.contains(&value.as_str()) {
@@ -40,6 +44,15 @@ pub fn normalize_effort(effort: Option<&str>) -> Option<&'static str> {
     None
 }
 
+fn normalize_gpt_effort(effort: Option<&str>) -> Option<&'static str> {
+    let effort = effort?;
+    // GPT defaults to high, so an explicit disable must reach the upstream model.
+    if is_disabling_effort(effort) {
+        return Some("none");
+    }
+    normalize_effort(Some(effort))
+}
+
 pub fn effort_from_anthropic(
     thinking: Option<&Value>,
     output_config: Option<&Value>,
@@ -48,9 +61,13 @@ pub fn effort_from_anthropic(
     if let Some(e) = output_config
         .and_then(|o| o.get("effort"))
         .and_then(Value::as_str)
-        .and_then(|e| normalize_effort(Some(e)))
     {
-        return Some(e);
+        if is_disabling_effort(e) {
+            return Some("none");
+        }
+        if let Some(e) = normalize_effort(Some(e)) {
+            return Some(e);
+        }
     }
     let thinking = thinking?.as_object()?;
     match thinking
@@ -61,7 +78,7 @@ pub fn effort_from_anthropic(
         .to_lowercase()
         .as_str()
     {
-        "disabled" => None,
+        "disabled" => Some("none"),
         "adaptive" => Some("high"),
         "enabled" => {
             let budget = thinking
@@ -92,12 +109,17 @@ pub fn effort_from_anthropic(
 }
 
 pub fn apply_native_thinking(payload: &mut Value, model_id: &str, effort: Option<&str>) {
-    let Some(e) = normalize_effort(effort) else {
-        return;
-    };
     if GPT_NATIVE_THINKING_MODELS.contains(&model_id) {
+        let Some(e) = normalize_gpt_effort(effort) else {
+            return;
+        };
         payload["additionalModelRequestFields"] = json!({"reasoning": {"effort": e}});
-    } else if supports_native_thinking(model_id) {
+        return;
+    }
+    if supports_native_thinking(model_id) {
+        let Some(e) = normalize_effort(effort) else {
+            return;
+        };
         payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
     }
 }

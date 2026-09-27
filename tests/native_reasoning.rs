@@ -125,14 +125,10 @@ fn unsupported_models_never_receive_native_controls() {
 }
 
 #[test]
-fn absent_disabled_and_malformed_efforts_are_omitted() {
+fn absent_and_malformed_efforts_are_omitted() {
     for effort in [
         None,
         Some(json!("")),
-        Some(json!("none")),
-        Some(json!("off")),
-        Some(json!("disabled")),
-        Some(json!("0")),
         Some(json!("extreme")),
         Some(json!(42)),
     ] {
@@ -147,16 +143,73 @@ fn absent_disabled_and_malformed_efforts_are_omitted() {
             }
         }
     }
+}
 
+#[test]
+fn explicit_none_disables_gpt_without_changing_claude_behavior() {
+    for model in [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "claude-opus-4.8",
+    ] {
+        for facade in [Facade::Chat, Facade::Anthropic, Facade::Responses] {
+            for stream in [false, true] {
+                let payload = upstream_payload(facade, model, Some(json!("none")), stream);
+                let expected = model
+                    .starts_with("gpt-")
+                    .then(|| json!({"reasoning": {"effort": "none"}}));
+                assert_eq!(
+                    native_fields(&payload),
+                    expected.as_ref(),
+                    "{model}, {facade:?}, stream={stream}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn accepted_disable_aliases_map_to_gpt_none() {
+    for effort in ["off", "disabled", "0"] {
+        for facade in [Facade::Chat, Facade::Anthropic] {
+            for stream in [false, true] {
+                let payload = upstream_payload(facade, "gpt-5.6-sol", Some(json!(effort)), stream);
+                assert_eq!(
+                    native_fields(&payload),
+                    Some(&json!({"reasoning": {"effort": "none"}})),
+                    "effort={effort}, {facade:?}, stream={stream}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn anthropic_disabled_thinking_disables_gpt_but_keeps_claude_behavior() {
     for stream in [false, true] {
-        let req = json!({
-            "model": "gpt-5.6-sol",
-            "messages": [{"role": "user", "content": "Explain the result."}],
-            "max_tokens": 4096,
-            "stream": stream,
-            "thinking": {"type": "disabled"},
-        });
-        let result = anthropic_to_kiro(&req, CONVERSATION_ID, PROFILE_ARN).unwrap();
-        assert_eq!(native_fields(&result.payload), None, "stream={stream}");
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "claude-opus-4.8",
+        ] {
+            let req = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Explain the result."}],
+                "max_tokens": 4096,
+                "stream": stream,
+                "thinking": {"type": "disabled"},
+            });
+            let result = anthropic_to_kiro(&req, CONVERSATION_ID, PROFILE_ARN).unwrap();
+            let expected = model
+                .starts_with("gpt-")
+                .then(|| json!({"reasoning": {"effort": "none"}}));
+            assert_eq!(
+                native_fields(&result.payload),
+                expected.as_ref(),
+                "{model}, stream={stream}"
+            );
+        }
     }
 }
