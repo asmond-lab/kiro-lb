@@ -70,6 +70,7 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         json!({"type": "json", "path": expanded_dir}),
         json!({"type": "internal", "id": "missing", "credential": {"refreshToken": "missing-a", "accessToken": "missing-access-a", "expiresAt": "2999-01-01T00:00:00Z", "region": "us-east-1"}}),
         json!({"type": "internal", "id": "builder", "credential": {"refreshToken": "builder-a", "accessToken": "builder-access-a", "expiresAt": "2999-01-01T00:00:00Z", "region": "us-east-1", "clientId": "builder-registration", "clientSecret": "secret"}}),
+        json!({"type": "internal", "id": "prebind", "credential": {"profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/a", "refreshToken": "prebind-a", "accessToken": "expired-a", "expiresAt": "2000-01-01T00:00:00Z", "region": "us-east-1"}}),
         json!({"type": "internal", "id": "stale-refresh", "credential": {"profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/a", "refreshToken": "stale-refresh-a", "accessToken": "expired-a", "expiresAt": "2000-01-01T00:00:00Z", "region": "us-east-1"}}),
     ];
     store::with(|c| store::replace_account_sources(c, &entries, true)).unwrap();
@@ -405,6 +406,25 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     let builder_state = builder_restart.get("builder").unwrap();
     assert_eq!(builder_state.state.lock().failures, 0);
     assert!(dashboard_store::cached_usage("builder").is_null());
+
+    let prebind = KiroAuth::new(
+        Source::Internal("prebind".into()),
+        "us-east-1",
+        None,
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    replace_internal(
+        "prebind",
+        &credential(
+            "arn:aws:codewhisperer:us-east-1:222:profile/b",
+            "prebind-b",
+            "access-b",
+        ),
+    );
+    assert!(
+        matches!(prebind.force_refresh().await, Err(kiro_lb::auth::AuthError::Other(ref message)) if message.contains("different login"))
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();

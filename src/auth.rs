@@ -591,6 +591,13 @@ impl KiroAuth {
         }
     }
 
+    fn creds_match_login(&self, creds: &Creds) -> bool {
+        stable_login_identity(creds).map_or_else(
+            || source_fingerprint(creds) == *self.source_fingerprint.lock(),
+            |identity| self.login_identity.as_deref() == Some(identity.as_str()),
+        )
+    }
+
     pub fn profile_arn(&self) -> Option<String> {
         self.creds
             .lock()
@@ -757,6 +764,11 @@ impl KiroAuth {
             })?;
             let mut fresh = Creds::default();
             fresh.load_document(&doc);
+            if !self.creds_match_login(&fresh) {
+                return Err(AuthError::Other(
+                    "Credential source changed to a different login".into(),
+                ));
+            }
             *self.source_fingerprint.lock() = source_fingerprint(&fresh);
             *self.creds.lock() = fresh;
         }
@@ -798,6 +810,9 @@ impl KiroAuth {
                 {
                     let mut fresh = Creds::default();
                     fresh.load_document(&doc);
+                    if !self.creds_match_login(&fresh) {
+                        return false;
+                    }
                     *self.source_fingerprint.lock() = source_fingerprint(&fresh);
                     *self.creds.lock() = fresh;
                     true
