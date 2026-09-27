@@ -178,6 +178,7 @@ impl Creds {
                 Some(r) => {
                     self.sso_region = Some(r.to_owned());
                     self.detected_api_region = Some(r.to_owned());
+                    self.invalid_region_type = false;
                 }
                 None => self.invalid_region_type = true,
             }
@@ -247,6 +248,9 @@ impl Creds {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
         };
+        let mut invalid_region_type = None;
+        let mut invalid_profile_arn_type = None;
+        let mut token_region_loaded = false;
         if let Some(token) = SQLITE_TOKEN_KEYS.iter().find_map(|k| get(k)) {
             if let Some(v) = s(&token, "access_token") {
                 self.access_token = Some(v);
@@ -255,15 +259,18 @@ impl Creds {
                 self.refresh_token = Some(v);
             }
             if let Some(profile_arn) = token.get("profile_arn") {
+                invalid_profile_arn_type = Some(profile_arn.as_str().is_none());
                 match profile_arn.as_str() {
                     Some(v) => self.profile_arn = Some(v.to_owned()),
-                    None => self.invalid_profile_arn_type = true,
+                    None => self.profile_arn = None,
                 }
             }
             if let Some(region) = token.get("region") {
+                token_region_loaded = true;
+                invalid_region_type = Some(region.as_str().is_none());
                 match region.as_str() {
                     Some(v) => self.sso_region = Some(v.to_owned()),
-                    None => self.invalid_region_type = true,
+                    None => self.sso_region = None,
                 }
             }
             if let Some(e) = s(&token, "expires_at") {
@@ -278,12 +285,20 @@ impl Creds {
                 self.client_secret = Some(v);
             }
             if let Some(region) = reg.get("region") {
+                invalid_region_type =
+                    Some(invalid_region_type.unwrap_or(false) || region.as_str().is_none());
                 match region.as_str() {
-                    Some(v) if self.sso_region.is_none() => self.sso_region = Some(v.to_owned()),
+                    Some(v) if !token_region_loaded => self.sso_region = Some(v.to_owned()),
                     Some(_) => {}
-                    None => self.invalid_region_type = true,
+                    None => {}
                 }
             }
+        }
+        if let Some(invalid) = invalid_region_type {
+            self.invalid_region_type = invalid;
+        }
+        if let Some(invalid) = invalid_profile_arn_type {
+            self.invalid_profile_arn_type = invalid;
         }
         let profile: Option<Value> = conn
             .query_row(
@@ -923,6 +938,9 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        let mut reloaded = Creds::default();
+        reloaded.load_sqlite(path.to_str().unwrap());
+        assert!(validate_credential_regions(&reloaded).is_err());
         let (http, listener) = recording_client();
 
         let result = KiroAuth::new(
@@ -936,6 +954,22 @@ mod tests {
             matches!(result, Err(AuthError::Other(message)) if message.starts_with("invalid credential auth region:"))
         );
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                json!({"client_id": "client", "client_secret": "secret", "region": "us-iso-east-1"}).to_string(),
+                SQLITE_REGISTRATION_KEYS[0]
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        reloaded.load_sqlite(path.to_str().unwrap());
+        assert_eq!(reloaded.sso_region.as_deref(), Some("us-iso-east-1"));
+        assert!(!reloaded.invalid_region_type);
+        assert!(!reloaded.invalid_profile_arn_type);
+        assert!(validate_credential_regions(&reloaded).is_ok());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -966,5 +1000,19 @@ mod tests {
         );
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrected_credential_types_clear_stale_validation_errors() {
+        let mut creds = Creds::default();
+        creds.load_document(&json!({"region": 7, "profileArn": false}));
+        assert!(validate_credential_regions(&creds).is_err());
+
+        creds.load_document(&json!({
+            "region": "us-gov-west-1",
+            "profileArn": "arn:aws-us-gov:codewhisperer:us-gov-west-1:123456789012:profile/test"
+        }));
+
+        assert!(validate_credential_regions(&creds).is_ok());
     }
 }
