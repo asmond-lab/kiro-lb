@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::app::{anthropic_error, json_response, openai_error, Shared};
 use crate::auth::AuthError;
@@ -464,6 +465,10 @@ fn stream_failure(protocol: Protocol, e: StreamError) -> Response {
     }
 }
 
+/// Silence longer than this sends a keepalive so clients do not treat a slow
+/// upstream (long thinking, a large tool call) as a dropped connection.
+const KEEPALIVE_SECONDS: u64 = 10;
+
 fn sse_response(
     s: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>>,
     pool: Arc<pool::AccountManager>,
@@ -474,7 +479,25 @@ fn sse_response(
     let body = async_stream::stream! {
         let mut s = s;
         let mut failed = false;
-        while let Some(item) = s.next().await {
+        let keepalive = Duration::from_secs(KEEPALIVE_SECONDS);
+        loop {
+            let item = match tokio::time::timeout(keepalive, s.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    let ping = match protocol {
+                        Protocol::Anthropic => "event: ping
+data: {\"type\": \"ping\"}
+
+",
+                        Protocol::OpenAI => ": keepalive
+
+",
+                    };
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(ping.as_bytes()));
+                    continue;
+                }
+            };
             match item {
                 Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
                 Err(e) => {

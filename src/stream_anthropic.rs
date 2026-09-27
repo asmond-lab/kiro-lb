@@ -118,21 +118,17 @@ pub fn stream(
         let mut cache_usage = serde_json::Map::new();
         let mut full_content = String::new();
         let mut full_thinking = String::new();
-        let mut started = false;
         let mut received = false;
         let start_data = json!({"type": "message_start", "message": {
             "id": message_id, "type": "message", "role": "assistant", "content": [], "model": ctx.model,
             "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": ctx.input_tokens, "output_tokens": 0},
         }});
+        yield em.emit("message_start", start_data.clone())?;
         let mut current: EventStream = events;
         'outer: loop {
             while let Some(ev) = current.next().await {
                 let ev = ev?;
                 received = true;
-                if !started {
-                    yield em.emit("message_start", start_data.clone())?;
-                    started = true;
-                }
                 if !pending.is_empty() && !matches!(ev, KiroEvent::Content(_) | KiroEvent::ThinkingSignature(_)) {
                     if thinking_open {
                         yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": thinking_index}))?;
@@ -256,7 +252,6 @@ pub fn stream(
         }
         if !received { Err(StreamError::Protocol(stream_core::NO_EVENTS))?; }
         let completed = context_usage.is_some();
-        if !started { yield em.emit("message_start", start_data.clone())?; }
         if !pending.is_empty() {
             if thinking_open {
                 yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": thinking_index}))?;
