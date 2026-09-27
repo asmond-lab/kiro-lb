@@ -256,7 +256,6 @@ fn setup(options: Options) -> Result<(), String> {
     run_diagnostic(&options.base_url, &key)?;
     let lock = StateLock::acquire()?;
     let mut state = load_state_locked(&lock)?;
-    let previous_state = state.clone();
     let plans: Vec<PlannedWrite> = options
         .clients
         .iter()
@@ -270,7 +269,7 @@ fn setup(options: Options) -> Result<(), String> {
     // The private state file is a recovery journal. If the process stops after
     // this point, restore accepts either the old bytes or the staged bytes.
     save_state_locked(&lock, &state)?;
-    commit_setup_plans(&lock, &plans, &mut state, &previous_state, |_| {})?;
+    commit_setup_plans(&lock, &plans, &mut state, |_| {}, |_, _| {})?;
     println!("Client configuration installed. No inference request was made.");
     println!("Run `kirolb client status` to inspect it or `kirolb client restore` to undo it.");
     if options.clients.contains(&ClientKind::Codex) {
@@ -289,13 +288,14 @@ fn commit_setup_plans(
     lock: &StateLock,
     plans: &[PlannedWrite],
     state: &mut State,
-    previous_state: &State,
     mut before_commit: impl FnMut(usize),
+    mut after_commit: impl FnMut(usize, &Path),
 ) -> Result<(), String> {
+    let recovery_state = state.clone();
     let mut applied = Vec::new();
     for (index, plan) in plans.iter().enumerate() {
         if let Err(error) = lock.verify_directory_path() {
-            return abort_transaction(lock, previous_state, &applied, error);
+            return abort_transaction(lock, &recovery_state, &applied, error);
         }
         before_commit(index);
         let installed = match conditional_write(
@@ -305,15 +305,18 @@ fn commit_setup_plans(
             Some(0o600),
         ) {
             Ok(installed) => installed,
-            Err(error) => return abort_transaction(lock, previous_state, &applied, error),
+            Err(error) => {
+                return abort_transaction(lock, &recovery_state, &applied, error);
+            }
         };
         applied.push(AppliedChange {
             path: plan.snapshot.path.clone(),
             before: plan.expected.clone(),
             after: installed,
         });
+        after_commit(index, &plan.snapshot.path);
         if let Err(error) = lock.verify_directory_path() {
-            return abort_transaction(lock, previous_state, &applied, error);
+            return abort_transaction(lock, &recovery_state, &applied, error);
         }
     }
     for plan in plans {
@@ -322,7 +325,7 @@ fn commit_setup_plans(
         }
     }
     if let Err(error) = save_state_locked(lock, state) {
-        return abort_transaction(lock, previous_state, &applied, error);
+        return abort_transaction(lock, &recovery_state, &applied, error);
     }
     Ok(())
 }
@@ -645,12 +648,23 @@ fn env_dir(variable: &str, fallback: &str) -> Result<PathBuf, String> {
         }
         return Ok(path);
     }
-    let home =
-        crate::store::home_dir().ok_or_else(|| "user home directory is not set".to_owned())?;
-    if !home.is_absolute() {
-        return Err("user home directory must be an absolute path".into());
-    }
+    let home = client_home_dir()
+        .ok_or_else(|| "user home directory is not set to an absolute native path".to_owned())?;
     Ok(home.join(fallback))
+}
+
+fn client_home_dir() -> Option<PathBuf> {
+    first_absolute_path([std::env::var_os("HOME"), std::env::var_os("USERPROFILE")])
+}
+
+fn first_absolute_path(
+    values: impl IntoIterator<Item = Option<std::ffi::OsString>>,
+) -> Option<PathBuf> {
+    values
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute())
 }
 
 fn state_path() -> Result<PathBuf, String> {
@@ -730,6 +744,8 @@ fn snapshot_accepts(
     match current_hash {
         Some(value) => {
             snapshot_matches_installed(snapshot, value, current_mode)
+                || (snapshot.recoverable_sha256.iter().any(|hash| hash == value)
+                    && snapshot_mode_matches(snapshot.installed_mode, current_mode))
                 || (snapshot
                     .original
                     .as_deref()
@@ -745,11 +761,7 @@ fn snapshot_matches_installed(
     current_hash: &str,
     current_mode: Option<u32>,
 ) -> bool {
-    (current_hash == snapshot.installed_sha256
-        || snapshot
-            .recoverable_sha256
-            .iter()
-            .any(|hash| hash == current_hash))
+    current_hash == snapshot.installed_sha256
         && snapshot_mode_matches(snapshot.installed_mode, current_mode)
 }
 
@@ -765,17 +777,13 @@ fn snapshot_mode_matches(_expected: Option<u32>, _current: Option<u32>) -> bool 
 
 fn abort_transaction(
     lock: &StateLock,
-    previous_state: &State,
+    recovery_state: &State,
     applied: &[AppliedChange],
     error: String,
 ) -> Result<(), String> {
     let rollback = rollback_changes(applied);
-    let journal = if rollback.is_ok() {
-        save_state_locked(lock, previous_state)
-            .or_else(|_| save_recovery_state(lock, previous_state))
-    } else {
-        Ok(())
-    };
+    let journal = save_state_locked(lock, recovery_state)
+        .or_else(|_| save_recovery_state(lock, recovery_state));
     match (rollback, journal) {
         (Ok(()), Ok(())) => Err(error),
         (rollback, journal) => {
@@ -1275,12 +1283,14 @@ fn conditional_write(
     _expected: &ExpectedFile,
     _mode: Option<u32>,
 ) -> Result<ExpectedFile, String> {
-    require_mutation_platform()
+    require_mutation_platform()?;
+    unreachable!()
 }
 
 #[cfg(not(target_os = "linux"))]
 fn conditional_remove(_path: &Path, _expected: &ExpectedFile) -> Result<ExpectedFile, String> {
-    require_mutation_platform()
+    require_mutation_platform()?;
+    unreachable!()
 }
 
 #[cfg(target_os = "linux")]
@@ -1567,6 +1577,42 @@ mod tests {
         assert!(normalize_base_url("http://192.168.1.10:8000").is_err());
     }
 
+    #[test]
+    fn home_selection_skips_an_unusable_first_candidate() {
+        let selected = first_absolute_path([
+            Some(std::ffi::OsString::from("relative-home")),
+            Some(std::env::current_dir().unwrap().into_os_string()),
+        ])
+        .unwrap();
+        assert!(selected.is_absolute());
+    }
+
+    #[test]
+    fn a_recoverable_hash_is_not_the_installed_hash() {
+        let snapshot = Snapshot {
+            path: PathBuf::from("unused"),
+            original: None,
+            original_mode: None,
+            installed_sha256: "new".into(),
+            installed_mode: None,
+            recoverable_sha256: vec!["old".into()],
+        };
+
+        assert!(!snapshot_matches_installed(&snapshot, "old", None));
+        assert!(snapshot_accepts(&snapshot, Some("old"), None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_home_selection_falls_back_from_posix_home_to_userprofile() {
+        let selected = first_absolute_path([
+            Some(std::ffi::OsString::from("/c/Users/example")),
+            Some(std::ffi::OsString::from(r"C:\Users\example")),
+        ])
+        .unwrap();
+        assert_eq!(selected, PathBuf::from(r"C:\Users\example"));
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn automatic_mutation_fails_closed_off_linux() {
@@ -1732,22 +1778,135 @@ mod tests {
             let lock = StateLock::acquire_at(state_file.clone()).unwrap();
             save_state_locked(&lock, &state).unwrap();
 
-            let error = commit_setup_plans(&lock, &plans, &mut state, &previous_state, |index| {
-                if index == swap_index {
-                    fs::rename(&state_directory, &moved_directory).unwrap();
-                    fs::create_dir(&state_directory).unwrap();
-                }
-            })
+            let error = commit_setup_plans(
+                &lock,
+                &plans,
+                &mut state,
+                |index| {
+                    if index == swap_index {
+                        fs::rename(&state_directory, &moved_directory).unwrap();
+                        fs::create_dir(&state_directory).unwrap();
+                    }
+                },
+                |_, _| {},
+            )
             .unwrap_err();
 
             assert!(error.contains("state directory changed while locked"));
             assert_eq!(fs::read_to_string(&first_path).unwrap(), "first before");
             assert_eq!(fs::read_to_string(&second_path).unwrap(), "second before");
-            assert!(!state_file.exists());
+            let recovery: State =
+                serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+            assert_eq!(recovery.clients.len(), 2);
             assert!(moved_directory.join("client-setup.json").exists());
             drop(lock);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_preserves_recovery_when_directory_and_client_change_during_commit() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = temporary_directory();
+        let state_directory = directory.join("state");
+        let moved_directory = directory.join("moved-state");
+        let state_file = state_directory.join("client-setup.json");
+        let client_path = directory.join("client.conf");
+        fs::write(&client_path, "before").unwrap();
+        let plans = vec![test_plan(
+            ClientKind::Codex,
+            client_path.clone(),
+            "installed",
+        )];
+        let previous_state = State {
+            version: 1,
+            clients: BTreeMap::new(),
+        };
+        let mut state = previous_state.clone();
+        state
+            .clients
+            .insert("codex".into(), plans[0].snapshot.clone());
+        let lock = StateLock::acquire_at(state_file.clone()).unwrap();
+        save_state_locked(&lock, &state).unwrap();
+
+        let error = commit_setup_plans(
+            &lock,
+            &plans,
+            &mut state,
+            |_| {
+                fs::rename(&state_directory, &moved_directory).unwrap();
+                fs::create_dir(&state_directory).unwrap();
+            },
+            |_, path| {
+                fs::write(path, "concurrent edit").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("client rollback failed"));
+        assert_eq!(fs::read_to_string(&client_path).unwrap(), "concurrent edit");
+        assert_eq!(fs::metadata(&client_path).unwrap().mode() & 0o7777, 0o640);
+        let recovery: State =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(
+            recovery.clients["codex"].original.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            recovery.clients["codex"].installed_sha256,
+            hash("installed")
+        );
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abort_preserves_prepared_journal_for_an_unreported_committed_mutation() {
+        let directory = temporary_directory();
+        let state_file = directory.join("state/client-setup.json");
+        let client_path = directory.join("client.conf");
+        fs::write(&client_path, "before").unwrap();
+        let plan = test_plan(ClientKind::Codex, client_path.clone(), "installed");
+        let recovery_state = State {
+            version: 1,
+            clients: BTreeMap::from([("codex".into(), plan.snapshot.clone())]),
+        };
+        let lock = StateLock::acquire_at(state_file.clone()).unwrap();
+        save_state_locked(&lock, &recovery_state).unwrap();
+
+        conditional_write(&client_path, b"installed", &plan.expected, Some(0o600)).unwrap();
+        let error = abort_transaction(
+            &lock,
+            &recovery_state,
+            &[],
+            "simulated post-commit durability failure".into(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("simulated post-commit durability failure"));
+        assert_eq!(fs::read_to_string(&client_path).unwrap(), "installed");
+        let preserved: State =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(
+            preserved.clients["codex"].original.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            preserved.clients["codex"].installed_sha256,
+            hash("installed")
+        );
+        let current = inspect_expected(&client_path, false).unwrap();
+        assert!(snapshot_accepts(
+            &preserved.clients["codex"],
+            Some(&hash(current.content.as_deref().unwrap())),
+            current.file_mode,
+        ));
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]
