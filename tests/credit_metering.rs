@@ -339,10 +339,7 @@ async fn openai_stream_exposes_the_final_generation_snapshot_including_zero() {
 #[tokio::test]
 async fn legacy_usage_still_completes_an_openai_stream_without_counting_credits() {
     let request = RequestCtx::new(None);
-    let upstream = events(vec![
-        Ok(KiroEvent::Content("complete".into())),
-        Ok(KiroEvent::Usage(json!(1.0))),
-    ]);
+    let upstream = parsed(&request, br#"{"content":"complete"}{"usage":1}"#);
     let chunks: Vec<String> = stream_openai::stream(upstream, context(request.clone()), options())
         .map(|chunk| chunk.unwrap())
         .collect()
@@ -407,7 +404,7 @@ async fn non_credit_metering_completes_openai_and_responses_without_counting_cre
 
 #[tokio::test]
 async fn malformed_metering_remains_an_incomplete_openai_and_responses_stream() {
-    const FRAMES: &[u8] = br#"{"content":"incomplete"}{"unit":"credit","usage":false}"#;
+    const FRAMES: &[u8] = br#"{"content":"incomplete"}{"usage":1,"unitPlural":"credits"}"#;
 
     let chat_request = RequestCtx::new(None);
     let chunks: Vec<String> = stream_openai::stream(

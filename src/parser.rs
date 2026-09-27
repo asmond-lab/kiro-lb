@@ -340,7 +340,9 @@ impl AwsEventStreamParser {
             }
             "tool_stop" => self.stop_tool(&data),
             "metering" => {
-                let unit_bearing = data.get("unit").is_some() || data.get("amount").is_some();
+                let unit_bearing = data.get("unit").is_some()
+                    || data.get("unitPlural").is_some()
+                    || data.get("amount").is_some();
                 match MeteringEvent::parse(data.clone()) {
                     Some(event) => Some(ParsedEvent::Metering(event)),
                     None if !unit_bearing => Some(ParsedEvent::Usage(
