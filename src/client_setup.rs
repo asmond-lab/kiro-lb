@@ -1021,6 +1021,32 @@ fn verify_parent(parent: &fs::File, path: &Path, expected: &ExpectedFile) -> Res
 }
 
 #[cfg(target_os = "linux")]
+fn verify_parent_path(
+    parent: &fs::File,
+    path: &Path,
+    expected: &ExpectedFile,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    verify_parent(parent, path, expected)?;
+    let current = open_parent_secure(path, false)?;
+    let metadata = current
+        .metadata()
+        .map_err(|e| format!("cannot inspect parent of {}: {e}", path.display()))?;
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if identity != expected.parent_identity {
+        return Err(format!(
+            "parent directory of {} changed during update; refusing mutation",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn expected_matches(actual: &Option<(String, FileIdentity, u32)>, expected: &ExpectedFile) -> bool {
     match (
         actual,
@@ -1037,6 +1063,22 @@ fn expected_matches(actual: &Option<(String, FileIdentity, u32)>, expected: &Exp
         ) => actual_content == content && *actual_identity == identity && *actual_mode == mode,
         _ => false,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn file_matches(
+    actual: &Option<(String, FileIdentity, u32)>,
+    content: &[u8],
+    identity: FileIdentity,
+    mode: u32,
+) -> bool {
+    actual
+        .as_ref()
+        .is_some_and(|(actual_content, actual_identity, actual_mode)| {
+            actual_content.as_bytes() == content
+                && *actual_identity == identity
+                && *actual_mode == mode
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1145,6 +1187,17 @@ fn conditional_write(
     expected: &ExpectedFile,
     mode: Option<u32>,
 ) -> Result<ExpectedFile, String> {
+    conditional_write_inner(path, content, expected, mode, || {})
+}
+
+#[cfg(target_os = "linux")]
+fn conditional_write_inner(
+    path: &Path,
+    content: &[u8],
+    expected: &ExpectedFile,
+    mode: Option<u32>,
+    after_mutation: impl FnOnce(),
+) -> Result<ExpectedFile, String> {
     use std::os::fd::AsRawFd;
 
     let parent = open_parent_secure(path, false)?;
@@ -1217,6 +1270,68 @@ fn conditional_write(
             }
         }
     };
+    if result.is_ok() {
+        after_mutation();
+        if let Err(error) = verify_parent_path(&parent, path, expected) {
+            let rollback = if expected.content.is_some() {
+                rename_at(&parent, &temporary, &target, libc::RENAME_EXCHANGE)
+                    .map_err(|e| format!("cannot roll back update of {}: {e}", path.display()))?;
+                let restored = read_at(&parent, path)?;
+                let staged = read_at(&parent, &temporary_path)?;
+                if expected_matches(&restored, expected)
+                    && file_matches(&staged, content, staged_identity, staged_mode)
+                {
+                    let removed =
+                        unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
+                    if removed == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "cannot remove rolled-back staged file for {}: {}",
+                            path.display(),
+                            io::Error::last_os_error()
+                        ))
+                    }
+                } else {
+                    let _ = rename_at(&parent, &temporary, &target, libc::RENAME_EXCHANGE);
+                    Err(format!(
+                        "cannot roll back update of {}; a concurrent edit was preserved",
+                        path.display()
+                    ))
+                }
+            } else {
+                rename_at(&parent, &target, &temporary, libc::RENAME_NOREPLACE)
+                    .map_err(|e| format!("cannot roll back update of {}: {e}", path.display()))?;
+                let staged = read_at(&parent, &temporary_path)?;
+                if file_matches(&staged, content, staged_identity, staged_mode) {
+                    let removed =
+                        unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
+                    if removed == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "cannot remove rolled-back staged file for {}: {}",
+                            path.display(),
+                            io::Error::last_os_error()
+                        ))
+                    }
+                } else {
+                    let _ = rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE);
+                    Err(format!(
+                        "cannot roll back update of {}; a concurrent edit was preserved",
+                        path.display()
+                    ))
+                }
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(format!("{error}; {rollback_error}"));
+            }
+            parent.sync_all().map_err(|e| {
+                format!("cannot sync rolled-back parent of {}: {e}", path.display())
+            })?;
+            return Err(error);
+        }
+    }
     let unlink = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
     if unlink < 0 && io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
         return Err(format!(
@@ -1242,6 +1357,15 @@ fn conditional_write(
 
 #[cfg(target_os = "linux")]
 fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<ExpectedFile, String> {
+    conditional_remove_inner(path, expected, || {})
+}
+
+#[cfg(target_os = "linux")]
+fn conditional_remove_inner(
+    path: &Path,
+    expected: &ExpectedFile,
+    after_mutation: impl FnOnce(),
+) -> Result<ExpectedFile, String> {
     use std::os::fd::AsRawFd;
 
     let parent = open_parent_secure(path, false)?;
@@ -1282,6 +1406,20 @@ fn conditional_remove(path: &Path, expected: &ExpectedFile) -> Result<ExpectedFi
             "{} changed after planning; refusing removal",
             path.display()
         ));
+    }
+    after_mutation();
+    if let Err(error) = verify_parent_path(&parent, path, expected) {
+        if let Err(rollback_error) = rename_at(&parent, &temporary, &target, libc::RENAME_NOREPLACE)
+        {
+            return Err(format!(
+                "{error}; cannot roll back removal of {}: {rollback_error}",
+                path.display()
+            ));
+        }
+        parent
+            .sync_all()
+            .map_err(|e| format!("cannot sync rolled-back parent of {}: {e}", path.display()))?;
+        return Err(error);
     }
     let result = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
     if result < 0 {
@@ -2140,6 +2278,91 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_write_preserves_a_concurrent_edit_when_parent_path_moves() {
+        let directory = temporary_directory();
+        let config = directory.join("config");
+        let moved_config = directory.join("moved-config");
+        fs::create_dir(&config).unwrap();
+        let path = config.join("settings.json");
+        fs::write(&path, "before").unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+
+        let error = conditional_write_inner(&path, b"generated", &expected, Some(0o600), || {
+            fs::write(&path, "concurrent edit").unwrap();
+            fs::rename(&config, &moved_config).unwrap();
+            fs::create_dir(&config).unwrap();
+            fs::write(&path, "replacement").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.contains("parent directory"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(
+            fs::read_to_string(moved_config.join("settings.json")).unwrap(),
+            "concurrent edit"
+        );
+        let preserved = fs::read_dir(&moved_config)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name() != "settings.json")
+            .unwrap();
+        assert_eq!(fs::read_to_string(preserved.path()).unwrap(), "before");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_write_removes_a_new_file_when_parent_path_moves() {
+        let directory = temporary_directory();
+        let config = directory.join("config");
+        let moved_config = directory.join("moved-config");
+        fs::create_dir(&config).unwrap();
+        let path = config.join("settings.json");
+        let expected = inspect_expected(&path, false).unwrap();
+
+        let error = conditional_write_inner(&path, b"generated", &expected, Some(0o600), || {
+            fs::rename(&config, &moved_config).unwrap();
+            fs::create_dir(&config).unwrap();
+            fs::write(&path, "replacement").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.contains("parent directory"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert!(fs::read_dir(&moved_config).unwrap().next().is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_remove_rolls_back_when_parent_path_moves_during_commit() {
+        let directory = temporary_directory();
+        let config = directory.join("config");
+        let moved_config = directory.join("moved-config");
+        fs::create_dir(&config).unwrap();
+        let path = config.join("settings.json");
+        fs::write(&path, "installed").unwrap();
+        let expected = inspect_expected(&path, false).unwrap();
+
+        let error = conditional_remove_inner(&path, &expected, || {
+            fs::rename(&config, &moved_config).unwrap();
+            fs::create_dir(&config).unwrap();
+            fs::write(&path, "replacement").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.contains("parent directory"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(
+            fs::read_to_string(moved_config.join("settings.json")).unwrap(),
+            "installed"
+        );
+        assert_eq!(fs::read_dir(&moved_config).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]
