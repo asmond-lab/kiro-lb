@@ -2,8 +2,10 @@ import {
   Activity,
   CircleCheck,
   Coins,
-  Gauge,
+  CreditCard,
+  Wallet,
   Info,
+  Palette,
   KeyRound,
   LayoutDashboard,
   ServerCog,
@@ -17,7 +19,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { dashboardApi } from "@/features/dashboard/api";
-import { exactTokens, formatLatency, formatTokens, summarizeUsage } from "@/features/dashboard/format";
+import { exactTokens, formatTokens, summarizeUsage } from "@/features/dashboard/format";
+import { creditTotals } from "@/features/dashboard/credit-totals";
 import { deriveOverviewKpis } from "@/features/dashboard/overview-kpis";
 import { useDashboard } from "@/features/dashboard/use-dashboard";
 import { useTabHash } from "@/features/dashboard/use-tab-hash";
@@ -33,6 +36,8 @@ import { RequestRateChart } from "@/features/dashboard/components/request-rate-c
 import { TokenUsagePanel } from "@/features/dashboard/components/token-usage-panel";
 import { AccountTokenPanel } from "@/features/dashboard/components/account-token-panel";
 import { TotalRateChart } from "@/features/dashboard/components/total-rate-chart";
+import { AppearancePanel } from "@/features/dashboard/components/appearance-panel";
+import { usePreferences } from "@/features/dashboard/preferences";
 import { AppHeader, KiroLogo, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 
@@ -40,8 +45,12 @@ import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 // call to Kiro for every account.
 const USAGE_REFRESH_MS = 5 * 60 * 1000;
 
+const formatCreditTotal = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+
 export default function App() {
   const dashboard = useDashboard();
+  const { t } = usePreferences();
+  const credits = useMemo(() => creditTotals(dashboard.accounts), [dashboard.accounts]);
   const [tab, selectTab] = useTabHash();
   const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
   const { overview, isLoading, isMutating, runAction, isAuthenticated, isLive, refreshUsageQuietly } =
@@ -75,7 +84,7 @@ export default function App() {
       <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
         <div role="status" className="flex items-center gap-3 text-sm">
           <KiroLogo />
-          <span>Loading dashboard…</span>
+          <span>{t("loadingDashboard")}</span>
         </div>
       </div>
     );
@@ -109,10 +118,10 @@ export default function App() {
           <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
             <span className="flex items-center gap-2 font-medium">
               <TriangleAlert size={15} aria-hidden />
-              Connection lost - retrying
+              {t("overview.connectionLost")}
             </span>
             <Button variant="outline" size="sm" onClick={() => void dashboard.reload()}>
-              Retry
+              {t("overview.retry")}
             </Button>
           </div>
         </div>
@@ -129,7 +138,7 @@ export default function App() {
               variant="ghost"
               size="icon"
               className="size-8 shrink-0"
-              aria-label="Dismiss action error"
+              aria-label={t("overview.dismissError")}
               onClick={dashboard.clearActionError}
             >
               <X aria-hidden />
@@ -149,7 +158,7 @@ export default function App() {
               variant="ghost"
               size="icon"
               className="size-8 shrink-0"
-              aria-label="Dismiss notice"
+              aria-label={t("overview.dismissNotice")}
               onClick={dashboard.clearActionNotice}
             >
               <X aria-hidden />
@@ -161,46 +170,50 @@ export default function App() {
       <main className="mx-auto max-w-7xl 2xl:max-w-[100rem] p-4 sm:p-6">
         <Tabs value={tab} onValueChange={selectTab} className="space-y-6">
           <TabsList className="h-10 w-full">
-            <TabsTrigger value="overview" className="gap-2 px-2 sm:px-3" title="Overview">
+            <TabsTrigger value="overview" className="gap-2 px-2 sm:px-3" title={t("overview")}>
               <LayoutDashboard aria-hidden />
-              <span className="hidden sm:inline">Overview</span>
+              <span className="hidden sm:inline">{t("overview")}</span>
             </TabsTrigger>
-            <TabsTrigger value="accounts" className="gap-2 px-2 sm:px-3" title="Accounts">
+            <TabsTrigger value="accounts" className="gap-2 px-2 sm:px-3" title={t("accounts")}>
               <Users aria-hidden />
-              <span className="hidden sm:inline">Accounts</span>
+              <span className="hidden sm:inline">{t("accounts")}</span>
             </TabsTrigger>
-            <TabsTrigger value="keys" className="gap-2 px-2 sm:px-3" title="API keys">
+            <TabsTrigger value="keys" className="gap-2 px-2 sm:px-3" title={t("apiKeys")}>
               <KeyRound aria-hidden />
-              <span className="hidden sm:inline">API keys</span>
+              <span className="hidden sm:inline">{t("apiKeys")}</span>
             </TabsTrigger>
-            <TabsTrigger value="settings" className="gap-2 px-2 sm:px-3" title="Settings">
+            <TabsTrigger value="settings" className="gap-2 px-2 sm:px-3" title={t("settings")}>
               <Settings aria-hidden />
-              <span className="hidden sm:inline">Settings</span>
+              <span className="hidden sm:inline">{t("settings")}</span>
             </TabsTrigger>
-            <TabsTrigger value="info" className="gap-2 px-2 sm:px-3" title="Info">
+            <TabsTrigger value="theme" className="gap-2 px-2 sm:px-3" title={t("theme")}>
+              <Palette aria-hidden />
+              <span className="hidden sm:inline">{t("theme")}</span>
+            </TabsTrigger>
+            <TabsTrigger value="info" className="gap-2 px-2 sm:px-3" title={t("info")}>
               <Info aria-hidden />
-              <span className="hidden sm:inline">Info</span>
+              <span className="hidden sm:inline">{t("info")}</span>
             </TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
-            <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+            <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-12 xl:[&>*]:col-span-4">
               {isLoading || !overview ? (
-                Array.from({ length: 5 }).map((_, index) => <StatCardSkeleton key={index} />)
+                Array.from({ length: 6 }).map((_, index) => <StatCardSkeleton key={index} />)
               ) : (
                 <>
                   <StatCard
-                    label="Total tokens"
+                    label={t("overview.totalTokens")}
                     value={<span title={exactTokens(totals.totalTokens)}>{formatTokens(totals.totalTokens)}</span>}
                     icon={<Coins size={15} />}
                   />
-                  <StatCard label="24h requests" value={overview.requests24h.toLocaleString()} icon={<Activity size={15} />} />
+                  <StatCard label={t("overview.requests24h")} value={overview.requests24h.toLocaleString()} icon={<Activity size={15} />} />
                   <StatCard
-                    label="24h success"
+                    label={t("overview.success24h")}
                     value={
                       <span
                         className={kpis?.success.isCritical ? "text-destructive" : undefined}
-                        title={`${overview.successes24h.toLocaleString()} successful of ${overview.requests24h.toLocaleString()} requests`}
+                        title={t("overview.successTitle", { ok: overview.successes24h.toLocaleString(), total: overview.requests24h.toLocaleString() })}
                       >
                         {kpis?.success.label}
                       </span>
@@ -208,22 +221,11 @@ export default function App() {
                     icon={<ShieldCheck size={15} className={kpis?.success.isCritical ? "text-destructive" : undefined} />}
                   />
                   <StatCard
-                    label="Average latency"
-                    value={
-                      kpis?.maskAverageLatency ? (
-                        <span title="all recent requests failed">—</span>
-                      ) : (
-                        formatLatency(overview.averageLatencyMs)
-                      )
-                    }
-                    icon={<Gauge size={15} />}
-                  />
-                  <StatCard
-                    label="Routable accounts"
+                    label={t("overview.routableAccounts")}
                     value={
                       <span
                         className={kpis?.routableAccounts.isCritical ? "text-destructive" : undefined}
-                        title={`${kpis?.routableAccounts.count ?? 0} routable of ${kpis?.routableAccounts.total ?? 0} total accounts`}
+                        title={t("overview.routableTitle", { n: kpis?.routableAccounts.count ?? 0, total: kpis?.routableAccounts.total ?? 0 })}
                       >
                         {kpis?.routableAccounts.count}/{kpis?.routableAccounts.total}
                       </span>
@@ -234,6 +236,21 @@ export default function App() {
                         className={kpis?.routableAccounts.isCritical ? "text-destructive" : undefined}
                       />
                     }
+                  />
+                  <StatCard
+                    label={t("overview.creditsUsed")}
+                    value={<span title={t("overview.creditsAccounts", { n: credits.accounts })}>{formatCreditTotal(credits.used)}</span>}
+                    icon={<CreditCard size={15} />}
+                  />
+                  <StatCard
+                    label={t("overview.creditsAvailable")}
+                    value={
+                      <span title={t("overview.creditsAccounts", { n: credits.accounts })}>
+                        {formatCreditTotal(credits.available)}
+                        <span className="text-base text-muted-foreground"> / {formatCreditTotal(credits.limit)}</span>
+                      </span>
+                    }
+                    icon={<Wallet size={15} />}
                   />
                 </>
               )}
@@ -303,6 +320,10 @@ export default function App() {
 
           <TabsContent value="settings">
             <SettingsPanel onNotice={dashboard.notify} />
+          </TabsContent>
+
+          <TabsContent value="theme">
+            <AppearancePanel />
           </TabsContent>
         </Tabs>
       </main>

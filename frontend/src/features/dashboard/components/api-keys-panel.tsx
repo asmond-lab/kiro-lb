@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, ChevronRight, Copy, KeyRound, Pencil, ShieldCheck, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -19,6 +19,7 @@ import { formatKeyPrefix } from "../api-key-display";
 import { exactTokens, formatTimestamp, formatTokens } from "../format";
 import type { ApiKey, KeyModelUsage, KeyUsage } from "../types";
 import { TableSkeleton } from "./skeletons";
+import { usePreferences } from "../preferences";
 
 export type ApiKeysPanelProps = {
   apiKeys: ApiKey[];
@@ -41,20 +42,21 @@ function totals(rows: KeyModelUsage[]) {
 }
 
 function UsageBreakdown({ rows }: { rows: KeyModelUsage[] }) {
+  const { t } = usePreferences();
   if (rows.length === 0) {
-    return <p className="px-4 py-3 text-xs text-muted-foreground">No traffic recorded for this key yet.</p>;
+    return <p className="px-4 py-3 text-xs text-muted-foreground">{t("keys.noTraffic")}</p>;
   }
   return (
     <div className="bg-muted/40 px-4 py-3">
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Model</TableHead>
-            <TableHead className="text-right">Requests</TableHead>
-            <TableHead className="text-right">Input</TableHead>
-            <TableHead className="text-right">Output</TableHead>
-            <TableHead className="text-right">Total</TableHead>
-            <TableHead>Last used</TableHead>
+            <TableHead>{t("keys.col.model")}</TableHead>
+            <TableHead className="text-right">{t("keys.col.requests")}</TableHead>
+            <TableHead className="text-right">{t("keys.col.input")}</TableHead>
+            <TableHead className="text-right">{t("keys.col.output")}</TableHead>
+            <TableHead className="text-right">{t("keys.col.total")}</TableHead>
+            <TableHead>{t("keys.col.lastUsed")}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -89,6 +91,7 @@ export function ApiKeysPanel({
   onDelete,
   onRename,
 }: ApiKeysPanelProps) {
+  const { t } = usePreferences();
   const [expanded, setExpanded] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<ApiKey | null>(null);
   const [renaming, setRenaming] = useState<ApiKey | null>(null);
@@ -119,14 +122,11 @@ export function ApiKeysPanel({
       <CardHeader>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="space-y-1">
-            <CardTitle>API keys</CardTitle>
-            <CardDescription>
-              scrypt-hashed; the plaintext value is shown only once at creation. Select a key to see its token usage per model.
-            </CardDescription>
+            <CardTitle>{t("keys.title")}</CardTitle>
           </div>
           <Button size="sm" disabled={isMutating} onClick={onCreate}>
             <KeyRound />
-            Create key
+            {t("keys.createKey")}
           </Button>
         </div>
       </CardHeader>
@@ -134,18 +134,18 @@ export function ApiKeysPanel({
         {isLoading ? (
           <TableSkeleton rows={3} columns={6} />
         ) : apiKeys.length === 0 ? (
-          <EmptyState icon={KeyRound} title="No API keys" description="Create a key to authenticate /v1 clients." />
+          <EmptyState icon={KeyRound} title={t("keys.emptyTitle")} description={t("keys.emptyDescription")} />
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead className="w-8" />
-                <TableHead>Name</TableHead>
-                <TableHead>Prefix</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead className="hidden text-right md:table-cell">Requests</TableHead>
-                <TableHead className="text-right">Tokens</TableHead>
-                <TableHead className="hidden md:table-cell">Created</TableHead>
+                <TableHead>{t("keys.col.name")}</TableHead>
+                <TableHead>{t("keys.col.prefix")}</TableHead>
+                <TableHead>{t("keys.col.status")}</TableHead>
+                <TableHead className="hidden text-right md:table-cell">{t("keys.col.requests")}</TableHead>
+                <TableHead className="text-right">{t("keys.col.tokens")}</TableHead>
+                <TableHead className="hidden md:table-cell">{t("keys.col.created")}</TableHead>
                 <TableHead />
               </TableRow>
             </TableHeader>
@@ -161,7 +161,7 @@ export function ApiKeysPanel({
                     key={key.id}
                     className="cursor-pointer focus-visible:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset focus-visible:outline-none"
                     tabIndex={0}
-                    aria-label={`Usage details for key ${key.name}`}
+                    aria-label={t("keys.usageAria", { name: key.name })}
                     aria-expanded={isOpen}
                     aria-controls={usageRegionId}
                     onClick={toggleExpanded}
@@ -194,7 +194,7 @@ export function ApiKeysPanel({
                       <span className="flex items-center gap-1.5">
                         {key.readOnly && <ShieldCheck size={13} className="text-muted-foreground" />}
                         {key.name}
-                        {key.readOnly && <Badge variant="secondary">environment</Badge>}
+                        {key.readOnly && <Badge variant="secondary">{t("keys.environment")}</Badge>}
                       </span>
                     </TableCell>
                     <TableCell>
@@ -202,8 +202,8 @@ export function ApiKeysPanel({
                         variant="ghost"
                         size="xs"
                         className="h-auto gap-1 px-1 font-mono text-xs font-normal"
-                        aria-label={`Copy prefix of key ${key.name}`}
-                        title="Copy prefix"
+                        aria-label={t("keys.copyPrefixAria", { name: key.name })}
+                        title={t("keys.copyPrefix")}
                         onClick={(event) => {
                           event.stopPropagation();
                           void copyPrefix(key);
@@ -215,7 +215,7 @@ export function ApiKeysPanel({
                     </TableCell>
                     <TableCell>
                       <Badge variant={key.readOnly ? "default" : key.revokedAt ? "outline" : "secondary"}>
-                        {key.readOnly ? "root" : key.revokedAt ? "revoked" : "active"}
+                        {t(key.readOnly ? "keys.status.root" : key.revokedAt ? "keys.status.revoked" : "keys.status.active")}
                       </Badge>
                     </TableCell>
                     <TableCell className="hidden text-right tabular-nums md:table-cell">
@@ -235,8 +235,8 @@ export function ApiKeysPanel({
                             variant="ghost"
                             className="text-muted-foreground hover:text-foreground"
                             disabled={isMutating}
-                            aria-label={`Rename key ${key.name}`}
-                            title="Rename"
+                            aria-label={t("keys.renameAria", { name: key.name })}
+                            title={t("keys.rename")}
                             onClick={(event) => {
                               event.stopPropagation();
                               setNewName(key.name);
@@ -250,8 +250,8 @@ export function ApiKeysPanel({
                             variant="ghost"
                             className="text-muted-foreground hover:text-destructive"
                             disabled={isMutating}
-                            aria-label={`Delete key ${key.name}`}
-                            title="Delete"
+                            aria-label={t("keys.deleteAria", { name: key.name })}
+                            title={t("keys.delete")}
                             onClick={(event) => {
                               event.stopPropagation();
                               setDeleting(key);
@@ -280,19 +280,18 @@ export function ApiKeysPanel({
       <Dialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Delete this API key?</DialogTitle>
+            <DialogTitle>{t("keys.deleteTitle")}</DialogTitle>
             <DialogDescription>
               {deleting ? (
                 <>
-                  <span className="font-medium">{deleting.name}</span> stops working immediately and its usage
-                  history is removed. This cannot be undone.
+                  <span className="font-medium">{deleting.name}</span> {t("keys.deleteDescription")}
                 </>
               ) : null}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" disabled={isMutating} onClick={() => setDeleting(null)}>
-              Cancel
+              {t("keys.cancel")}
             </Button>
             <Button
               variant="destructive"
@@ -302,7 +301,7 @@ export function ApiKeysPanel({
                 setDeleting(null);
               }}
             >
-              Delete
+              {t("keys.delete")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -311,11 +310,11 @@ export function ApiKeysPanel({
       <Dialog open={renaming !== null} onOpenChange={(open) => !open && setRenaming(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Rename API key</DialogTitle>
-            <DialogDescription>The key itself does not change, only its label.</DialogDescription>
+            <DialogTitle>{t("keys.renameTitle")}</DialogTitle>
+            <DialogDescription>{t("keys.renameDescription")}</DialogDescription>
           </DialogHeader>
           <div className="space-y-1">
-            <Label htmlFor="key-name">Name</Label>
+            <Label htmlFor="key-name">{t("keys.col.name")}</Label>
             <Input
               id="key-name"
               value={newName}
@@ -332,7 +331,7 @@ export function ApiKeysPanel({
           </div>
           <DialogFooter>
             <Button variant="outline" disabled={isMutating} onClick={() => setRenaming(null)}>
-              Cancel
+              {t("keys.cancel")}
             </Button>
             <Button
               disabled={isMutating || !newName.trim() || newName.trim() === renaming?.name}
@@ -341,7 +340,7 @@ export function ApiKeysPanel({
                 setRenaming(null);
               }}
             >
-              Save
+              {t("keys.save")}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -9,6 +9,8 @@ This project is a modified version of:
 Modifications and additions in this repository:
 
 - Copyright (C) 2026 minpeter and contributors
+- The gateway was rewritten from Python to Rust. The Rust code is a derivative
+  work of the original and stays under the same AGPL-3.0 license.
 
 The complete corresponding source for this work is available at:
 

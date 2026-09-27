@@ -1,0 +1,262 @@
+use std::sync::OnceLock;
+
+fn env_str(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+        Err(_) => default,
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn bounded_debug_int(name: &str, default: i64, min: i64, max: i64) -> i64 {
+    match std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        Some(v) if (min..=max).contains(&v) => v,
+        _ => default,
+    }
+}
+
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const APP_TITLE: &str = "kiro-lb";
+pub const REGION: &str = "us-east-1";
+pub const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+pub const MAX_RETRIES: u32 = 3;
+pub const BASE_RETRY_DELAY: f64 = 1.0;
+pub const ERROR_BODY_READ_TIMEOUT: f64 = 5.0;
+pub const MODEL_CACHE_TTL: u64 = 3600;
+pub const DEFAULT_MAX_INPUT_TOKENS: u64 = 200_000;
+pub const MINIMUM_ROUTING_WEIGHT: f64 = 1e-9;
+pub const HIDDEN_FROM_LIST: &[&str] = &["auto"];
+pub const MODEL_ALIASES: &[(&str, &str)] = &[("auto-kiro", "auto")];
+pub const HIDDEN_MODELS: &[(&str, &str)] = &[];
+
+pub struct FallbackModel {
+    pub model_id: &'static str,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+}
+
+const fn fm(
+    model_id: &'static str,
+    max_input_tokens: u64,
+    max_output_tokens: u64,
+) -> FallbackModel {
+    FallbackModel {
+        model_id,
+        max_input_tokens,
+        max_output_tokens,
+    }
+}
+
+// Five entries deliberately carry 666667 rather than the advertised 1000000:
+// the runtime charges contextUsagePercentage against two thirds of the
+// advertised window (measured slopes 1.4963-1.5018 on English text).
+pub const FALLBACK_MODELS: &[FallbackModel] = &[
+    fm("auto", 1_000_000, 64_000),
+    fm("claude-sonnet-4", 200_000, 64_000),
+    fm("claude-sonnet-4.5", 200_000, 64_000),
+    fm("claude-sonnet-4.6", 1_000_000, 64_000),
+    fm("claude-haiku-4.5", 200_000, 64_000),
+    fm("claude-opus-4.5", 200_000, 64_000),
+    fm("claude-opus-4.6", 1_000_000, 64_000),
+    fm("claude-opus-4.7", 666_667, 128_000),
+    fm("claude-opus-4.8", 666_667, 128_000),
+    fm("claude-opus-5", 666_667, 128_000),
+    fm("claude-opus-5.5", 666_667, 128_000),
+    fm("claude-sonnet-5", 666_667, 64_000),
+    fm("deepseek-3.2", 164_000, 64_000),
+    fm("glm-5", 200_000, 64_000),
+    fm("minimax-m2.1", 196_000, 64_000),
+    fm("minimax-m2.5", 196_000, 64_000),
+    fm("qwen3-coder-next", 256_000, 64_000),
+    fm("gpt-5.6-sol", 1_000_000, 128_000),
+    fm("gpt-5.6-terra", 1_000_000, 128_000),
+    fm("gpt-5.6-luna", 1_000_000, 128_000),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DebugMode {
+    Off,
+    Errors,
+    All,
+}
+
+pub struct Config {
+    pub server_host: String,
+    pub server_port: u16,
+    pub proxy_api_key: String,
+    pub vpn_proxy_url: String,
+    pub token_refresh_threshold: i64,
+    pub tool_description_max_length: usize,
+    pub log_level: String,
+    pub first_token_timeout: f64,
+    pub streaming_read_timeout: f64,
+    pub first_token_max_retries: u32,
+    pub endpoint_rotation: bool,
+    pub endpoint_order: Vec<String>,
+    pub endpoint_cooldown_seconds: f64,
+    pub condense_claude_prompt: bool,
+    pub shorten_claude_tools: bool,
+    pub shorten_tool_threshold: usize,
+    pub agent_task_type: String,
+    pub debug_mode: DebugMode,
+    pub debug_dir: String,
+    pub debug_capture_content: bool,
+    pub debug_capture_success: bool,
+    pub debug_capture_max_bytes: i64,
+    pub debug_capture_retention: i64,
+    pub max_payload_tokens: i64,
+    pub max_payload_bytes: i64,
+    pub auto_trim_payload: bool,
+    pub web_search_enabled: bool,
+    pub account_recovery_timeout: i64,
+    pub account_max_backoff_multiplier: f64,
+    pub account_probabilistic_retry_chance: f64,
+    pub account_rate_limit_cooldown: i64,
+    pub account_quota_quarantine: i64,
+    pub account_quota_reset_margin: i64,
+    pub account_quota_quarantine_max: i64,
+    pub account_suspension_quarantine: i64,
+    pub account_auth_dead_quarantine: i64,
+    pub rate_window_seconds: i64,
+    pub rate_estimate_window_seconds: i64,
+    pub rate_observation_retention_days: i64,
+    pub request_log_retention_days: i64,
+    pub account_cache_ttl: i64,
+    pub state_save_interval_seconds: i64,
+    pub usage_refresh_interval_seconds: i64,
+    pub quota_weighted_routing: bool,
+    pub unknown_quota_weight: f64,
+    pub depleted_quota_weight: f64,
+    pub session_affinity_ttl_seconds: u64,
+    pub session_affinity_capacity: usize,
+    pub dashboard_password: String,
+    pub dashboard_secure_cookie: Option<bool>,
+    pub data_dir: String,
+    pub kiro_slot: String,
+    pub handoff_secret: String,
+}
+
+impl Config {
+    fn from_env() -> Config {
+        let debug_mode = match env_str("DEBUG_MODE", "").to_ascii_lowercase().as_str() {
+            "errors" => DebugMode::Errors,
+            "all" => DebugMode::All,
+            _ => DebugMode::Off,
+        };
+        Config {
+            server_host: env_str("SERVER_HOST", "0.0.0.0"),
+            server_port: env_parse("SERVER_PORT", 8000),
+            proxy_api_key: env_str("PROXY_API_KEY", ""),
+            vpn_proxy_url: env_str("VPN_PROXY_URL", ""),
+            token_refresh_threshold: env_parse("TOKEN_REFRESH_THRESHOLD", 600),
+            tool_description_max_length: env_parse("TOOL_DESCRIPTION_MAX_LENGTH", 10_000),
+            log_level: env_str("LOG_LEVEL", "INFO").to_ascii_uppercase(),
+            first_token_timeout: env_parse("FIRST_TOKEN_TIMEOUT", 15.0),
+            streaming_read_timeout: env_parse("STREAMING_READ_TIMEOUT", 300.0),
+            first_token_max_retries: env_parse("FIRST_TOKEN_MAX_RETRIES", 3),
+            endpoint_rotation: env_bool("KIRO_ENDPOINT_ROTATION", false),
+            endpoint_order: env_str("KIRO_ENDPOINT_ORDER", "runtime,codewhisperer,amazonq")
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            endpoint_cooldown_seconds: env_parse("KIRO_ENDPOINT_COOLDOWN_SECONDS", 30.0),
+            condense_claude_prompt: env_bool("CONDENSE_CLAUDE_PROMPT", false),
+            shorten_claude_tools: env_bool("SHORTEN_CLAUDE_TOOLS", false),
+            shorten_tool_threshold: env_parse("SHORTEN_TOOL_THRESHOLD", 1200),
+            agent_task_type: env_str("KIRO_AGENT_TASK_TYPE", "vibe").trim().to_owned(),
+            debug_mode,
+            debug_dir: env_str("DEBUG_DIR", "debug_logs"),
+            debug_capture_content: env_str("DEBUG_CAPTURE_CONTENT", "false")
+                .eq_ignore_ascii_case("true"),
+            debug_capture_success: env_str("DEBUG_CAPTURE_SUCCESS", "false")
+                .eq_ignore_ascii_case("true"),
+            debug_capture_max_bytes: bounded_debug_int(
+                "DEBUG_CAPTURE_MAX_BYTES",
+                4 * 1024 * 1024,
+                64 * 1024,
+                64 * 1024 * 1024,
+            ),
+            debug_capture_retention: bounded_debug_int("DEBUG_CAPTURE_RETENTION", 10, 1, 100),
+            max_payload_tokens: env_parse("KIRO_MAX_PAYLOAD_TOKENS", 800_000),
+            max_payload_bytes: env_parse("KIRO_MAX_PAYLOAD_BYTES", 1_085_435),
+            auto_trim_payload: env_bool("AUTO_TRIM_PAYLOAD", false),
+            web_search_enabled: env_bool("WEB_SEARCH_ENABLED", false),
+            account_recovery_timeout: env_parse("ACCOUNT_RECOVERY_TIMEOUT", 60),
+            account_max_backoff_multiplier: env_parse("ACCOUNT_MAX_BACKOFF_MULTIPLIER", 1440.0),
+            account_probabilistic_retry_chance: env_parse(
+                "ACCOUNT_PROBABILISTIC_RETRY_CHANCE",
+                0.1,
+            ),
+            account_rate_limit_cooldown: env_parse("ACCOUNT_RATE_LIMIT_COOLDOWN", 10),
+            account_quota_quarantine: env_parse("ACCOUNT_QUOTA_QUARANTINE", 21_600),
+            account_quota_reset_margin: env_parse("ACCOUNT_QUOTA_RESET_MARGIN", 300),
+            account_quota_quarantine_max: env_parse("ACCOUNT_QUOTA_QUARANTINE_MAX", 2_764_800),
+            account_suspension_quarantine: env_parse("ACCOUNT_SUSPENSION_QUARANTINE", 86_400),
+            account_auth_dead_quarantine: env_parse("ACCOUNT_AUTH_DEAD_QUARANTINE", 86_400),
+            rate_window_seconds: env_parse("RATE_WINDOW_SECONDS", 60),
+            rate_estimate_window_seconds: env_parse("RATE_ESTIMATE_WINDOW_SECONDS", 86_400),
+            rate_observation_retention_days: env_parse("RATE_OBSERVATION_RETENTION_DAYS", 7),
+            request_log_retention_days: env_parse("REQUEST_LOG_RETENTION_DAYS", 7),
+            account_cache_ttl: env_parse("ACCOUNT_CACHE_TTL", 43_200),
+            state_save_interval_seconds: env_parse("STATE_SAVE_INTERVAL_SECONDS", 10),
+            usage_refresh_interval_seconds: env_parse("USAGE_REFRESH_INTERVAL_SECONDS", 900),
+            quota_weighted_routing: env_bool("ACCOUNT_QUOTA_WEIGHTED_ROUTING", true),
+            unknown_quota_weight: env_parse("ACCOUNT_UNKNOWN_QUOTA_WEIGHT", 0.25),
+            depleted_quota_weight: env_parse("ACCOUNT_DEPLETED_QUOTA_WEIGHT", 0.01),
+            session_affinity_ttl_seconds: env_parse("SESSION_AFFINITY_TTL_SECONDS", 7200),
+            session_affinity_capacity: env_parse("SESSION_AFFINITY_CAPACITY", 10_000),
+            dashboard_password: env_str("DASHBOARD_PASSWORD", ""),
+            dashboard_secure_cookie: std::env::var("DASHBOARD_SECURE_COOKIE")
+                .ok()
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
+            data_dir: env_str("DASHBOARD_DATA_DIR", "data"),
+            kiro_slot: env_str("KIRO_SLOT", ""),
+            handoff_secret: env_str("HANDOFF_SECRET", ""),
+        }
+    }
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+pub fn get() -> &'static Config {
+    CONFIG.get_or_init(Config::from_env)
+}
+
+pub fn kiro_refresh_url(region: &str) -> String {
+    format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken")
+}
+
+pub fn aws_sso_oidc_url(region: &str) -> String {
+    format!("https://oidc.{region}.amazonaws.com/token")
+}
+
+pub fn kiro_api_host(region: &str) -> String {
+    format!("https://runtime.{region}.kiro.dev")
+}
+
+pub fn kiro_q_host(region: &str, is_builder_id: bool) -> String {
+    if is_builder_id {
+        format!("https://q.{region}.amazonaws.com")
+    } else {
+        format!("https://runtime.{region}.kiro.dev")
+    }
+}
+
+pub fn fallback_limits(model: &str) -> Option<&'static FallbackModel> {
+    FALLBACK_MODELS.iter().find(|m| m.model_id == model)
+}

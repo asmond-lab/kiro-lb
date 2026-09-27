@@ -11,6 +11,7 @@ import { isUnroutable } from "../routing-state";
 import type { AccountRateSeries } from "../types";
 import type { RequestRate } from "../types";
 import { ChartSkeleton } from "./skeletons";
+import { usePreferences } from "../preferences";
 
 function formatClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -19,6 +20,7 @@ function formatClock(unixSeconds: number): string {
 
 
 function AccountRatePanel({ series }: { series: AccountRateSeries }) {
+  const { t } = usePreferences();
   const view = useMemo(() => accountRateSeries(series), [series]);
 
   return (
@@ -30,19 +32,19 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
               suspended account is indistinguishable from an idle healthy one. */}
           {isUnroutable(series.routingState) && (
             <Badge variant="destructive" className="text-[10px]">
-              {series.routingState === "suspended" ? "BANNED" : "no quota"}
+              {series.routingState === "suspended" ? t("rate.banned") : t("rate.noQuota")}
             </Badge>
           )}
         </span>
         <span className="text-xs tabular-nums text-muted-foreground">
-          {view.peak}/min peak
+          {t("rate.peakPerMin", { n: view.peak })}
           {view.load !== null && (
             <span className={view.nearLimit ? "text-destructive" : undefined}>
               {" "}
-              · {Math.round(view.load * 100)}% of limit
+              · {t("rate.ofLimit", { n: Math.round(view.load * 100) })}
             </span>
           )}
-          {view.rejected > 0 && <span className="text-destructive"> · {view.rejected} rejected</span>}
+          {view.rejected > 0 && <span className="text-destructive"> · {t("rate.nRejected", { n: view.rejected })}</span>}
         </span>
       </div>
 
@@ -51,15 +53,15 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
           in the pool at all. */}
       {!view.hasTraffic ? (
         <div className="flex h-28 items-center justify-center rounded-md border border-dashed border-border/60">
-          <p className="text-xs text-muted-foreground">No traffic in this window</p>
+          <p className="text-xs text-muted-foreground">{t("rate.noTraffic")}</p>
         </div>
       ) : (
         <div className="relative">
           <div
             className="h-28 w-full"
             role="img"
-            aria-label={`Peak requests per minute for account ${series.account}: ${view.peak} per minute${
-              series.limitRpm === null ? ", no observed limit" : `, observed limit ${series.limitRpm} per minute`
+            aria-label={`${t("rate.accountAria", { account: series.account, peak: view.peak })}${
+              series.limitRpm === null ? t("rate.accountAriaNoLimit") : t("rate.accountAriaLimit", { n: series.limitRpm })
             }`}
           >
             <AreaChart
@@ -87,18 +89,22 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
       <p className="text-xs text-muted-foreground">
         {series.limitRpm === null ? (
           <>
-            No guide yet: {series.limitUnknownReason}.
-            {series.safeRpm > 0 && ` Served ${series.safeRpm}/min without rejection.`}
+            {t("rate.noGuide", { reason: series.limitUnknownReason ?? "" })}
+            {series.safeRpm > 0 && t("rate.servedSafe", { n: series.safeRpm })}
           </>
         ) : view.nearLimit ? (
           <span className="text-destructive">
-            Approaching the observed limit. Rejections start near ~{series.limitRpm}/min.
+            {t("rate.approaching", { n: series.limitRpm })}
           </span>
         ) : (
           <>
-            Limit between {series.safeRpm} and {series.limitRpm}/min (±{series.limitPrecisionRpm}), from{" "}
-            {series.informativeSamples} rejection{series.informativeSamples === 1 ? "" : "s"} in the last{" "
-            }{Math.round(series.estimateWindowSeconds / 3600)}h.
+            {t(series.informativeSamples === 1 ? "rate.limitBetweenOne" : "rate.limitBetweenMany", {
+              safe: series.safeRpm,
+              limit: series.limitRpm ?? "",
+              precision: series.limitPrecisionRpm ?? "",
+              n: series.informativeSamples,
+              h: Math.round(series.estimateWindowSeconds / 3600),
+            })}
           </>
         )}
       </p>
@@ -107,6 +113,7 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
 }
 
 export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
+  const { t } = usePreferences();
   const [showUnroutable, setShowUnroutable] = useState(false);
 
   const { shown, hidden } = useMemo(() => {
@@ -125,13 +132,15 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Per-account request rate</CardTitle>
+        <CardTitle>{t("rate.perAccountTitle")}</CardTitle>
         <CardDescription>
           {rate
-            ? `Peak requests per minute in ${rate.bucketSeconds}s buckets, ${formatClock(rate.bucketStarts[0])}–${formatClock(
-                rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds,
-              )}. The dashed guide marks where rejections have started; Kiro publishes no limit, so it is inferred from observed 429s.`
-            : "Peak requests per minute per account."}
+            ? t("rate.perAccountDescWindow", {
+                s: rate.bucketSeconds,
+                from: formatClock(rate.bucketStarts[0]),
+                to: formatClock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds),
+              })
+            : t("rate.perAccountDesc")}
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -140,8 +149,8 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
         ) : !hasAccounts ? (
           <EmptyState
             icon={Activity}
-            title="No accounts to chart"
-            description="Rate history appears once an account joins the pool."
+            title={t("rate.noAccounts")}
+            description={t("rate.noAccountsDesc")}
           />
         ) : (
           <div className="space-y-3">
@@ -156,8 +165,8 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
               // empty card that reads as "no data".
               <EmptyState
                 icon={Activity}
-                title="No routable accounts"
-                description="Every account is suspended or out of quota. Show them below to see their history."
+                title={t("rate.noRoutable")}
+                description={t("rate.noRoutableDesc")}
               />
             )}
 
@@ -172,8 +181,8 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
                 className="text-xs text-muted-foreground underline-offset-2 hover:underline"
               >
                 {showUnroutable
-                  ? `Hide ${hidden.length} unroutable account${hidden.length === 1 ? "" : "s"}`
-                  : `${hidden.length} unroutable account${hidden.length === 1 ? "" : "s"} hidden (suspended or out of quota)`}
+                  ? t(hidden.length === 1 ? "rate.hideOne" : "rate.hideMany", { n: hidden.length })
+                  : t(hidden.length === 1 ? "rate.hiddenOne" : "rate.hiddenMany", { n: hidden.length })}
               </button>
             )}
           </div>

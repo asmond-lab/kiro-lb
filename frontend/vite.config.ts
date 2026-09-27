@@ -28,7 +28,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "../kiro/static",
+    outDir: "../static",
     emptyOutDir: true,
   },
 });

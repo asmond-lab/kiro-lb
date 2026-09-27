@@ -14,6 +14,7 @@ import { rateChartConfig, rateChartRows } from "../dither-series";
 import { summarizeRate, throttledAccounts } from "../request-rate-totals";
 import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { RequestRate } from "../types";
+import { usePreferences } from "../preferences";
 
 function formatClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -38,6 +39,7 @@ function Figure({ label, value, hint, tone }: { label: string; value: string; hi
 }
 
 export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
+  const { t } = usePreferences();
   const totals = useMemo(() => summarizeRate(rate), [rate]);
   const throttled = useMemo(() => throttledAccounts(rate), [rate]);
   const rows = useMemo(() => rateChartRows(totals), [totals]);
@@ -46,14 +48,15 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
-        <CardTitle>Total request rate</CardTitle>
+        <CardTitle>{t("rate.totalTitle")}</CardTitle>
         <CardDescription>
           {rate
-            ? `Every account combined, in ${rate.bucketSeconds}s buckets, ${formatClock(
-                rate.bucketStarts[0],
-              )}–${formatClock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds)}. Per-account rates
-              and their inferred limits are on the Accounts tab, where the limit applies.`
-            : "Requests per minute across the whole pool."}
+            ? t("rate.totalDescWindow", {
+                s: rate.bucketSeconds,
+                from: formatClock(rate.bucketStarts[0]),
+                to: formatClock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds),
+              })
+            : t("rate.totalDesc")}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex-1">
@@ -67,15 +70,17 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
               <div
                 className="h-44 w-full"
                 role="img"
-                aria-label={`Total requests per minute across all accounts. Peak ${round(
-                  totals.peakPerMinute,
-                )} per minute, average ${round(totals.meanPerMinute)} per minute, ${totals.requests} requests in the window.`}
+                aria-label={t("rate.totalAria", {
+                  peak: round(totals.peakPerMinute),
+                  avg: round(totals.meanPerMinute),
+                  n: totals.requests,
+                })}
               >
                 {totals.requests === 0 ? (
                   <EmptyState
                     icon={Activity}
-                    title="No requests in this window"
-                    description="Requests appear here once traffic reaches the gateway."
+                    title={t("rate.noRequests")}
+                    description={t("rate.noRequestsDesc")}
                   />
                 ) : (
                   /* No entrance sweep: live polling bumps the data revision every
@@ -86,7 +91,7 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
                     <YAxis tickCount={3} tickFormatter={round} />
                     {/* The mean makes a spike legible as a spike rather than as the
                         normal level, which a bare area chart cannot convey. */}
-                    <ReferenceLine y={totals.meanPerMinute} label={`avg ${round(totals.meanPerMinute)}/min`} />
+                    <ReferenceLine y={totals.meanPerMinute} label={t("rate.avg", { n: round(totals.meanPerMinute) })} />
                     <Area dataKey="served" variant="gradient" />
                     {/* Rejections are drawn on top: they are rare and must not be
                         lost inside the total they are part of. */}
@@ -102,20 +107,20 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
                 has to follow the card rather than the screen. */}
             <dl className="grid grid-cols-2 gap-3 border-t pt-4 @md/panel:grid-cols-3 @2xl/panel:grid-cols-5">
               <Figure
-                label="Peak"
+                label={t("rate.peak")}
                 value={`${round(totals.peakPerMinute)}/min`}
-                hint={`burst ${totals.peakConcurrentRpm}`}
+                hint={t("rate.burst", { n: totals.peakConcurrentRpm })}
               />
-              <Figure label="Average" value={`${round(totals.meanPerMinute)}/min`} />
-              <Figure label="Requests" value={totals.requests.toLocaleString()} hint="in window" />
+              <Figure label={t("rate.average")} value={`${round(totals.meanPerMinute)}/min`} />
+              <Figure label={t("rate.requests")} value={totals.requests.toLocaleString()} hint={t("rate.inWindow")} />
               <Figure
-                label="Rejected"
+                label={t("rate.rejected")}
                 value={totals.rateLimited.toLocaleString()}
                 tone={totals.rateLimited > 0 ? "warning" : undefined}
-                hint={throttled.length > 0 ? `${throttled.length} account${throttled.length === 1 ? "" : "s"}` : undefined}
+                hint={throttled.length > 0 ? t(throttled.length === 1 ? "rate.accountsOne" : "rate.accountsMany", { n: throttled.length }) : undefined}
               />
               <Figure
-                label="Failed"
+                label={t("rate.failed")}
                 value={totals.failures.toLocaleString()}
                 tone={totals.failures > 0 ? "warning" : undefined}
               />
@@ -123,16 +128,12 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
 
             {totals.rateLimited > 0 && (
               <p className="text-xs text-destructive">
-                {totals.rateLimited} upstream rejection{totals.rateLimited === 1 ? "" : "s"} on{" "}
-                {throttled.join(", ")}. A rejection failover recovered from is still a success to the client, so it does
-                not appear in the request log.
+                {t(totals.rateLimited === 1 ? "rate.rejectionsOne" : "rate.rejectionsMany", {
+                  n: totals.rateLimited,
+                  accounts: throttled.join(", "),
+                })}
               </p>
             )}
-
-            <p className="text-xs text-muted-foreground">
-              Peak is the busiest bucket scaled to a minute; burst sums each account&apos;s own sliding-window rate, which
-              is what an upstream rate limit actually measures.
-            </p>
           </div>
         )}
       </CardContent>

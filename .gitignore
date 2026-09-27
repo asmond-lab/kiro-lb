@@ -12,17 +12,11 @@ deploy/pushgateway/kiro-lb.env
 .idea/
 .shard/
 
-# Python
-.venv/
+# Build
+/target/
+/kiro-rs/
 frontend/node_modules/
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
 dist/
-build/
 
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/
@@ -34,10 +28,6 @@ requests/
 data/
 .omo/
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
 
 # blue/green edge runtime cfg (rendered by deploy.sh)
 docker/haproxy-edge.generated.cfg

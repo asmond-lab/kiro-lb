@@ -19,6 +19,8 @@ import {
 import type { RequestLogDetail, RequestLogOrder, RequestLogPage } from "../types";
 import { PaginationControls } from "./pagination-controls";
 import { TableSkeleton } from "./skeletons";
+import { ModelMark } from "./model-marks";
+import { usePreferences } from "../preferences";
 
 export type RequestLogTableProps = {
   page: RequestLogPage;
@@ -43,6 +45,7 @@ export function RequestLogTable({
   onModelChange,
   onOrderChange,
 }: RequestLogTableProps) {
+  const { t } = usePreferences();
   const isEmpty = !isLoading && page.total === 0;
   const [detail, setDetail] = useState<RequestLogDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -62,7 +65,7 @@ export function RequestLogTable({
     try {
       setDetail(await dashboardApi.requestLogDetail(id));
     } catch (error) {
-      setDetailError(error instanceof DashboardApiError ? error.message : "Could not load the request");
+      setDetailError(error instanceof DashboardApiError ? error.message : t("logs.loadError"));
     } finally {
       setLoadingDetail(null);
     }
@@ -71,31 +74,32 @@ export function RequestLogTable({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Recent proxy requests</CardTitle>
-        <CardDescription>Open a row to see where it came from and what it cost.</CardDescription>
+        <CardTitle>{t("logs.title")}</CardTitle>
+        <CardDescription>{t("logs.description")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-center gap-2">
           <Select value={model || ALL_MODELS} onValueChange={(value) => onModelChange(value === ALL_MODELS ? "" : value)}>
-            <SelectTrigger className="w-56" aria-label="Filter by model">
-              <SelectValue placeholder="All models" />
+            <SelectTrigger className="w-56" aria-label={t("logs.filterModel")}>
+              <SelectValue placeholder={t("logs.allModels")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={ALL_MODELS}>All models</SelectItem>
+              <SelectItem value={ALL_MODELS}>{t("logs.allModels")}</SelectItem>
               {(page.models ?? []).map((name) => (
                 <SelectItem key={name} value={name}>
+                  <ModelMark model={name} />
                   {name}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
           <Select value={order} onValueChange={(value) => onOrderChange(value as RequestLogOrder)}>
-            <SelectTrigger className="w-44" aria-label="Sort order">
+            <SelectTrigger className="w-44" aria-label={t("logs.sortOrder")}>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="newest">Newest first</SelectItem>
-              <SelectItem value="oldest">Oldest first</SelectItem>
+              <SelectItem value="newest">{t("logs.newest")}</SelectItem>
+              <SelectItem value="oldest">{t("logs.oldest")}</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -109,16 +113,16 @@ export function RequestLogTable({
         {isLoading ? (
           <TableSkeleton rows={Math.min(page.limit, 5)} columns={6} />
         ) : isEmpty ? (
-          <EmptyState icon={ScrollText} title="No requests recorded yet" description="Proxy traffic will appear here." />
+          <EmptyState icon={ScrollText} title={t("logs.emptyTitle")} description={t("logs.emptyDesc")} />
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Time</TableHead>
-                <TableHead>Route</TableHead>
-                <TableHead>Model</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead className="hidden text-right md:table-cell">Latency</TableHead>
+                <TableHead>{t("logs.time")}</TableHead>
+                <TableHead>{t("logs.route")}</TableHead>
+                <TableHead>{t("logs.model")}</TableHead>
+                <TableHead>{t("logs.status")}</TableHead>
+                <TableHead className="hidden text-right md:table-cell">{t("logs.latency")}</TableHead>
                 <TableHead className="w-10" />
               </TableRow>
             </TableHeader>
@@ -132,14 +136,21 @@ export function RequestLogTable({
                     </TableCell>
                     <TableCell className="max-w-[10rem] truncate font-mono text-xs md:max-w-none">{log.route}</TableCell>
                     <TableCell>
-                      {log.model ?? "—"}
+                      {log.model ? (
+                        <span className="inline-flex items-center gap-2 align-middle">
+                          <ModelMark model={log.model} />
+                          {log.model}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                       {spendLabel ? (
-                        <span className="ml-2 text-xs text-muted-foreground" title="Credits spent">
+                        <span className="ml-2 text-xs text-muted-foreground" title={t("logs.creditsSpent")}>
                           {spendLabel}
                         </span>
                       ) : null}
                       {log.modelMultiplier != null ? (
-                        <span className="ml-2 text-xs text-muted-foreground" title="Model multiplier">
+                        <span className="ml-2 text-xs text-muted-foreground" title={t("logs.modelMultiplier")}>
                           {formatMultiplier(log.modelMultiplier)}
                         </span>
                       ) : null}
@@ -163,7 +174,7 @@ export function RequestLogTable({
                           variant="ghost"
                           size="icon"
                           className="size-7"
-                          aria-label="Show request details"
+                          aria-label={t("logs.showDetails")}
                           disabled={loadingDetail !== null}
                           onClick={() => void openDetail(log.id as number)}
                         >
@@ -205,27 +216,47 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
 }
 
 export function RequestLogDetailFields({ detail }: { detail: RequestLogDetail }) {
+  const { t } = usePreferences();
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-        <Field label="Model" value={detail.model} />
-        <Field label="Status" value={detail.statusCode} />
-        <Field label="Latency" value={formatLatency(detail.latencyMs)} />
-        <Field label="Client" value={detail.clientIp} />
-        <Field label="User agent" value={detail.userAgent} />
         <Field
-          label="Tokens in / out"
+          label={t("logs.model")}
+          value={
+            detail.model ? (
+              <span className="inline-flex items-center gap-2">
+                <ModelMark model={detail.model} />
+                {detail.model}
+              </span>
+            ) : null
+          }
+        />
+        <Field label={t("logs.status")} value={detail.statusCode} />
+        <Field label={t("logs.latency")} value={formatLatency(detail.latencyMs)} />
+        <Field label={t("logs.client")} value={detail.clientIp} />
+        <Field label={t("logs.userAgent")} value={detail.userAgent} />
+        <Field
+          label={t("logs.tokensInOut")}
           value={
             detail.inputTokens !== null || detail.outputTokens !== null
               ? `${(detail.inputTokens ?? 0).toLocaleString()} / ${(detail.outputTokens ?? 0).toLocaleString()}`
               : "—"
           }
         />
+        <Field
+          label={t("logs.tokensPerSecond")}
+          value={
+            detail.tokensPerSecond != null
+              ? `${detail.tokensPerSecond.toFixed(1)} tok/s`
+              : "—"
+          }
+        />
+        <Field label={t("logs.ttft")} value={detail.ttftMs != null ? formatLatency(detail.ttftMs) : "—"} />
         {detail.creditsSpent != null ? (
-          <Field label="Credits spent" value={formatCredits(detail.creditsSpent)} />
+          <Field label={t("logs.creditsSpent")} value={formatCredits(detail.creditsSpent)} />
         ) : null}
         {detail.modelMultiplier != null ? (
-          <Field label="Model multiplier" value={formatMultiplier(detail.modelMultiplier)} />
+          <Field label={t("logs.modelMultiplier")} value={formatMultiplier(detail.modelMultiplier)} />
         ) : null}
       </div>
     </div>
@@ -233,11 +264,12 @@ export function RequestLogDetailFields({ detail }: { detail: RequestLogDetail })
 }
 
 function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | null; onClose: () => void }) {
+  const { t } = usePreferences();
   return (
     <Dialog open={detail !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-h-[85vh] overflow-auto sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>Request detail</DialogTitle>
+          <DialogTitle>{t("logs.detailTitle")}</DialogTitle>
           <DialogDescription>
             {detail ? `${detail.route} · ${formatTimestamp(detail.createdAt)}` : ""}
           </DialogDescription>

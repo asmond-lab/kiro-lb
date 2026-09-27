@@ -75,10 +75,10 @@ export const dashboardApi = {
       method: "PUT",
       body: JSON.stringify({ mode }),
     }),
-  savePromptFilter: (enabled: boolean) =>
-    request<{ enabled: boolean }>("/api/dashboard/prompt-filter", {
+  savePromptFilter: (patch: { enabled?: boolean; shortenTools?: boolean }) =>
+    request<PromptFilterSettings>("/api/dashboard/prompt-filter", {
       method: "PUT",
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify(patch),
     }),
   accounts: () => request<{ accounts: Account[] }>("/api/dashboard/accounts"),
   deleteAccount: (id: string) =>

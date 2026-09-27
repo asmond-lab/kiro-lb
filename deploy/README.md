@@ -1,6 +1,6 @@
 # Observability deployment assets
 
-Wiring for `GET /metrics` (`kiro/metrics.py`). These files describe this
+Wiring for `GET /metrics` (`src/metrics.rs`). These files describe this
 operator's homelab and carry its private addresses; treat them as a worked
 example rather than a drop-in.
 

@@ -36,11 +36,15 @@ import type {
   PromptFilterSettings,
   ProxyChain,
 } from "../types";
+import { usePreferences } from "../preferences";
+import { compareModels } from "../model-family";
+import { ModelMark } from "./model-marks";
+import { describeShortenStats, loadBalancingHelp, loadBalancingLabel } from "./routing-labels";
 
-const describe = (error: unknown) =>
-  error instanceof DashboardApiError ? error.message : "Unexpected error";
+const UNEXPECTED = "unexpected-error";
 
-// Radix Select reserves the empty string, so the "omit" choice needs a stand-in.
+const describe = (error: unknown) => (error instanceof DashboardApiError ? error.message : UNEXPECTED);
+
 type BusyKind =
   | "save"
   | "test"
@@ -72,6 +76,7 @@ export type SettingsPanelProps = {
 };
 
 export function SettingsPanel({ onNotice }: SettingsPanelProps) {
+  const { t } = usePreferences();
   const [endpoints, setEndpoints] = useState<EndpointsResponse | null>(null);
   const [promptFilter, setPromptFilter] = useState<PromptFilterSettings | null>(null);
   const [agentMode, setAgentMode] = useState<AgentModeSettings | null>(null);
@@ -89,6 +94,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
   const [refreshSeconds, setRefreshSeconds] = useState(600);
   const [data, setData] = useState<DataOverview | null>(null);
   const [costs, setCosts] = useState<ModelCostRow[]>([]);
+  const sortedCosts = [...costs].sort((a, b) => compareModels(a.model, b.model));
   const [costNote, setCostNote] = useState("");
   const [proxies, setProxies] = useState<ProxyChain | null>(null);
   const [proxyText, setProxyText] = useState("");
@@ -152,7 +158,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
     run("save", async () => {
       const saved = await dashboardApi.saveEndpoints({ rotation, order, cooldownSeconds: cooldown });
       setOrder(saved.settings.order);
-      onNotice("Saved. It applies to the next request, with no restart.");
+      onNotice(t("settings.savedNotice"));
     });
 
   const test = () =>
@@ -214,8 +220,8 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             betweenSpreadMs: Math.round(between),
             withinSpreadMs: Math.round(within),
             verdict: conclusive
-              ? `${fastest.name} is fastest by ${Math.round(between)}ms, which exceeds the widest single-provider spread of ${Math.round(within)}ms.`
-              : `Indistinguishable: the ${Math.round(between)}ms gap between providers is smaller than the ${Math.round(within)}ms spread within one. Raise repetitions for a firmer answer.`,
+              ? t("settings.verdictFastest", { name: fastest.name, between: Math.round(between), within: Math.round(within) })
+              : t("settings.verdictIndistinguishable", { between: Math.round(between), within: Math.round(within) }),
           });
         }
       }
@@ -250,7 +256,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       const fresh = await dashboardApi.proxies();
       setProxies(fresh);
       setProxyText(fresh.proxies.map((entry) => entry.url).join("\n"));
-      onNotice(entries.length ? `Chain saved with ${entries.length} proxy(ies).` : "Chain cleared: direct connections.");
+      onNotice(entries.length ? t("settings.chainSaved", { n: entries.length }) : t("settings.chainCleared"));
     });
 
   const clear = (scope: "logs" | "usage") =>
@@ -259,8 +265,8 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       setData(await dashboardApi.dataOverview());
       onNotice(
         scope === "usage"
-          ? `Cleared ${result.affected} token usage row(s).`
-          : `Deleted ${result.affected} request log(s).`,
+          ? t("settings.clearedUsage", { n: result.affected })
+          : t("settings.deletedLogs", { n: result.affected }),
       );
     });
 
@@ -270,10 +276,10 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       setAgentMode((previous) => (previous ? { ...previous, mode: saved.mode } : previous));
     });
 
-  const togglePrompt = (next: boolean) =>
+  const togglePrompt = (patch: { enabled?: boolean; shortenTools?: boolean }) =>
     run("prompt", async () => {
-      await dashboardApi.savePromptFilter(next);
-      setPromptFilter((previous) => (previous ? { ...previous, enabled: next } : previous));
+      const saved = await dashboardApi.savePromptFilter(patch);
+      setPromptFilter((previous) => (previous ? { ...previous, ...saved } : saved));
     });
 
   const available = endpoints?.available ?? [];
@@ -292,20 +298,16 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
     <div className="space-y-6">
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-          {error}
+          {error === UNEXPECTED ? t("settings.unexpectedError") : error}
         </div>
       )}
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <PlugZap size={16} aria-hidden /> Generation providers
+            <PlugZap size={16} aria-hidden /> {t("settings.providersTitle")}
           </CardTitle>
-          <CardDescription>
-            Which upstreams may serve a generation request, and in what order. Only the runtime host is
-            verified for every credential type; the alternates may reject some accounts, so test before
-            relying on one.
-          </CardDescription>
+          <CardDescription>{t("settings.providersDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <label className="flex items-center gap-2 text-sm">
@@ -315,20 +317,20 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               disabled={isBusy}
               onChange={(event) => setRotation(event.target.checked)}
             />
-            Rotate to the next provider when one fails
+            {t("settings.rotate")}
           </label>
           {!rotation && (
             <p className="text-xs text-muted-foreground">
-              With rotation off, only the account's own generation URL is used and the order below is ignored.
+              {t("settings.rotationOff")}
             </p>
           )}
 
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Provider</TableHead>
-                <TableHead>URL</TableHead>
-                <TableHead className="text-right">Enabled</TableHead>
+                <TableHead>{t("settings.provider")}</TableHead>
+                <TableHead>{t("settings.url")}</TableHead>
+                <TableHead className="text-right">{t("settings.enabled")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -374,8 +376,8 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                           <span
                             role="button"
                             tabIndex={isBusy ? -1 : 0}
-                            aria-label={`Reorder ${endpoint.name}, currently position ${position + 1} of ${order.length}. Use the arrow keys.`}
-                            title="Drag to reorder, or focus and use the arrow keys"
+                            aria-label={t("settings.reorderAria", { name: endpoint.name, position: position + 1, total: order.length })}
+                            title={t("settings.reorderTitle")}
                             className="text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
                             onKeyDown={(event) => {
                               if (isBusy) return;
@@ -400,8 +402,8 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                         type="checkbox"
                         checked={active}
                         disabled={isBusy || lastActive}
-                        aria-label={`Enable ${endpoint.name}`}
-                        title={lastActive ? "At least one provider must stay enabled" : undefined}
+                        aria-label={t("settings.enableAria", { name: endpoint.name })}
+                        title={lastActive ? t("settings.lastProvider") : undefined}
                         onChange={(event) =>
                           setOrder((previous) =>
                             event.target.checked
@@ -417,12 +419,12 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             </TableBody>
           </Table>
           <p className="text-xs text-muted-foreground">
-            Drag a row to set the attempt order, or focus its handle and use the arrow keys.
+            {t("settings.dragHint")}
           </p>
 
           <div className="flex flex-wrap items-end gap-4">
             <div className="space-y-1">
-              <Label htmlFor="cooldown">Cooldown after a failure (seconds)</Label>
+              <Label htmlFor="cooldown">{t("settings.cooldown")}</Label>
               <Input
                 id="cooldown"
                 type="number"
@@ -435,7 +437,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               />
             </div>
             <Button onClick={save} disabled={isBusy || order.length === 0}>
-              {busy === "save" ? "Saving..." : "Save"}
+              {busy === "save" ? t("settings.saving") : t("settings.save")}
             </Button>
           </div>
         </CardContent>
@@ -444,24 +446,20 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Gauge size={16} aria-hidden /> Connectivity and latency
+            <Gauge size={16} aria-hidden /> {t("settings.connectivityTitle")}
           </CardTitle>
           <CardDescription className="flex items-start gap-2">
             <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden />
-            <span>
-              Both send real generation requests and spend quota. Test sends one per provider; ping sends
-              {" "}
-              {pingCost} in total.
-            </span>
+            <span>{t("settings.connectivityDescription", { n: pingCost })}</span>
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-wrap items-end gap-4">
             <Button variant="secondary" onClick={test} disabled={isBusy}>
-              {busy === "test" ? "Testing..." : "Test all providers"}
+              {busy === "test" ? t("settings.testing") : t("settings.testAll")}
             </Button>
             <div className="space-y-1">
-              <Label htmlFor="reps">Ping repetitions</Label>
+              <Label htmlFor="reps">{t("settings.pingReps")}</Label>
               <Input
                 id="reps"
                 type="number"
@@ -474,7 +472,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               />
             </div>
             <Button variant="secondary" onClick={ping} disabled={isBusy}>
-              {busy === "ping" ? "Measuring..." : "Ping"}
+              {busy === "ping" ? t("settings.measuring") : t("settings.ping")}
             </Button>
           </div>
 
@@ -497,7 +495,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                     <span className={active ? "font-medium" : done ? "" : "text-muted-foreground"}>
                       {endpoint.name}
                     </span>
-                    {active && <span className="text-xs text-muted-foreground">checking...</span>}
+                    {active && <span className="text-xs text-muted-foreground">{t("settings.checking")}</span>}
                   </div>
                 );
               })}
@@ -508,9 +506,9 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>Result</TableHead>
-                  <TableHead className="text-right">First byte</TableHead>
+                  <TableHead>{t("settings.provider")}</TableHead>
+                  <TableHead>{t("settings.result")}</TableHead>
+                  <TableHead className="text-right">{t("settings.firstByte")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -519,9 +517,9 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                     <TableCell className="font-medium">{row.name}</TableCell>
                     <TableCell>
                       {row.ok ? (
-                        <Badge variant="secondary">accepted</Badge>
+                        <Badge variant="secondary">{t("settings.accepted")}</Badge>
                       ) : (
-                        <span className="text-destructive">{row.error ?? "failed"}</span>
+                        <span className="text-destructive">{row.error ?? t("settings.failed")}</span>
                       )}
                     </TableCell>
                     <TableCell className="text-right">{row.ttfbMs === null ? "—" : `${row.ttfbMs} ms`}</TableCell>
@@ -536,11 +534,11 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Provider</TableHead>
-                    <TableHead className="text-right">Samples</TableHead>
-                    <TableHead className="text-right">Median</TableHead>
-                    <TableHead className="text-right">Min</TableHead>
-                    <TableHead className="text-right">Max</TableHead>
+                    <TableHead>{t("settings.provider")}</TableHead>
+                    <TableHead className="text-right">{t("settings.samples")}</TableHead>
+                    <TableHead className="text-right">{t("settings.median")}</TableHead>
+                    <TableHead className="text-right">{t("settings.min")}</TableHead>
+                    <TableHead className="text-right">{t("settings.max")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -550,7 +548,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                         {row.name}
                         {pingResult.conclusive && pingResult.fastest === row.key && (
                           <Badge variant="secondary" className="ml-2">
-                            fastest
+                            {t("settings.fastest")}
                           </Badge>
                         )}
                       </TableCell>
@@ -573,31 +571,30 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Workflow size={16} aria-hidden /> Agent task mode
+            <Workflow size={16} aria-hidden /> {t("settings.agentModeTitle")}
           </CardTitle>
           <CardDescription>
-            Sent as <span className="font-mono">conversationState.agentTaskType</span>. The official Kiro CLI
-            sends <span className="font-mono">vibe</span> for free-form chat and reserves{" "}
-            <span className="font-mono">spec</span> and <span className="font-mono">task</span> for its
-            structured modes. What each one changes upstream is undocumented, so "omit" reproduces the payload
-            as it was before this option existed.
+            {t("settings.agentModeSentAs")} <span className="font-mono">conversationState.agentTaskType</span>
+            {t("settings.agentModeOfficial")} <span className="font-mono">vibe</span> {t("settings.agentModeFreeform")}{" "}
+            <span className="font-mono">spec</span> {t("settings.and")} <span className="font-mono">task</span>{" "}
+            {t("settings.agentModeRest")}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="space-y-1">
-            <Label htmlFor="agent-mode">Mode</Label>
+            <Label htmlFor="agent-mode">{t("settings.mode")}</Label>
             <Select
               value={agentMode ? agentMode.mode || OMIT_VALUE : undefined}
               disabled={isBusy || !agentMode}
               onValueChange={(value) => saveMode(value === OMIT_VALUE ? "" : value)}
             >
               <SelectTrigger id="agent-mode" className="w-48">
-                <SelectValue placeholder="Select a mode" />
+                <SelectValue placeholder={t("settings.selectMode")} />
               </SelectTrigger>
               <SelectContent>
                 {(agentMode?.allowed ?? []).map((mode) => (
                   <SelectItem key={mode || OMIT_VALUE} value={mode || OMIT_VALUE}>
-                    {mode === "" ? "omit the field" : mode}
+                    {mode === "" ? t("settings.omitField") : mode}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -609,41 +606,37 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Users size={16} aria-hidden /> Account pool
+            <Users size={16} aria-hidden /> {t("settings.poolTitle")}
           </CardTitle>
-          <CardDescription>
-            How the next account is chosen, and how early tokens are refreshed. Disable individual accounts in
-            the Accounts tab.
-          </CardDescription>
+          <CardDescription>{t("settings.poolDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-1">
-            <Label htmlFor="balancing">Account ordering</Label>
+            <Label htmlFor="balancing">{t("settings.accountOrdering")}</Label>
             <Select
               value={tunables?.loadBalancing}
               disabled={isBusy || !tunables}
               onValueChange={(value) => saveTunables({ loadBalancing: value })}
             >
-              <SelectTrigger id="balancing" className="w-56">
+              <SelectTrigger id="balancing" className="w-80">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 {(tunables?.loadBalancingOptions ?? []).map((option) => (
                   <SelectItem key={option} value={option}>
-                    {option === "weighted"
-                      ? "weighted — random, by remaining quota"
-                      : option === "most_credits"
-                        ? "most credits first"
-                        : "sticky — keep the current account"}
+                    {loadBalancingLabel(option, t)}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {loadBalancingHelp(tunables?.loadBalancing, t) && (
+              <p className="text-xs text-muted-foreground">{loadBalancingHelp(tunables?.loadBalancing, t)}</p>
+            )}
           </div>
 
           <div className="flex flex-wrap items-end gap-4">
             <div className="space-y-1">
-              <Label htmlFor="refresh">Refresh token this many seconds before expiry</Label>
+              <Label htmlFor="refresh">{t("settings.refreshBefore")}</Label>
               <Input
                 id="refresh"
                 type="number"
@@ -660,7 +653,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               disabled={isBusy || !tunables || refreshSeconds === tunables?.tokenRefreshSeconds}
               onClick={() => saveTunables({ tokenRefreshSeconds: refreshSeconds })}
             >
-              Save
+              {t("settings.save")}
             </Button>
           </div>
         </CardContent>
@@ -669,33 +662,33 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Database size={16} aria-hidden /> Data
+            <Database size={16} aria-hidden /> {t("settings.dataTitle")}
           </CardTitle>
-          <CardDescription>What the gateway keeps on disk.</CardDescription>
+          <CardDescription>{t("settings.dataDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {data && (
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <Field label="Request logs" value={data.requestLogs.toLocaleString()} />
-              <Field label="Retention" value={`${data.retentionDays} days`} />
-              <Field label="Database" value={`${(data.databaseBytes / 1048576).toFixed(1)} MB`} />
+              <Field label={t("settings.requestLogs")} value={data.requestLogs.toLocaleString()} />
+              <Field label={t("settings.retention")} value={t("settings.retentionDays", { n: data.retentionDays })} />
+              <Field label={t("settings.database")} value={`${(data.databaseBytes / 1048576).toFixed(1)} MB`} />
             </div>
           )}
 
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" disabled={isBusy} onClick={() => clear("usage")}>
-              {busy === "clear-usage" ? "Clearing..." : "Clear token usage"}
+              {busy === "clear-usage" ? t("settings.clearing") : t("settings.clearUsage")}
             </Button>
             <Button
               variant="destructive"
               disabled={isBusy || !data || data.requestLogs === 0}
               onClick={() => clear("logs")}
             >
-              {busy === "clear-logs" ? "Clearing..." : "Clear all request logs"}
+              {busy === "clear-logs" ? t("settings.clearing") : t("settings.clearLogs")}
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Clearing logs also resets the request metrics derived from them.
+            {t("settings.clearLogsNote")}
           </p>
         </CardContent>
       </Card>
@@ -703,7 +696,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <ScrollText size={16} aria-hidden /> Claude Code prompt
+            <ScrollText size={16} aria-hidden /> {t("settings.promptTitle")}
           </CardTitle>
           <CardDescription>{promptFilter?.preservedNote}</CardDescription>
         </CardHeader>
@@ -713,13 +706,26 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               type="checkbox"
               checked={promptFilter?.enabled ?? false}
               disabled={isBusy || !promptFilter}
-              onChange={(event) => togglePrompt(event.target.checked)}
+              onChange={(event) => togglePrompt({ enabled: event.target.checked })}
             />
-            Replace Anthropic's generic prompt sections with a short Kiro one
+            {t("settings.replacePrompt")}
           </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={promptFilter?.shortenTools ?? false}
+              disabled={isBusy || !promptFilter || promptFilter.shortenTools === undefined}
+              onChange={(event) => togglePrompt({ shortenTools: event.target.checked })}
+            />
+            {t("settings.shortenTools", { n: promptFilter?.shortenThreshold ?? 1200 })}
+          </label>
+          {promptFilter?.shortenNote && <p className="text-xs text-muted-foreground">{promptFilter.shortenNote}</p>}
+          {describeShortenStats(promptFilter?.lastShorten, t) && (
+            <p className="text-xs text-muted-foreground">{describeShortenStats(promptFilter?.lastShorten, t)}</p>
+          )}
           {promptFilter && (
             <p className="text-xs text-muted-foreground">
-              Dropped sections: <span className="font-mono">{promptFilter.droppedSections.join(", ")}</span>
+              {t("settings.droppedSections")} <span className="font-mono">{promptFilter.droppedSections.join(", ")}</span>
             </p>
           )}
         </CardContent>
@@ -728,13 +734,9 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Network size={16} aria-hidden /> Proxies
+            <Network size={16} aria-hidden /> {t("settings.proxiesTitle")}
           </CardTitle>
-          <CardDescription>
-            One per line, in the order they should be tried. A proxy that fails a connection is moved to the
-            back for {proxies?.cooldownSeconds ?? 60}s. Leave empty to connect directly. Passwords are masked
-            everywhere they are shown.
-          </CardDescription>
+          <CardDescription>{t("settings.proxiesDescription", { n: proxies?.cooldownSeconds ?? 60 })}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <textarea
@@ -746,8 +748,8 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             onChange={(event) => setProxyText(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Accepted: <span className="font-mono">{(proxies?.schemes ?? []).join(", ")}</span>. Use{" "}
-            <span className="font-mono">socks5h</span> to resolve DNS at the proxy.
+            {t("settings.accepted.schemes")} <span className="font-mono">{(proxies?.schemes ?? []).join(", ")}</span>.{" "}
+            {t("settings.use")} <span className="font-mono">socks5h</span> {t("settings.socksHint")}
           </p>
           {proxies && proxies.proxies.length > 0 && (
             <div className="space-y-1">
@@ -755,13 +757,13 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                 <div key={entry.url} className="flex items-center gap-2 text-xs">
                   <Badge variant="secondary">#{index + 1}</Badge>
                   <span className="font-mono">{entry.url}</span>
-                  {entry.cooling && <span className="text-destructive">cooling down</span>}
+                  {entry.cooling && <span className="text-destructive">{t("settings.coolingDown")}</span>}
                 </div>
               ))}
             </div>
           )}
           <Button onClick={saveProxies} disabled={isBusy}>
-            {busy === "proxies" ? "Saving..." : "Save proxies"}
+            {busy === "proxies" ? t("settings.saving") : t("settings.saveProxies")}
           </Button>
         </CardContent>
       </Card>
@@ -769,17 +771,14 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Waves size={16} aria-hidden /> Concurrency
+            <Waves size={16} aria-hidden /> {t("settings.concurrencyTitle")}
           </CardTitle>
-          <CardDescription>
-            Caps how many generation requests run at once. 0 means no cap. Holding a burst here is cheaper
-            than being rate limited upstream, which costs an account cooldown each time.
-          </CardDescription>
+          <CardDescription>{t("settings.concurrencyDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="space-y-1">
-              <Label htmlFor="max-conc">Total in flight</Label>
+              <Label htmlFor="max-conc">{t("settings.totalInFlight")}</Label>
               <Input
                 id="max-conc"
                 type="number"
@@ -791,7 +790,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="max-acct">Per account</Label>
+              <Label htmlFor="max-acct">{t("settings.perAccount")}</Label>
               <Input
                 id="max-acct"
                 type="number"
@@ -803,7 +802,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="queue-timeout">Queue wait (seconds)</Label>
+              <Label htmlFor="queue-timeout">{t("settings.queueWait")}</Label>
               <Input
                 id="queue-timeout"
                 type="number"
@@ -816,7 +815,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             </div>
           </div>
           <p className="text-xs text-muted-foreground">
-            A request that waits longer than the queue wait fails with 503 instead of hanging.
+            {t("settings.queueNote")}
           </p>
           <Button
             variant="secondary"
@@ -829,7 +828,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
               })
             }
           >
-            {busy === "tunables" ? "Saving..." : "Save limits"}
+            {busy === "tunables" ? t("settings.saving") : t("settings.saveLimits")}
           </Button>
         </CardContent>
       </Card>
@@ -837,33 +836,38 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Coins size={16} aria-hidden /> Kiro credit cost
+            <Coins size={16} aria-hidden /> {t("settings.costTitle")}
           </CardTitle>
           <CardDescription>{costNote}</CardDescription>
         </CardHeader>
         <CardContent>
           {/* 19 rows is a tall column on its own; split it once there is room. */}
           <div className="grid gap-x-8 lg:grid-cols-2">
-            {[costs.slice(0, Math.ceil(costs.length / 2)), costs.slice(Math.ceil(costs.length / 2))].map(
+            {[sortedCosts.slice(0, Math.ceil(sortedCosts.length / 2)), sortedCosts.slice(Math.ceil(sortedCosts.length / 2))].map(
               (half, index) => (
                 <Table key={index}>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Model</TableHead>
-                      <TableHead className="text-right">Multiplier</TableHead>
-                      <TableHead className="text-right">Context</TableHead>
+                      <TableHead>{t("settings.model")}</TableHead>
+                      <TableHead className="text-right">{t("settings.multiplier")}</TableHead>
+                      <TableHead className="text-right">{t("settings.context")}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {half.map((row) => (
                       <TableRow key={row.model}>
-                        <TableCell className="font-medium">{row.model}</TableCell>
+                        <TableCell className="font-medium">
+                          <span className="flex items-center gap-2">
+                            <ModelMark model={row.model} />
+                            {row.model}
+                          </span>
+                        </TableCell>
                         <TableCell className="text-right tabular-nums">
                           {row.multiplier}x
                           {row.longMultiplier !== null && row.longThresholdTokens !== null && (
                             <span className="text-muted-foreground">
                               {" "}
-                              · {row.longMultiplier}x above{" "}
+                              · {row.longMultiplier}x {t("settings.above")}{" "}
                               {(row.longThresholdTokens / 1000).toFixed(0)}K
                             </span>
                           )}
