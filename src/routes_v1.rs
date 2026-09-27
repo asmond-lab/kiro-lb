@@ -422,6 +422,7 @@ fn events_of(r: UpstreamResponse, ctx: &RequestCtx) -> EventStream {
     };
     let inner =
         stream_core::parse_kiro_stream(bytes, cfg.first_token_timeout, cfg.streaming_read_timeout);
+    let inner = stream_core::meter_generation(inner, ctx);
     Box::pin(async_stream::stream! {
         let _permits = permits;
         let mut inner = inner;

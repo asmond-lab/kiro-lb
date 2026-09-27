@@ -10,13 +10,15 @@ use std::sync::OnceLock;
 use crate::pyjson;
 use crate::utils::tool_call_id;
 
-const PATTERNS: [(&str, &str); 10] = [
+const PATTERNS: [(&str, &str); 12] = [
     ("{\"content\":", "content"),
     ("{\"name\":", "tool_start"),
     ("{\"input\":", "tool_input"),
     ("{\"stop\":", "tool_stop"),
     ("{\"followupPrompt\":", "followup"),
-    ("{\"usage\":", "usage"),
+    ("{\"unit\":", "metering"),
+    ("{\"usage\":", "metering"),
+    ("{\"amount\":", "metering"),
     ("{\"contextUsagePercentage\":", "context_usage"),
     ("{\"stopReason\":", "stop_reason"),
     ("{\"text\":", "native_thinking"),
@@ -28,6 +30,7 @@ pub enum ParsedEvent {
     Content(String),
     ToolUse(Value),
     Usage(Value),
+    Metering(MeteringEvent),
     ContextUsage(f64),
     StopReason(String),
     Thinking { text: String, is_first: bool },
@@ -40,6 +43,7 @@ impl ParsedEvent {
             ParsedEvent::Content(c) => json!({"type": "content", "data": c}),
             ParsedEvent::ToolUse(t) => json!({"type": "tool_use", "data": t}),
             ParsedEvent::Usage(u) => json!({"type": "usage", "data": u}),
+            ParsedEvent::Metering(m) => json!({"type": "usage", "data": m.raw()}),
             ParsedEvent::ContextUsage(p) => json!({"type": "context_usage", "data": p}),
             ParsedEvent::StopReason(r) => json!({"type": "stop_reason", "data": r}),
             ParsedEvent::Thinking { text, is_first } => {
@@ -49,6 +53,44 @@ impl ParsedEvent {
                 json!({"type": "native_thinking_signature", "data": s})
             }
         }
+    }
+}
+
+/// A validated Kiro `meteringEvent` payload. Metering values are snapshots for
+/// one upstream generation, not increments for every frame.
+#[derive(Debug, Clone)]
+pub struct MeteringEvent {
+    unit: String,
+    usage: f64,
+    raw: Value,
+}
+
+impl MeteringEvent {
+    pub fn parse(raw: Value) -> Option<Self> {
+        let object = raw.as_object()?;
+        let unit = object.get("unit")?.as_str()?.to_owned();
+        if object
+            .get("unitPlural")
+            .is_some_and(|value| !value.is_string())
+        {
+            return None;
+        }
+        let usage = object
+            .get("usage")
+            .or_else(|| object.get("amount"))?
+            .as_f64()?;
+        if !usage.is_finite() || usage < 0.0 {
+            return None;
+        }
+        Some(Self { unit, usage, raw })
+    }
+
+    pub fn credits(&self) -> Option<f64> {
+        matches!(self.unit.as_str(), "credit" | "credits").then_some(self.usage)
+    }
+
+    pub fn raw(&self) -> &Value {
+        &self.raw
     }
 }
 
@@ -199,7 +241,7 @@ impl AwsEventStreamParser {
         let bytes = buffer.as_bytes();
         let mut events = Vec::new();
         let mut pos = 0usize;
-        let mut next_hit: [Option<Option<usize>>; 10] = [None; 10];
+        let mut next_hit: [Option<Option<usize>>; 12] = [None; 12];
         let mut keep_from = None;
         loop {
             let (earliest_pos, kind, scan_from, depth, in_string);
@@ -297,9 +339,19 @@ impl AwsEventStreamParser {
                 None
             }
             "tool_stop" => self.stop_tool(&data),
-            "usage" => Some(ParsedEvent::Usage(
-                data.get("usage").cloned().unwrap_or(json!(0)),
-            )),
+            "metering" => {
+                let unit_bearing = data.get("unit").is_some() || data.get("amount").is_some();
+                match MeteringEvent::parse(data.clone()) {
+                    Some(event) => Some(ParsedEvent::Metering(event)),
+                    None if !unit_bearing => Some(ParsedEvent::Usage(
+                        data.get("usage").cloned().unwrap_or(json!(0)),
+                    )),
+                    None => {
+                        tracing::warn!("Ignored invalid Kiro metering event payload");
+                        None
+                    }
+                }
+            }
             "context_usage" => Some(ParsedEvent::ContextUsage(
                 data.get("contextUsagePercentage")
                     .and_then(Value::as_f64)

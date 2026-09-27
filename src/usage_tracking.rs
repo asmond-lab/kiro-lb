@@ -3,7 +3,6 @@
 //! flushed in batches so the data path never writes per request.
 
 use parking_lot::Mutex;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,7 +11,6 @@ use crate::model_resolver::normalize_model_name;
 
 pub const ROOT_KEY_ID: &str = "root";
 pub const UNKNOWN_ACCOUNT_ID: &str = "unknown";
-const CREDIT_FIELDS: [&str; 4] = ["creditUsage", "credit_usage", "creditsConsumed", "credits"];
 
 #[derive(Default, Debug, Clone)]
 pub struct RequestUsage {
@@ -59,23 +57,10 @@ impl RequestCtx {
         *self.account_id.lock() = Some(id.to_owned());
     }
 
-    pub fn report_credits(&self, amount: &Value) {
-        let raw = match amount {
-            Value::Object(o) => match CREDIT_FIELDS.iter().find_map(|f| o.get(*f)) {
-                Some(v) => v.clone(),
-                None => return,
-            },
-            other => other.clone(),
-        };
-        let value = match &raw {
-            Value::Number(n) => n.as_f64(),
-            Value::String(s) => s.trim().parse().ok(),
-            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            _ => None,
-        };
-        if let Some(v) = value.filter(|v| *v > 0.0) {
-            let mut u = self.usage.lock();
-            u.credits = Some(u.credits.unwrap_or(0.0) + v);
+    pub fn begin_generation(&self) -> GenerationCredits {
+        GenerationCredits {
+            usage: self.usage.clone(),
+            snapshot: None,
         }
     }
 
@@ -121,6 +106,25 @@ impl RequestCtx {
             entry[3] += (g * 1000.0) as i64;
             entry[4] += completion - 1;
         }
+    }
+}
+
+/// Credit snapshot reducer for one physical generation. A request can own
+/// several of these (for example, a search follow-up), whose final snapshots
+/// contribute additively to the request total.
+pub struct GenerationCredits {
+    usage: Arc<Mutex<RequestUsage>>,
+    snapshot: Option<f64>,
+}
+
+impl GenerationCredits {
+    pub fn report(&mut self, event: &crate::parser::MeteringEvent) {
+        let Some(next) = event.credits() else {
+            return;
+        };
+        let previous = self.snapshot.replace(next).unwrap_or(0.0);
+        let mut usage = self.usage.lock();
+        usage.credits = Some(usage.credits.unwrap_or(0.0) + next - previous);
     }
 }
 

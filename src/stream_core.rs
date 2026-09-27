@@ -8,8 +8,10 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::parser::{
-    deduplicate_tool_calls, parse_bracket_tool_calls, AwsEventStreamParser, ParsedEvent,
+    deduplicate_tool_calls, parse_bracket_tool_calls, AwsEventStreamParser, MeteringEvent,
+    ParsedEvent,
 };
+use crate::usage_tracking::RequestCtx;
 
 #[derive(Debug, Clone)]
 pub enum KiroEvent {
@@ -18,6 +20,7 @@ pub enum KiroEvent {
     ThinkingSignature(String),
     ToolUse(Value),
     Usage(Value),
+    Metering(MeteringEvent),
     ContextUsage(f64),
     StopReason(String),
 }
@@ -61,6 +64,7 @@ fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
     Ok(Some(match e {
         ParsedEvent::Content(c) => KiroEvent::Content(c),
         ParsedEvent::Usage(u) => KiroEvent::Usage(u),
+        ParsedEvent::Metering(m) => KiroEvent::Metering(m),
         ParsedEvent::ContextUsage(p) => KiroEvent::ContextUsage(p),
         ParsedEvent::StopReason(r) => KiroEvent::StopReason(r),
         ParsedEvent::Thinking { text, is_first } => {
@@ -126,6 +130,22 @@ pub fn parse_kiro_stream(
     })
 }
 
+/// Attributes metering to one physical upstream generation while leaving the
+/// event stream intact for protocol conversion. Each call establishes a new
+/// additive generation boundary; repeated frames inside it replace its latest
+/// snapshot.
+pub fn meter_generation(mut events: EventStream, request: &RequestCtx) -> EventStream {
+    let mut meter = request.begin_generation();
+    Box::pin(async_stream::stream! {
+        while let Some(event) = events.next().await {
+            if let Ok(KiroEvent::Metering(reading)) = &event {
+                meter.report(reading);
+            }
+            yield event;
+        }
+    })
+}
+
 #[derive(Default, Debug)]
 pub struct StreamResult {
     pub content: String,
@@ -134,6 +154,7 @@ pub struct StreamResult {
     pub content_blocks: Vec<Value>,
     pub tool_calls: Vec<Value>,
     pub usage: Option<Value>,
+    pub metering: Option<MeteringEvent>,
     pub context_usage_percentage: Option<f64>,
     pub stop_reason: Option<String>,
 }
@@ -187,6 +208,7 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     .push(json!({"type": "tool_use", "tool": t}));
             }
             KiroEvent::Usage(u) if !is_zero(&u) => r.usage = Some(u),
+            KiroEvent::Metering(m) => r.metering = Some(m),
             KiroEvent::ContextUsage(p) => r.context_usage_percentage = Some(p),
             KiroEvent::StopReason(s) if !s.is_empty() => r.stop_reason = Some(s),
             _ => {}

@@ -245,11 +245,11 @@ pub fn stream(
                         index += 1;
                     }
                     KiroEvent::ContextUsage(p) => context_usage = Some(p),
+                    KiroEvent::Metering(m) => {
+                        cache_usage.extend(cache_fields(m.raw()));
+                    }
                     KiroEvent::Usage(u) => {
-                        if !stream_core::is_zero(&u) {
-                            ctx.request.report_credits(&u);
-                            cache_usage.extend(cache_fields(&u));
-                        }
+                        cache_usage.extend(cache_fields(&u));
                     }
                     KiroEvent::StopReason(s) => if !s.is_empty() { stop_reason = Some(s) },
                 }
@@ -406,7 +406,12 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         let next = followup(id, query.clone(), web_search::summary(&query, &results)).await?;
         result = stream_core::collect(next).await?;
     }
-    let cache = result.usage.as_ref().map(cache_fields).unwrap_or_default();
+    let cache = result
+        .metering
+        .as_ref()
+        .map(|metering| cache_fields(metering.raw()))
+        .or_else(|| result.usage.as_ref().map(cache_fields))
+        .unwrap_or_default();
     let mut content = Vec::new();
     for b in &native {
         match b["type"].as_str() {

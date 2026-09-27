@@ -42,7 +42,7 @@ pub fn stream(
         let first = chunk(json!({"role": "assistant", "content": ""}), Value::Null);
         v.accept(Some(&first), false)?;
         yield data(&first);
-        let mut metering: Option<Value> = None;
+        let mut metering: Option<f64> = None;
         let mut context_usage: Option<f64> = None;
         let mut full = String::new();
         let mut thinking = String::new();
@@ -94,10 +94,12 @@ pub fn stream(
                     }
                     tools.push(tool);
                 }
-                KiroEvent::Usage(u) if !stream_core::is_zero(&u) => {
-                    ctx.request.report_credits(&u);
-                    metering = Some(u);
+                KiroEvent::Metering(m) => {
+                    if let Some(credits) = m.credits() {
+                        metering = Some(credits);
+                    }
                 }
+                KiroEvent::Usage(_) => {}
                 KiroEvent::ContextUsage(p) => context_usage = Some(p),
                 KiroEvent::StopReason(s) if !s.is_empty() => stop = Some(s),
                 _ => {}
@@ -160,8 +162,8 @@ pub fn stream(
         }
         let mut last = chunk(json!({}), json!(finish));
         last["usage"] = json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total});
-        if let Some(m) = metering {
-            last["usage"]["credits_used"] = m;
+        if let Some(credits) = metering {
+            last["usage"]["credits_used"] = json!(credits);
         }
         ctx.request.record_tokens(&ctx.model, prompt, completion, Some(&timer));
         v.accept(Some(&last), false)?;

@@ -1,8 +1,9 @@
 use futures_util::StreamExt;
 use kiro_lb::auth::{KiroAuth, Source};
 use kiro_lb::model_resolver::ModelInfoCache;
+use kiro_lb::parser::MeteringEvent;
 use kiro_lb::stream_anthropic::{self, SearchFollowup, StreamCtx};
-use kiro_lb::stream_core::{EventStream, KiroEvent, StreamError};
+use kiro_lb::stream_core::{self, EventStream, KiroEvent, StreamError};
 use kiro_lb::upstream::http::Transport;
 use kiro_lb::usage_tracking::RequestCtx;
 use serde_json::json;
@@ -125,6 +126,10 @@ fn answer() -> EventStream {
     ]))
 }
 
+fn metering(credits: f64) -> KiroEvent {
+    KiroEvent::Metering(MeteringEvent::parse(json!({"unit": "credit", "usage": credits})).unwrap())
+}
+
 fn failing() -> SearchFollowup {
     Arc::new(|_, _, _| Box::pin(async { Err(StreamError::UpstreamStatus(429)) }))
 }
@@ -233,4 +238,32 @@ async fn a_followup_answer_replaces_the_client_tool_call() {
             .any(|b| b["type"] == "text" && b["text"] == "answer"),
         "{v}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_followup_adds_its_physical_generation_credits() {
+    let request = RequestCtx::new(None);
+    let followup_request = request.clone();
+    let followup: SearchFollowup = Arc::new(move |_, _, _| {
+        let request = followup_request.clone();
+        Box::pin(async move {
+            let stream = Box::pin(futures_util::stream::iter(vec![
+                Ok(metering(0.02)),
+                Ok(KiroEvent::Content("answer".into())),
+                Ok(KiroEvent::StopReason("end_turn".into())),
+            ]));
+            Ok(stream_core::meter_generation(stream, &request))
+        })
+    });
+    let mut context = ctx(followup).await;
+    context.request = request.clone();
+    let first = Box::pin(futures_util::stream::iter(vec![
+        Ok(metering(0.03)),
+        Ok(search_call()),
+    ]));
+    let first = stream_core::meter_generation(first, &request);
+
+    stream_anthropic::collect(first, context).await.unwrap();
+
+    assert_eq!(request.usage.lock().credits, Some(0.05));
 }
