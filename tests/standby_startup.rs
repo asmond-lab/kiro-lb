@@ -22,7 +22,10 @@ fn free_port() -> u16 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standby_slot_serves_health_without_waiting_on_account_refresh() {
-    let dir = std::env::temp_dir().join(format!("kirolb-standby-startup-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "kirolb-standby-startup-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);

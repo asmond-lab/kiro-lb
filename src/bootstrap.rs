@@ -66,7 +66,8 @@ mod tests {
 
     #[test]
     fn an_environment_configured_deployment_writes_nothing() {
-        let dir = std::env::temp_dir().join(format!("kirolb-boot-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("kirolb-boot-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();

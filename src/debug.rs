@@ -13,29 +13,75 @@ use crate::stream_core::{AnthropicValidator, OpenAIValidator};
 
 const SENSITIVE_KEYS: &[&str] = &[
     "authorization",
+    "proxyauthorization",
+    "xapikey",
+    "apikey",
     "accesstoken",
     "refreshtoken",
-    "access_token",
-    "refresh_token",
+    "idtoken",
     "clientsecret",
-    "client_secret",
-    "password",
-    "x-api-key",
-    "api_key",
-    "apikey",
-    "signature",
     "cookie",
-    "set-cookie",
+    "setcookie",
+    "signature",
+    "thinkingsignature",
     "profilearn",
+    "password",
+    "token",
+    "secret",
+    "credential",
+    "privatekey",
+];
+
+const SENSITIVE_SUFFIXES: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "privatekey",
+    "accesskey",
+    "accesskeyid",
+    "secretaccesskey",
+    "session",
+    "sessionid",
+    "sessionkey",
+];
+
+/// With content capture off, only these keys keep their string values; every
+/// other string, at any depth, becomes a length-only marker. This is an
+/// allowlist on purpose: a denylist of content keys misses fields such as
+/// Responses `input` and `instructions` or arbitrary metadata.
+const STRUCTURAL_KEYS: &[&str] = &[
+    "type",
+    "role",
+    "model",
+    "modelid",
+    "name",
+    "id",
+    "tooluseid",
+    "toolcallid",
+    "callid",
+    "stopreason",
+    "finishreason",
+    "status",
+    "format",
+    "origin",
+    "chattriggertype",
+    "agentmode",
+    "event",
+    "object",
 ];
 
 fn patterns() -> &'static [Regex] {
     static P: OnceLock<Vec<Regex>> = OnceLock::new();
     P.get_or_init(|| {
         [
-            r"(?i)bearer\s+[A-Za-z0-9._\-~+/=]+",
-            r"klb_[A-Za-z0-9_\-]{8,}",
-            r"aoa[A-Za-z0-9_\-]{20,}",
+            r"(?i)\bbearer\s+[A-Za-z0-9._\-~+/=]+",
+            r"\bklb_[A-Za-z0-9_\-]{8,}",
+            r"\bapik_[A-Za-z0-9_\-]{8,}",
+            r"\baoa[A-Za-z0-9_\-]{20,}",
+            r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}",
+            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            r"(?i)[?&](?:key|token|signature|credential)=[^&#\s]+",
             r"arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile/[A-Za-z0-9]+",
         ]
         .iter()
@@ -52,35 +98,77 @@ pub fn redact_patterns(text: &str) -> String {
     out
 }
 
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 fn is_sensitive(key: &str) -> bool {
-    let k = key.to_lowercase().replace(['-', '_'], "");
-    SENSITIVE_KEYS
-        .iter()
-        .any(|s| s.replace(['-', '_'], "") == k)
+    let k = normalize_key(key);
+    SENSITIVE_KEYS.contains(&k.as_str()) || SENSITIVE_SUFFIXES.iter().any(|s| k.ends_with(s))
+}
+
+fn redacted_text(s: &str) -> Value {
+    json!({"$redacted_text": true, "chars": s.chars().count()})
+}
+
+fn is_binary(s: &str) -> bool {
+    s.len() >= 256
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b))
 }
 
 pub fn sanitize(v: &Value, keep_content: bool) -> Value {
+    sanitize_at(v, keep_content, None)
+}
+
+fn sanitize_at(v: &Value, keep_content: bool, key: Option<&str>) -> Value {
+    let normalized = key.map(normalize_key).unwrap_or_default();
+    if key.is_some_and(is_sensitive) {
+        return json!("[REDACTED]");
+    }
     match v {
         Value::Object(m) => Value::Object(
             m.iter()
-                .map(|(k, x)| {
-                    let val = if is_sensitive(k) {
-                        json!("[REDACTED]")
-                    } else if !keep_content
-                        && matches!(k.as_str(), "content" | "text" | "thinking")
-                        && x.is_string()
-                    {
-                        json!(format!("[{} chars]", x.as_str().unwrap().chars().count()))
-                    } else {
-                        sanitize(x, keep_content)
-                    };
-                    (k.clone(), val)
-                })
+                .map(|(k, x)| (k.clone(), sanitize_at(x, keep_content, Some(k))))
                 .collect(),
         ),
-        Value::Array(a) => Value::Array(a.iter().map(|x| sanitize(x, keep_content)).collect()),
-        Value::String(s) => json!(redact_patterns(s)),
+        Value::Array(a) => Value::Array(
+            a.iter()
+                .map(|x| sanitize_at(x, keep_content, key))
+                .collect(),
+        ),
+        Value::String(s) => {
+            if is_binary(s) && matches!(normalized.as_str(), "data" | "bytes") {
+                return json!("[REDACTED_BINARY]");
+            }
+            if let Ok(inner @ (Value::Object(_) | Value::Array(_))) =
+                serde_json::from_str::<Value>(s)
+            {
+                return json!(
+                    serde_json::to_string(&sanitize_at(&inner, keep_content, None))
+                        .unwrap_or_default()
+                );
+            }
+            if keep_content || STRUCTURAL_KEYS.contains(&normalized.as_str()) {
+                json!(redact_patterns(s))
+            } else {
+                redacted_text(s)
+            }
+        }
         other => other.clone(),
+    }
+}
+
+/// Error strings can quote upstream bodies that echo the prompt, so they get
+/// the same content rule as request fields.
+fn sanitize_error(error: &str, keep_content: bool) -> Value {
+    if error.is_empty() || keep_content {
+        json!(redact_patterns(error))
+    } else {
+        redacted_text(error)
     }
 }
 
@@ -157,7 +245,7 @@ impl Capture {
             })
             .collect();
         let bundle = json!({
-            "version": 1, "status": status, "error": redact_patterns(error), "capturedAt": crate::store::now_f64(),
+            "version": 1, "status": status, "error": sanitize_error(error, keep), "capturedAt": crate::store::now_f64(),
             "request": self.request, "kiroRequest": self.kiro_request, "records": records, "truncated": self.truncated,
         });
         if let Err(e) = write_bundle(&bundle) {
@@ -321,7 +409,90 @@ mod tests {
         let s = sanitize(&v, false);
         assert_eq!(s["headers"]["Authorization"], "[REDACTED]");
         assert_eq!(s["accessToken"], "[REDACTED]");
-        assert_eq!(s["messages"][0]["content"], "[5 chars]");
-        assert_eq!(s["note"], "key [REDACTED]");
+        assert_eq!(
+            s["messages"][0]["content"],
+            json!({"$redacted_text": true, "chars": 5})
+        );
+        assert_eq!(s["note"], json!({"$redacted_text": true, "chars": 24}));
+        let kept = sanitize(&v, true);
+        assert_eq!(kept["note"], "key [REDACTED]");
+        assert_eq!(kept["accessToken"], "[REDACTED]");
+    }
+
+    fn sentinels(v: &Value) -> Vec<String> {
+        let text = serde_json::to_string(v).unwrap();
+        [
+            "PRIVATE_A",
+            "PRIVATE_B",
+            "PRIVATE_C",
+            "PRIVATE_D",
+            "PRIVATE_E",
+        ]
+        .into_iter()
+        .filter(|s| text.contains(s))
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn content_off_redacts_every_non_structural_string() {
+        let shapes = [
+            json!({"model": "claude-sonnet-4.5", "input": "PRIVATE_A", "instructions": "PRIVATE_B", "metadata": {"note": "PRIVATE_C", "tags": ["PRIVATE_D"]}}),
+            json!({"model": "m", "messages": [{"role": "user", "content": [{"type": "text", "text": "PRIVATE_A"}]}], "user": "PRIVATE_B", "tools": [{"type": "function", "function": {"name": "f", "description": "PRIVATE_C", "parameters": {"properties": {"q": {"description": "PRIVATE_D"}}}}}]}),
+            json!({"model": "m", "system": [{"type": "text", "text": "PRIVATE_A"}], "messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "PRIVATE_B"}]}], "metadata": {"user_id": "PRIVATE_C"}}),
+            json!({"conversationState": {"currentMessage": {"userInputMessage": {"content": "PRIVATE_A", "modelId": "claude-sonnet-4.5", "origin": "AI_EDITOR", "userInputMessageContext": {"tools": [{"toolSpecification": {"name": "f", "description": "PRIVATE_B"}}], "toolResults": [{"toolUseId": "t1", "content": [{"text": "PRIVATE_C"}], "status": "success"}]}}}, "history": [{"assistantResponseMessage": {"content": "PRIVATE_D", "toolUses": [{"toolUseId": "t1", "name": "f", "input": {"q": "PRIVATE_E"}}]}}]}}),
+        ];
+        for shape in &shapes {
+            let s = sanitize(shape, false);
+            assert!(
+                sentinels(&s).is_empty(),
+                "leaked {:?} from {shape}",
+                sentinels(&s)
+            );
+        }
+        assert_eq!(sanitize(&shapes[0], false)["model"], "claude-sonnet-4.5");
+        let kiro = sanitize(&shapes[3], false);
+        let msg = &kiro["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(msg["modelId"], "claude-sonnet-4.5");
+        assert_eq!(
+            msg["userInputMessageContext"]["toolResults"][0]["status"],
+            "success"
+        );
+        assert_eq!(
+            kiro["conversationState"]["history"][0]["assistantResponseMessage"]["toolUses"][0]
+                ["name"],
+            "f"
+        );
+    }
+
+    #[test]
+    fn content_on_keeps_text_but_still_redacts_secrets() {
+        let v = json!({"input": "PRIVATE_A", "apiKey": "PRIVATE_B", "note": "Bearer abcdef123"});
+        let s = sanitize(&v, true);
+        assert_eq!(s["input"], "PRIVATE_A");
+        assert_eq!(s["apiKey"], "[REDACTED]");
+        assert_eq!(s["note"], "[REDACTED]");
+    }
+
+    #[test]
+    fn json_encoded_strings_are_sanitized_inside() {
+        let v = json!({"arguments": "{\"query\":\"PRIVATE_A\",\"token\":\"x\"}"});
+        let s = sanitize(&v, false);
+        assert!(sentinels(&s).is_empty());
+        let inner: Value = serde_json::from_str(s["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["token"], "[REDACTED]");
+    }
+
+    #[test]
+    fn error_text_follows_the_content_rule() {
+        assert_eq!(
+            sanitize_error("upstream said PRIVATE_A", false),
+            json!({"$redacted_text": true, "chars": 23})
+        );
+        assert_eq!(
+            sanitize_error("Bearer abcdef123 failed", true),
+            json!("[REDACTED] failed")
+        );
+        assert_eq!(sanitize_error("", false), json!(""));
     }
 }

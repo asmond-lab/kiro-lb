@@ -48,7 +48,7 @@ async fn cookie(app: &Router) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_disables_cannot_both_remove_the_last_account() {
-    let dir = std::env::temp_dir().join(format!("kirolb-mut-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("kirolb-mut-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);
     std::env::set_var("DASHBOARD_PASSWORD", "test-password");

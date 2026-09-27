@@ -234,8 +234,8 @@ impl Drop for RequestLogGuard {
             generation_ms: u.generation_ms,
             ttft_ms: u.ttft_ms,
         };
-        let capture = self.ctx.capture.take();
         let failed_stream = self.stream_failed();
+        let capture = self.ctx.capture.take();
         let write = move || {
             dashboard_store::record_request(record);
             if let Some(c) = capture {
