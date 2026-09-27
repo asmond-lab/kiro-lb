@@ -9,7 +9,7 @@ use kiro_lb::stream_openai::{self, OpenAIOptions};
 use kiro_lb::upstream::http::Transport;
 use kiro_lb::usage_tracking::RequestCtx;
 use serde_json::{json, Value};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, OnceLock};
 
 fn reading(value: Value) -> MeteringEvent {
     MeteringEvent::parse(value).expect("valid metering event")
@@ -32,6 +32,7 @@ fn metered(request: &RequestCtx, items: Vec<Result<KiroEvent, StreamError>>) -> 
 }
 
 fn context(request: RequestCtx) -> StreamCtx {
+    initialize_store();
     let http = reqwest::Client::new();
     StreamCtx {
         model: "claude-sonnet-4.5".into(),
@@ -185,16 +186,23 @@ async fn error_and_disconnect_retain_the_latest_observed_snapshot() {
 }
 
 fn initialize_store() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
+    static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let data_dir = DATA_DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!(
             "kirolb-credit-metering-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("DASHBOARD_DATA_DIR", dir);
+        std::env::set_var("DASHBOARD_DATA_DIR", &dir);
         kiro_lb::store::initialize().unwrap();
+        dir
     });
+    let expected = data_dir.join(kiro_lb::store::DB_FILENAME);
+    let actual = kiro_lb::store::path();
+    assert_eq!(
+        actual, expected,
+        "credit metering tests must use their isolated SQLite store"
+    );
 }
 
 #[tokio::test]
@@ -261,7 +269,10 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
     ));
 
     let request_credits = request.usage.lock().credits.unwrap();
-    assert!((request_credits - 0.1125).abs() < f64::EPSILON * 4.0);
+    assert!(
+        (request_credits - 0.1125).abs() < f64::EPSILON * 4.0,
+        "aggregate credit mismatch: expected 0.1125, actual {request_credits}"
+    );
     assert_eq!(kiro_lb::dashboard_store::flush_key_model_usage(), 4);
     let rows = kiro_lb::store::with(|connection| {
         let mut statement = connection.prepare(
@@ -285,8 +296,13 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
             "account-zero"
         ]
     );
-    for ((_, actual), expected) in rows.iter().zip([0.0125, 0.03, 0.07, 0.0]) {
-        assert!((actual.unwrap() - expected).abs() < f64::EPSILON * 4.0);
+    for ((account, actual), expected) in rows.iter().zip([0.0125, 0.03, 0.07, 0.0]) {
+        let actual =
+            actual.unwrap_or_else(|| panic!("missing credits for {account}; rows={rows:?}"));
+        assert!(
+            (actual - expected).abs() < f64::EPSILON * 4.0,
+            "credit mismatch for {account}: expected {expected}, actual {actual}; rows={rows:?}"
+        );
     }
 }
 
