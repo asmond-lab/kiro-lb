@@ -222,6 +222,9 @@ fn proxy_attempt_order() -> Vec<String> {
 pub fn build_client(proxy: Option<&str>) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs_f64(
+            config::get().streaming_read_timeout.max(1.0),
+        ))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kiro_lb::app::{self, AppState};
+use kiro_lb::app::{self, cors_preflight, AppState};
 use kiro_lb::pool::AccountManager;
 use kiro_lb::routes_dashboard as d;
 use kiro_lb::routes_v1 as v1;
@@ -52,20 +52,6 @@ async fn static_file(uri: Uri) -> Response {
     }
 }
 
-async fn cors_preflight() -> Response {
-    Response::builder()
-        .status(200)
-        .header("access-control-allow-origin", "*")
-        .header(
-            "access-control-allow-methods",
-            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-        )
-        .header("access-control-allow-headers", "*")
-        .header("access-control-max-age", "600")
-        .body(Body::empty())
-        .unwrap()
-}
-
 fn router(state: app::Shared) -> Router {
     Router::new()
         .route("/v1/messages", post(v1::messages).options(cors_preflight))
@@ -78,8 +64,8 @@ fn router(state: app::Shared) -> Router {
             post(v1::chat_completions).options(cors_preflight),
         )
         .route("/v1/responses", post(v1::responses).options(cors_preflight))
-        .route("/v1/models", get(v1::models))
-        .route("/v1/models/{id}", get(v1::model))
+        .route("/v1/models", get(v1::models).options(cors_preflight))
+        .route("/v1/models/{id}", get(v1::model).options(cors_preflight))
         .route("/health", get(v1::health))
         .route("/healthz", get(v1::healthz))
         .route("/docs", get(kiro_lb::docs::swagger))

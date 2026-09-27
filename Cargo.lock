@@ -858,6 +858,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "unicode-general-category",

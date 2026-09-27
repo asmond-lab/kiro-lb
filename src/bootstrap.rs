@@ -28,8 +28,12 @@ pub struct Generated {
     pub password: String,
 }
 
+fn configured_by_environment() -> bool {
+    std::env::var("PROXY_API_KEY").is_ok_and(|v| !v.trim().is_empty())
+}
+
 pub fn ensure_env() -> std::io::Result<Option<Generated>> {
-    if dotenvy::dotenv().is_ok() {
+    if dotenvy::dotenv().is_ok() || configured_by_environment() {
         return Ok(None);
     }
     let dir = std::env::current_dir()?;
@@ -54,4 +58,25 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     }
     use std::io::Write;
     opts.open(path)?.write_all(contents.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_environment_configured_deployment_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("kirolb-boot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        std::env::set_var("PROXY_API_KEY", "from-environment");
+        let generated = ensure_env().unwrap();
+        let wrote = dir.join(".env").exists() || dir.join(".env.example").exists();
+        std::env::set_current_dir(previous).unwrap();
+        std::env::remove_var("PROXY_API_KEY");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(generated.is_none());
+        assert!(!wrote);
+    }
 }

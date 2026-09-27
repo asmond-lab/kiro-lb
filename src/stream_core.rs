@@ -28,6 +28,14 @@ pub enum StreamError {
     Protocol(&'static str),
     MalformedToolInput,
     Upstream(String),
+    UpstreamStatus(u16),
+    Terminal,
+}
+
+impl StreamError {
+    pub fn is_rate_limit(&self) -> bool {
+        matches!(self, StreamError::UpstreamStatus(429))
+    }
 }
 
 impl std::fmt::Display for StreamError {
@@ -37,6 +45,8 @@ impl std::fmt::Display for StreamError {
             StreamError::Protocol(m) => f.write_str(m),
             StreamError::MalformedToolInput => f.write_str("Malformed upstream tool input"),
             StreamError::Upstream(m) => f.write_str(m),
+            StreamError::UpstreamStatus(s) => write!(f, "Upstream API error ({s})"),
+            StreamError::Terminal => f.write_str("Stream ended with a protocol failure event"),
         }
     }
 }

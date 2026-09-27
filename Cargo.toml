@@ -47,6 +47,9 @@ winresource = "=0.1.23"
 [dev-dependencies]
 hex = "=0.4.3"
 flate2 = "1"
+tower = { version = "=0.5.3", features = ["util"] }
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3

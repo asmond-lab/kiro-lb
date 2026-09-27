@@ -218,10 +218,14 @@ pub async fn create_key(headers: HeaderMap, body: Bytes) -> Response {
                 .unwrap_or_else(|| n.to_string())
         })
         .unwrap_or_default();
-    let (raw, meta) = tokio::task::spawn_blocking(move || ds::create_data_api_key(&name))
-        .await
-        .unwrap();
-    json_response(200, json!({"apiKey": raw, "metadata": meta}))
+    match tokio::task::spawn_blocking(move || ds::create_data_api_key(&name)).await {
+        Ok(Ok((raw, meta))) => json_response(200, json!({"apiKey": raw, "metadata": meta})),
+        Ok(Err(e)) => {
+            tracing::error!("Could not persist API key: {e}");
+            detail(500, "Could not create API key")
+        }
+        Err(_) => detail(500, "Could not create API key"),
+    }
 }
 
 pub async fn delete_key(headers: HeaderMap, Path(id): Path<String>) -> Response {

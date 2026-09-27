@@ -41,6 +41,20 @@ pub fn json_response(status: u16, body: Value) -> Response {
     r
 }
 
+pub async fn cors_preflight() -> Response {
+    Response::builder()
+        .status(200)
+        .header("access-control-allow-origin", "*")
+        .header(
+            "access-control-allow-methods",
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        )
+        .header("access-control-allow-headers", "*")
+        .header("access-control-max-age", "600")
+        .body(Body::empty())
+        .unwrap()
+}
+
 pub fn detail(status: u16, message: impl Into<String>) -> Response {
     json_response(status, json!({"detail": message.into()}))
 }

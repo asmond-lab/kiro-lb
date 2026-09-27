@@ -432,8 +432,7 @@ fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
                     match retry.state.transport.generate(&retry.auth, retry.body.clone(), &retry.model_id, true, false).await {
                         Ok(r) if r.status == 200 => current = events_of(r),
                         Ok(r) => {
-                            let status = r.status;
-                            yield Err(StreamError::Upstream(format!("Upstream API error ({status})")));
+                            yield Err(StreamError::UpstreamStatus(r.status));
                             return;
                         }
                         Err(e) => {
@@ -469,14 +468,18 @@ fn stream_failure(protocol: Protocol, e: StreamError) -> Response {
 /// upstream (long thinking, a large tool call) as a dropped connection.
 const KEEPALIVE_SECONDS: u64 = 10;
 
-fn sse_response(
-    s: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>>,
-    pool: Arc<pool::AccountManager>,
-    account_id: String,
-    model: String,
-    protocol: Protocol,
-) -> Response {
-    let body = async_stream::stream! {
+type ChunkStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>>;
+
+/// Frames a chunk stream as SSE with keepalives and calls `on_end` once with
+/// whether the turn succeeded. A protocol failure event (`Terminal`) or any
+/// error counts as a failure, so it never credits the account.
+pub fn sse_body(
+    s: ChunkStream,
+    anthropic: bool,
+    on_end: impl FnOnce(bool) + Send + 'static,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
         let mut s = s;
         let mut failed = false;
         let keepalive = Duration::from_secs(KEEPALIVE_SECONDS);
@@ -485,14 +488,10 @@ fn sse_response(
                 Ok(Some(item)) => item,
                 Ok(None) => break,
                 Err(_) => {
-                    let ping = match protocol {
-                        Protocol::Anthropic => "event: ping
-data: {\"type\": \"ping\"}
-
-",
-                        Protocol::OpenAI => ": keepalive
-
-",
+                    let ping = if anthropic {
+                        "event: ping\ndata: {\"type\": \"ping\"}\n\n"
+                    } else {
+                        ": keepalive\n\n"
                     };
                     yield Ok::<Bytes, std::io::Error>(Bytes::from_static(ping.as_bytes()));
                     continue;
@@ -500,10 +499,14 @@ data: {\"type\": \"ping\"}
             };
             match item {
                 Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
+                Err(StreamError::Terminal) => {
+                    failed = true;
+                    break;
+                }
                 Err(e) => {
                     failed = true;
                     tracing::error!("HTTP 500 - streaming - {e}");
-                    if protocol == Protocol::Anthropic {
+                    if anthropic {
                         let ev = format!("event: error\ndata: {}\n\n", json!({"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}));
                         yield Ok(Bytes::from(ev));
                     }
@@ -511,11 +514,23 @@ data: {\"type\": \"ping\"}
                 }
             }
         }
-        if !failed {
+        on_end(!failed);
+    }
+}
+
+fn sse_response(
+    s: ChunkStream,
+    pool: Arc<pool::AccountManager>,
+    account_id: String,
+    model: String,
+    protocol: Protocol,
+) -> Response {
+    let body = sse_body(s, protocol == Protocol::Anthropic, move |ok| {
+        if ok {
             pool.report_success(&account_id, &model);
             tracing::info!("HTTP 200 - {model} (streaming) - completed");
         }
-    };
+    });
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream; charset=utf-8")

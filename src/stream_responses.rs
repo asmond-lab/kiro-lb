@@ -48,8 +48,14 @@ pub fn translate(
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Responses stream failed while translating: {e}");
-                    let env = response_envelope(&response_id, &model, "failed", vec![], None, None, json!({"code": "server_error", "message": "Internal server error"}));
+                    let error = if e.is_rate_limit() {
+                        json!({"code": "rate_limit_exceeded", "message": "Rate limit exceeded. Please retry after a short wait."})
+                    } else {
+                        json!({"code": "server_error", "message": "Internal server error"})
+                    };
+                    let env = response_envelope(&response_id, &model, "failed", vec![], None, None, error);
                     yield Ok(sse("response.failed", json!({"sequence_number": next(), "response": env})));
+                    yield Err(StreamError::Terminal);
                     return;
                 }
             };
@@ -148,4 +154,51 @@ pub fn translate(
         let env = response_envelope(&response_id, &model, "completed", output, Some(usage_block(usage.as_ref())), None, Value::Null);
         yield Ok(sse("response.completed", json!({"sequence_number": next(), "response": env})));
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(err: StreamError) -> Vec<Result<String, StreamError>> {
+        let chat: Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>> =
+            Box::pin(futures_util::stream::iter(vec![Err(err)]));
+        let out = translate(chat, "m".into(), "resp_1".into(), HashSet::new());
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(out.collect::<Vec<_>>())
+    }
+
+    fn failed_code(items: &[Result<String, StreamError>]) -> String {
+        let failed = items
+            .iter()
+            .filter_map(|i| i.as_ref().ok())
+            .find(|s| s.starts_with("event: response.failed"))
+            .expect("response.failed");
+        let data = failed
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap();
+        let v: Value = serde_json::from_str(data).unwrap();
+        v["response"]["error"]["code"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn upstream_429_keeps_the_rate_limit_code() {
+        let items = run(StreamError::UpstreamStatus(429));
+        assert_eq!(failed_code(&items), "rate_limit_exceeded");
+    }
+
+    #[test]
+    fn other_failures_stay_server_error() {
+        let items = run(StreamError::MalformedToolInput);
+        assert_eq!(failed_code(&items), "server_error");
+    }
+
+    #[test]
+    fn a_failed_turn_ends_with_a_terminal_error() {
+        let items = run(StreamError::UpstreamStatus(429));
+        assert!(matches!(items.last(), Some(Err(StreamError::Terminal))));
+    }
 }

@@ -345,7 +345,7 @@ pub async fn identify_async(value: String) -> Option<String> {
         .flatten()
 }
 
-pub fn create_data_api_key(name: &str) -> (String, Value) {
+pub fn create_data_api_key(name: &str) -> rusqlite::Result<(String, Value)> {
     use base64::Engine;
     use rand::RngCore;
     let mut raw = [0u8; 32];
@@ -367,17 +367,17 @@ pub fn create_data_api_key(name: &str) -> (String, Value) {
         name.trim().to_owned()
     };
     let hash = hash_key(&raw_key, &salt);
-    let _ = store::with(|c| {
+    store::with(|c| {
         c.execute(
             "INSERT INTO api_keys(id, name, key_prefix, salt, key_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![key_id, name, prefix, salt.to_vec(), hash, created],
         )
-    });
+    })?;
     invalidate_key_cache();
-    (
+    Ok((
         raw_key,
         json!({"id": key_id, "name": name, "prefix": prefix, "createdAt": created, "revokedAt": null}),
-    )
+    ))
 }
 
 pub fn list_data_api_keys() -> Vec<Value> {
