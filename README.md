@@ -108,11 +108,14 @@ kirolb client diagnose --base-url http://127.0.0.1:8000
 Plaintext HTTP is accepted only for `localhost` and loopback IP addresses. If
 `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, or `all_proxy` is set, setup also
 requires an unambiguous `NO_PROXY`/`no_proxy` entry for that exact loopback host
-(or `*`) in both the setup environment and the environment used to start the
-client. Preserved Claude Code `env` overrides are included in this check. The
-read-only diagnostic always connects directly for plaintext loopback, so its
-success alone does not prove that a generated client will bypass a proxy. Use
-HTTPS for remote gateways so the bearer key is not sent in cleartext.
+in bare form (for example, `127.0.0.1` or `::1`) in both the setup environment
+and the environment used to start the client. Port-qualified, bracketed,
+wildcard, and case-variant entries are rejected because their behavior is not
+consistent across clients. Preserved Claude Code `env` overrides are included
+in this check. The read-only diagnostic always connects directly for plaintext
+loopback, so its success alone does not prove that a generated client will
+bypass a proxy. Use HTTPS for remote gateways so the bearer key is not sent in
+cleartext.
 
 For Codex, setup writes the dedicated profile
 `$CODEX_HOME/kirolb.config.toml` (normally

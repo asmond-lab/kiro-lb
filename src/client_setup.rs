@@ -504,30 +504,7 @@ fn no_proxy_covers(value: &str, base_url: &Url) -> bool {
         .host_str()
         .expect("validated base URL")
         .trim_matches(['[', ']']);
-    let port = base_url.port_or_known_default();
-    value.split(',').any(|entry| {
-        let entry = entry.trim();
-        if entry == "*" || entry.eq_ignore_ascii_case(host) {
-            return true;
-        }
-        if let Some(bracketed) = entry.strip_prefix('[') {
-            let Some((candidate, suffix)) = bracketed.split_once(']') else {
-                return false;
-            };
-            return candidate.eq_ignore_ascii_case(host)
-                && (suffix.is_empty()
-                    || suffix
-                        .strip_prefix(':')
-                        .and_then(|value| value.parse::<u16>().ok())
-                        == port);
-        }
-        let Some((candidate, candidate_port)) = entry.rsplit_once(':') else {
-            return false;
-        };
-        !candidate.contains(':')
-            && candidate.eq_ignore_ascii_case(host)
-            && candidate_port.parse::<u16>().ok() == port
-    })
+    value.split(',').any(|entry| entry.trim() == host)
 }
 
 fn plan_install(
@@ -2040,6 +2017,23 @@ mod tests {
         assert!(
             validate_client_runtime_proxy(ClientKind::Claude, &https, Some(&conflicting)).is_ok()
         );
+    }
+
+    #[test]
+    fn proxy_bypass_rejects_unproven_host_forms() {
+        let ipv4 = Url::parse("http://127.0.0.1:8000/").unwrap();
+        assert!(no_proxy_covers("localhost, 127.0.0.1", &ipv4));
+        assert!(!no_proxy_covers("127.0.0.1:8000", &ipv4));
+        assert!(!no_proxy_covers("*", &ipv4));
+
+        let ipv6 = Url::parse("http://[::1]:8000/").unwrap();
+        assert!(no_proxy_covers("::1", &ipv6));
+        assert!(!no_proxy_covers("[::1]", &ipv6));
+        assert!(!no_proxy_covers("[::1]:8000", &ipv6));
+
+        let localhost = Url::parse("http://localhost:8000/").unwrap();
+        assert!(no_proxy_covers("localhost", &localhost));
+        assert!(!no_proxy_covers("LOCALHOST", &localhost));
     }
 
     #[test]
