@@ -559,7 +559,7 @@ impl AccountManager {
         }
         let cfg = &a.config;
         let region = match cfg.get("region") {
-            None => config::REGION.to_owned(),
+            None | Some(Value::Null) => config::REGION.to_owned(),
             Some(Value::String(region)) => region.clone(),
             Some(_) => {
                 tracing::error!(
@@ -570,7 +570,7 @@ impl AccountManager {
             }
         };
         let api_region = match cfg.get("api_region") {
-            None => None,
+            None | Some(Value::Null) => None,
             Some(Value::String(region)) => Some(region.clone()),
             Some(_) => {
                 tracing::error!(
