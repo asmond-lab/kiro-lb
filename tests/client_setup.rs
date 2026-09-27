@@ -526,36 +526,56 @@ fn setup_rejects_unusable_model_discovery_without_writing_configuration() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn setup_rejects_oversized_model_discovery_without_writing_configuration() {
-    let home = TestHome::new();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        for (index, stream) in listener.incoming().take(2).enumerate() {
-            let mut stream = stream.unwrap();
-            let mut request = [0; 2048];
-            let _ = stream.read(&mut request);
-            let body = if index == 0 {
-                r#"{"status":"healthy"}"#.to_owned()
-            } else {
-                format!(r#"{{"data":[{{"id":"{}"}}]}}"#, "x".repeat(1024 * 1024))
-            };
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+fn setup_enforces_the_model_discovery_size_boundary_before_writing() {
+    const LIMIT: usize = 1024 * 1024;
+    for (size, content_length, succeeds) in [
+        (LIMIT + 1, true, false),
+        (LIMIT + 1, false, false),
+        (LIMIT, false, true),
+    ] {
+        let home = TestHome::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (index, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request);
+                let mut body = if index == 0 {
+                    r#"{"status":"healthy"}"#.to_owned()
+                } else {
+                    r#"{"data":[{"id":"model"}]}"#.to_owned()
+                };
+                if index == 1 {
+                    body.push_str(&" ".repeat(size - body.len()));
+                }
+                let length = if index == 0 || content_length {
+                    format!("content-length: {}\r\n", body.len())
+                } else {
+                    String::new()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{length}connection: close\r\n\r\n{body}"
+                );
+            }
+        });
+
+        let output = setup(&home, &url, "all");
+
+        server.join().unwrap();
+        assert_eq!(output.status.success(), succeeds, "{}", text(&output));
+        if succeeds {
+            assert!(home.codex().exists());
+            assert!(home.claude().exists());
+            assert!(home.state().exists());
+        } else {
+            assert!(text(&output).contains("exceeds the 1 MiB diagnostic limit"));
+            assert!(!home.codex().exists());
+            assert!(!home.claude().exists());
+            assert!(!home.state().exists());
         }
-    });
-
-    let output = setup(&home, &url, "all");
-
-    server.join().unwrap();
-    assert!(!output.status.success());
-    assert!(text(&output).contains("exceeds the 1 MiB diagnostic limit"));
-    assert!(!home.codex().exists());
-    assert!(!home.claude().exists());
-    assert!(!home.state().exists());
+    }
 }
 
 #[cfg(target_os = "linux")]
