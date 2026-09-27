@@ -4,6 +4,7 @@
 
 use parking_lot::Mutex;
 use regex::Regex;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -205,7 +206,7 @@ impl Creds {
         }
         if let Some(v) = data.get("profileArn") {
             self.profile_arn = v.as_str().map(str::to_owned);
-            self.invalid_profile_arn_type = !v.is_string();
+            self.invalid_profile_arn_type = !v.is_string() && !v.is_null();
         }
         if let Some(region) = data.get("region") {
             match region.as_str() {
@@ -262,36 +263,68 @@ impl Creds {
         }
     }
 
-    fn replace_sqlite(&mut self, db_path: &str) {
+    fn replace_sqlite(&mut self, db_path: &str) -> bool {
         let mut fresh = Creds::default();
-        fresh.load_sqlite(db_path);
-        *self = fresh;
+        if fresh.load_sqlite(db_path) {
+            *self = fresh;
+            true
+        } else {
+            false
+        }
     }
 
-    fn load_sqlite(&mut self, db_path: &str) {
+    fn load_sqlite(&mut self, db_path: &str) -> bool {
         let path = PathBuf::from(store::expand_home(db_path));
         if !path.exists() {
             tracing::warn!("SQLite database not found: {db_path}");
-            return;
+            return false;
         }
         let Ok(conn) = rusqlite::Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ) else {
             tracing::error!("SQLite error loading credentials from {db_path}");
-            return;
+            return false;
         };
-        let get = |key: &str| -> Option<Value> {
-            conn.query_row("SELECT value FROM auth_kv WHERE key = ?1", [key], |r| {
-                r.get::<_, String>(0)
+        if conn
+            .prepare("SELECT value FROM auth_kv WHERE key = ?1")
+            .is_err()
+        {
+            tracing::error!("SQLite credential table is unavailable in {db_path}");
+            return false;
+        }
+        let get = |key: &str| -> Result<Option<Value>, ()> {
+            let raw = conn
+                .query_row("SELECT value FROM auth_kv WHERE key = ?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| {
+                    tracing::error!("SQLite error reading credential key {key}: {e}");
+                })?;
+            raw.map(|text| {
+                serde_json::from_str(&text).map_err(|e| {
+                    tracing::error!("SQLite credential key {key} contains invalid JSON: {e}");
+                })
             })
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
+            .transpose()
+        };
+        let first = |keys: &[&str]| -> Result<Option<Value>, ()> {
+            for key in keys {
+                if let Some(value) = get(key)? {
+                    return Ok(Some(value));
+                }
+            }
+            Ok(None)
         };
         let mut invalid_region_type = None;
         let mut invalid_profile_arn_type = None;
         let mut token_region_loaded = false;
-        if let Some(token) = SQLITE_TOKEN_KEYS.iter().find_map(|k| get(k)) {
+        let token = match first(&SQLITE_TOKEN_KEYS) {
+            Ok(token) => token,
+            Err(()) => return false,
+        };
+        if let Some(token) = token {
             if let Some(v) = s(&token, "access_token") {
                 self.access_token = Some(v);
             }
@@ -299,7 +332,7 @@ impl Creds {
                 self.refresh_token = Some(v);
             }
             if let Some(profile_arn) = token.get("profile_arn") {
-                invalid_profile_arn_type = Some(profile_arn.as_str().is_none());
+                invalid_profile_arn_type = Some(!profile_arn.is_string() && !profile_arn.is_null());
                 match profile_arn.as_str() {
                     Some(v) => self.profile_arn = Some(v.to_owned()),
                     None => self.profile_arn = None,
@@ -317,7 +350,11 @@ impl Creds {
                 self.expires_at = parse_iso(&e).or(self.expires_at);
             }
         }
-        if let Some(reg) = SQLITE_REGISTRATION_KEYS.iter().find_map(|k| get(k)) {
+        let registration = match first(&SQLITE_REGISTRATION_KEYS) {
+            Ok(registration) => registration,
+            Err(()) => return false,
+        };
+        if let Some(reg) = registration {
             if let Some(v) = s(&reg, "client_id") {
                 self.client_id = Some(v);
             }
@@ -360,6 +397,7 @@ impl Creds {
                 self.detected_api_region = Some(r);
             }
         }
+        true
     }
 }
 
@@ -436,7 +474,7 @@ impl KiroAuth {
         api_region: Option<&str>,
         http: reqwest::Client,
     ) -> Result<KiroAuth, AuthError> {
-        let c = Self::read_source(&source);
+        let c = Self::read_source(&source).unwrap_or_default();
         let source_fingerprint = source_fingerprint(&c);
         let login_identity = Self::bind_source_creds(&source, &c);
         let mut auth = KiroAuth {
@@ -484,7 +522,7 @@ impl KiroAuth {
     /// lineage. This lets startup restore matching state before lazy auth and
     /// model initialization performs any network I/O.
     pub fn bind_source_login(source: &Source) -> Option<String> {
-        let creds = Self::read_source(source);
+        let creds = Self::read_source(source)?;
         Self::bind_source_creds(source, &creds)
     }
 
@@ -499,22 +537,29 @@ impl KiroAuth {
         )
     }
 
-    fn read_source(source: &Source) -> Creds {
+    fn read_source(source: &Source) -> Option<Creds> {
         let mut c = Creds::default();
         match source {
             Source::Internal(id) => {
                 c.replace_document(&store::load_internal_credential(id).unwrap_or(json!({})))
             }
-            Source::Sqlite(p) => c.replace_sqlite(p),
+            Source::Sqlite(p) => {
+                if !c.replace_sqlite(p) {
+                    return None;
+                }
+            }
             Source::File(p) => match std::fs::read_to_string(store::expand_home(p))
                 .ok()
                 .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             {
                 Some(d) => c.replace_document(&d),
-                None => tracing::warn!("Credentials file not found: {p}"),
+                None => {
+                    tracing::warn!("Credentials file not found or invalid: {p}");
+                    return None;
+                }
             },
         }
-        c
+        Some(c)
     }
 
     fn source_account_id(source: &Source) -> Option<String> {
@@ -578,7 +623,9 @@ impl KiroAuth {
     }
 
     pub fn is_current_login(&self) -> bool {
-        let current = Self::read_source(&self.source);
+        let Some(current) = Self::read_source(&self.source) else {
+            return false;
+        };
         if let Some(stable) = stable_login_identity(&current) {
             return self.login_identity.as_deref() == Some(stable.as_str());
         }
@@ -818,7 +865,9 @@ impl KiroAuth {
         if matches!(self.source, Source::Internal(_)) {
             return false;
         }
-        let fresh = Self::read_source(&self.source);
+        let Some(fresh) = Self::read_source(&self.source) else {
+            return false;
+        };
         if !self.creds_match_login(&fresh) {
             return false;
         }
@@ -847,7 +896,9 @@ impl KiroAuth {
                 }
             }
             Source::File(_) | Source::Sqlite(_) => {
-                let fresh = Self::read_source(&self.source);
+                let Some(fresh) = Self::read_source(&self.source) else {
+                    return false;
+                };
                 if !self.creds_match_login(&fresh) {
                     return false;
                 }
@@ -1144,7 +1195,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let mut reloaded = Creds::default();
-        reloaded.replace_sqlite(path.to_str().unwrap());
+        assert!(reloaded.replace_sqlite(path.to_str().unwrap()));
         assert!(validate_credential_regions(&reloaded).is_err());
         let (http, listener) = recording_client();
 
@@ -1172,11 +1223,14 @@ mod tests {
         .unwrap();
         conn.execute(
             "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
-            rusqlite::params![json!({}).to_string(), SQLITE_TOKEN_KEYS[0]],
+            rusqlite::params![
+                json!({"profile_arn": null}).to_string(),
+                SQLITE_TOKEN_KEYS[0]
+            ],
         )
         .unwrap();
         drop(conn);
-        reloaded.replace_sqlite(path.to_str().unwrap());
+        assert!(reloaded.replace_sqlite(path.to_str().unwrap()));
         assert_eq!(reloaded.sso_region.as_deref(), Some("us-iso-east-1"));
         assert!(!reloaded.invalid_region_type);
         assert!(!reloaded.invalid_profile_arn_type);
@@ -1192,7 +1246,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        reloaded.replace_sqlite(path.to_str().unwrap());
+        assert!(reloaded.replace_sqlite(path.to_str().unwrap()));
         assert!(reloaded.sso_region.is_none());
         assert!(!reloaded.invalid_region_type);
         assert!(validate_credential_regions(&reloaded).is_ok());
@@ -1255,5 +1309,78 @@ mod tests {
         }));
 
         assert!(validate_credential_regions(&creds).is_ok());
+    }
+
+    #[test]
+    fn null_optional_profile_arn_is_absent_not_malformed() {
+        let mut creds = Creds::default();
+        creds.replace_document(&json!({"profileArn": null, "region": "us-east-1"}));
+
+        assert!(creds.profile_arn.is_none());
+        assert!(!creds.invalid_profile_arn_type);
+        assert!(validate_credential_regions(&creds).is_ok());
+    }
+
+    #[test]
+    fn failed_sqlite_reload_preserves_last_good_snapshot() {
+        let mut creds = Creds::default();
+        creds.replace_document(&json!({
+            "accessToken": "cached-access",
+            "refreshToken": "cached-refresh",
+            "region": "us-gov-west-1"
+        }));
+        let missing = temp_path("missing-sqlite", "credentials.sqlite");
+
+        assert!(!creds.replace_sqlite(missing.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+
+        let directory = temp_path("unopenable-sqlite", "directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(!creds.replace_sqlite(directory.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+        std::fs::remove_dir(directory).unwrap();
+
+        let incomplete = temp_path("incomplete-sqlite", "credentials.sqlite");
+        drop(rusqlite::Connection::open(&incomplete).unwrap());
+        assert!(!creds.replace_sqlite(incomplete.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+        std::fs::remove_file(incomplete).unwrap();
+
+        let malformed = temp_path("malformed-sqlite", "credentials.sqlite");
+        let conn = rusqlite::Connection::open(&malformed).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv(key, value) VALUES (?1, ?2)",
+            rusqlite::params![SQLITE_TOKEN_KEYS[0], "not-json"],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!creds.replace_sqlite(malformed.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+
+        let conn = rusqlite::Connection::open(&malformed).unwrap();
+        conn.execute(
+            "UPDATE auth_kv SET value = ?1 WHERE key = ?2",
+            rusqlite::params![vec![0xff_u8, 0xfe], SQLITE_TOKEN_KEYS[0]],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!creds.replace_sqlite(malformed.to_str().unwrap()));
+        assert_eq!(creds.access_token.as_deref(), Some("cached-access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("cached-refresh"));
+        assert_eq!(creds.sso_region.as_deref(), Some("us-gov-west-1"));
+        std::fs::remove_file(malformed).unwrap();
     }
 }
