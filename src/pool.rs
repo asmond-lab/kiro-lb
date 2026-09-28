@@ -44,6 +44,7 @@ pub struct AccountStats {
 
 #[derive(Default)]
 pub struct AccountState {
+    pub login_identity: Option<String>,
     pub failures: i64,
     pub last_failure_time: f64,
     pub rate_limited_until: f64,
@@ -52,6 +53,7 @@ pub struct AccountState {
     pub auth_dead_until: f64,
     pub models_cached_at: f64,
     pub quota_headroom: Option<f64>,
+    pub quota_observed_at: f64,
     pub quota_resets_at: f64,
     pub quota_overage_enabled: Option<bool>,
     pub stats: AccountStats,
@@ -78,8 +80,25 @@ impl Account {
     }
 }
 
-pub fn is_quota_depleted(s: &AccountState) -> bool {
-    s.quota_headroom.is_some_and(|h| h <= 0.0) && s.quota_overage_enabled == Some(false)
+pub fn is_quota_depleted(s: &AccountState, now: f64) -> bool {
+    quota_depleted_at(s, now, config::get().usage_refresh_interval_seconds)
+}
+
+fn quota_depleted_at(s: &AccountState, now: f64, refresh_interval: i64) -> bool {
+    effective_quota_headroom(s, now, refresh_interval).is_some_and(|h| h <= 0.0)
+        && s.quota_overage_enabled == Some(false)
+}
+
+fn effective_quota_headroom(s: &AccountState, now: f64, refresh_interval: i64) -> Option<f64> {
+    if refresh_interval <= 0
+        || s.quota_observed_at <= 0.0
+        || s.quota_observed_at < now - refresh_interval.max(60) as f64 * 2.0
+        || (s.quota_resets_at > 0.0 && s.quota_resets_at <= now)
+    {
+        return None;
+    }
+    let headroom = s.quota_headroom?;
+    Some(headroom)
 }
 
 fn cooling_remaining(s: &AccountState, now: f64) -> f64 {
@@ -112,7 +131,7 @@ pub fn routing_state(a: &Account, now: f64) -> (&'static str, i64) {
     if a.auth.lock().is_none() {
         return ("uninitialized", 0);
     }
-    if is_quota_depleted(&s) {
+    if is_quota_depleted(&s, now) {
         let r = s.quota_resets_at - now;
         return ("quota_depleted", if r > 0.0 { r as i64 } else { 0 });
     }
@@ -343,54 +362,51 @@ impl AccountManager {
     }
 
     pub fn load_state(&self) {
-        if let Some(state) = store::load_runtime_state() {
+        let durable = store::load_runtime_state();
+        if let Some(state) = &durable {
             let mut inner = self.inner.lock();
             inner.current_index = state
                 .get("current_account_index")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            if let Some(Value::Object(m)) = state.get("model_to_accounts") {
-                for (model, data) in m {
-                    let list = data
+        }
+        for account in self.accounts() {
+            let source = match account.config.get("type").and_then(Value::as_str) {
+                Some("internal") | Some("refresh_token") => Source::Internal(account.id.clone()),
+                Some("sqlite") => Source::Sqlite(account.id.clone()),
+                Some("json") => Source::File(account.id.clone()),
+                _ => continue,
+            };
+            let identity = KiroAuth::bind_source_login(&source);
+            self.bind_login_state(&account, identity.as_deref());
+        }
+        if let Some(state) = &durable {
+            let mut inner = self.inner.lock();
+            if let Some(Value::Object(models)) = state.get("model_to_accounts") {
+                for (model, data) in models {
+                    let accounts = data
                         .get("accounts")
                         .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(str::to_owned))
-                                .collect()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|id| {
+                            let Some(account) = inner.accounts.get(*id) else {
+                                return false;
+                            };
+                            let current = account.state.lock().login_identity.clone();
+                            let saved = state
+                                .get("accounts")
+                                .and_then(|accounts| accounts.get(*id))
+                                .and_then(|saved| saved.get("login_identity"))
+                                .and_then(Value::as_str);
+                            current.as_deref() == saved
                         })
-                        .unwrap_or_default();
-                    inner.model_to_accounts.insert(model.clone(), list);
-                }
-            }
-            if let Some(Value::Object(accts)) = state.get("accounts") {
-                for (id, d) in accts {
-                    let Some(a) = inner.accounts.get(id) else {
-                        continue;
-                    };
-                    let mut s = a.state.lock();
-                    let f = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-                    s.failures = d.get("failures").and_then(Value::as_i64).unwrap_or(0);
-                    s.last_failure_time = f("last_failure_time");
-                    s.quota_exhausted_until = f("quota_exhausted_until");
-                    s.suspended_until = f("suspended_until");
-                    s.auth_dead_until = f("auth_dead_until");
-                    s.models_cached_at = f("models_cached_at");
-                    let st = d.get("stats").cloned().unwrap_or(json!({}));
-                    s.stats = AccountStats {
-                        total: st
-                            .get("total_requests")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0),
-                        success: st
-                            .get("successful_requests")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0),
-                        failed: st
-                            .get("failed_requests")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0),
-                    };
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    if !accounts.is_empty() {
+                        inner.model_to_accounts.insert(model.clone(), accounts);
+                    }
                 }
             }
         }
@@ -398,21 +414,74 @@ impl AccountManager {
     }
 
     fn seed_quota(&self) {
+        let now = store::now_f64();
         let headroom = store::load_quota_headroom();
         let period = store::load_quota_period();
+        let observed = store::load_quota_observed_at();
         let inner = self.inner.lock();
+        for (id, observed_at) in observed {
+            if let Some(a) = inner.accounts.get(&id) {
+                let mut state = a.state.lock();
+                if state.login_identity.as_deref() == store::login_identity(&id).as_deref() {
+                    state.quota_observed_at = observed_at;
+                }
+            }
+        }
         for (id, h) in headroom {
             if let Some(a) = inner.accounts.get(&id) {
-                a.state.lock().quota_headroom = Some(h.clamp(0.0, 1.0));
+                let mut state = a.state.lock();
+                if state.login_identity.as_deref() == store::login_identity(&id).as_deref() {
+                    state.quota_headroom = Some(h.clamp(0.0, 1.0));
+                }
             }
         }
         for (id, (reset, overage)) in period {
             if let Some(a) = inner.accounts.get(&id) {
                 let mut s = a.state.lock();
-                s.quota_resets_at = reset.unwrap_or(0.0);
-                s.quota_overage_enabled = overage;
+                if s.login_identity.as_deref() == store::login_identity(&id).as_deref() {
+                    s.quota_resets_at = reset.filter(|r| *r > now).unwrap_or(0.0);
+                    s.quota_overage_enabled = overage;
+                }
             }
         }
+    }
+
+    fn bind_login_state(&self, a: &Account, identity: Option<&str>) {
+        let mut restored = AccountState {
+            login_identity: identity.map(str::to_owned),
+            ..Default::default()
+        };
+        if let (Some(identity), Some(state)) = (identity, store::load_runtime_state()) {
+            if let Some(d) = state
+                .get("accounts")
+                .and_then(|v| v.get(&a.id))
+                .filter(|d| d.get("login_identity").and_then(Value::as_str) == Some(identity))
+            {
+                let f = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                restored.failures = d.get("failures").and_then(Value::as_i64).unwrap_or(0);
+                restored.last_failure_time = f("last_failure_time");
+                restored.quota_exhausted_until = f("quota_exhausted_until");
+                restored.suspended_until = f("suspended_until");
+                restored.auth_dead_until = f("auth_dead_until");
+                restored.models_cached_at = f("models_cached_at");
+                let stats = d.get("stats").cloned().unwrap_or(json!({}));
+                restored.stats = AccountStats {
+                    total: stats
+                        .get("total_requests")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    success: stats
+                        .get("successful_requests")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    failed: stats
+                        .get("failed_requests")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                };
+            }
+        }
+        *a.state.lock() = restored;
     }
 
     pub fn reload_durable_state(&self) {
@@ -439,6 +508,7 @@ impl AccountManager {
                 (
                     id.clone(),
                     json!({
+                        "login_identity": s.login_identity,
                         "failures": s.failures, "last_failure_time": s.last_failure_time,
                         "quota_exhausted_until": s.quota_exhausted_until, "suspended_until": s.suspended_until,
                         "auth_dead_until": s.auth_dead_until, "models_cached_at": s.models_cached_at,
@@ -568,7 +638,13 @@ impl AccountManager {
                 return false;
             }
         }
+        self.bind_login_state(a, auth.login_identity());
+        self.seed_quota();
         let models = crate::model_catalog::fetch_available_models(&auth, &self.http).await;
+        if !auth.is_current_login() {
+            tracing::info!("Discarding initialization of {id}: its login was replaced");
+            return false;
+        }
         match models {
             Some(m) => a.models.update(m),
             None => a.models.seed_fallback(),
@@ -648,7 +724,17 @@ impl AccountManager {
         }
         let Some(auth) = a.auth() else { return };
         let refresh_revision = a.models.refresh_revision();
-        let refreshed = fetch(auth).await;
+        let refreshed = fetch(auth.clone()).await;
+        let still_current = a
+            .auth()
+            .is_some_and(|current| Arc::ptr_eq(&current, &auth) && current.is_current_login());
+        if !still_current {
+            tracing::info!(
+                "Discarding model refresh for {}: its login was replaced",
+                a.id
+            );
+            return;
+        }
         match refreshed {
             Some(m) => a.models.update_after_refresh(m, refresh_revision),
             None => a.models.seed_fallback(),
@@ -725,9 +811,9 @@ impl AccountManager {
         }
     }
 
-    fn routing_weight(s: &AccountState) -> f64 {
+    fn routing_weight_at(s: &AccountState, now: f64, refresh_interval: i64) -> f64 {
         let cfg = config::get();
-        match s.quota_headroom {
+        match effective_quota_headroom(s, now, refresh_interval) {
             None => cfg.unknown_quota_weight.max(config::MINIMUM_ROUTING_WEIGHT),
             Some(h) if h <= 0.0 => cfg
                 .depleted_quota_weight
@@ -738,6 +824,8 @@ impl AccountManager {
 
     fn candidate_order(&self, model: &str, session: Option<u64>) -> Vec<Arc<Account>> {
         let inner = self.inner.lock();
+        let now = store::now_f64();
+        let refresh_interval = config::get().usage_refresh_interval_seconds;
         let ids = inner.order.clone();
         if ids.is_empty() {
             return vec![];
@@ -756,7 +844,7 @@ impl AccountManager {
                     let w = inner
                         .accounts
                         .get(id)
-                        .map(|a| Self::routing_weight(&a.state.lock()))
+                        .map(|a| Self::routing_weight_at(&a.state.lock(), now, refresh_interval))
                         .unwrap_or(config::MINIMUM_ROUTING_WEIGHT);
                     let e: f64 = -(1.0 - rng.gen::<f64>()).ln();
                     (e / w, id.clone())
@@ -775,12 +863,12 @@ impl AccountManager {
                 let wa = inner
                     .accounts
                     .get(a)
-                    .map(|x| Self::routing_weight(&x.state.lock()))
+                    .map(|x| Self::routing_weight_at(&x.state.lock(), now, refresh_interval))
                     .unwrap_or(0.0);
                 let wb = inner
                     .accounts
                     .get(b)
-                    .map(|x| Self::routing_weight(&x.state.lock()))
+                    .map(|x| Self::routing_weight_at(&x.state.lock(), now, refresh_interval))
                     .unwrap_or(0.0);
                 wb.total_cmp(&wa)
             });
@@ -848,7 +936,7 @@ impl AccountManager {
         let any_depleted = self
             .accounts()
             .iter()
-            .any(|a| is_quota_depleted(&a.state.lock()));
+            .any(|a| is_quota_depleted(&a.state.lock(), store::now_f64()));
         if !any_depleted {
             return None;
         }
@@ -884,7 +972,7 @@ impl AccountManager {
                 {
                     continue;
                 }
-                if !last_resort && is_quota_depleted(&s) {
+                if !last_resort && is_quota_depleted(&s, now) {
                     continue;
                 }
                 if cooling_remaining(&s, now) > 0.0 {
@@ -1187,17 +1275,32 @@ impl AccountManager {
     pub fn set_quota(
         &self,
         id: &str,
+        login_identity: &str,
         headroom: Option<f64>,
         resets_at: Option<f64>,
         overage: Option<bool>,
     ) {
         let Some(a) = self.get(id) else { return };
         let mut s = a.state.lock();
+        if s.login_identity.as_deref() != Some(login_identity) {
+            return;
+        }
+        let now = store::now_f64();
         s.quota_headroom = headroom.map(|h| h.clamp(0.0, 1.0));
+        s.quota_observed_at = if headroom.is_some() || resets_at.is_some() || overage.is_some() {
+            now
+        } else {
+            0.0
+        };
         s.quota_resets_at = resets_at
-            .filter(|r| r.is_finite() && *r > 0.0)
+            .filter(|r| r.is_finite() && *r > now)
             .unwrap_or(0.0);
         s.quota_overage_enabled = overage;
+        if resets_at.is_some() && s.quota_resets_at == 0.0 {
+            s.quota_headroom = None;
+            s.quota_observed_at = 0.0;
+            s.quota_overage_enabled = None;
+        }
     }
 
     pub fn drain_unsaved_observations(&self) -> Vec<RateObservation> {
@@ -1478,5 +1581,71 @@ mod tests {
         drop(state);
         assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
         assert!(pool.inner.lock().observations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn quota_evidence_expires_at_reset_and_after_two_polling_intervals() {
+        let cfg = config::get();
+        let interval = 60;
+        let now = 10_000.0;
+        let mut state = AccountState {
+            quota_headroom: Some(0.0),
+            quota_observed_at: now,
+            quota_resets_at: now + 1.0,
+            quota_overage_enabled: Some(false),
+            ..Default::default()
+        };
+        let depleted_weight = cfg
+            .depleted_quota_weight
+            .max(config::MINIMUM_ROUTING_WEIGHT);
+        let unknown_weight = cfg.unknown_quota_weight.max(config::MINIMUM_ROUTING_WEIGHT);
+
+        assert!(quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            depleted_weight
+        );
+
+        state.quota_resets_at = now;
+        assert!(!quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            unknown_weight
+        );
+
+        state.quota_resets_at = now + 60.0;
+        state.quota_observed_at = now - interval.max(60) as f64 * 2.0;
+        assert!(quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            depleted_weight
+        );
+
+        state.quota_observed_at -= 0.001;
+        assert!(!quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            unknown_weight
+        );
+
+        state.quota_resets_at = 0.0;
+        state.quota_observed_at = now;
+        assert!(quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            depleted_weight
+        );
+
+        state.quota_observed_at = now - interval.max(60) as f64 * 2.0 - 0.001;
+        assert!(!quota_depleted_at(&state, now, interval));
+        assert_eq!(
+            AccountManager::routing_weight_at(&state, now, interval),
+            unknown_weight
+        );
     }
 }

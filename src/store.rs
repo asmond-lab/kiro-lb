@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -94,7 +95,9 @@ pub fn initialize() -> rusqlite::Result<()> {
                 account_id TEXT PRIMARY KEY,
                 position INTEGER NOT NULL,
                 config_json TEXT NOT NULL,
-                credential_json TEXT
+                credential_json TEXT,
+                login_identity TEXT,
+                source_fingerprint TEXT
             );
             CREATE TABLE IF NOT EXISTS account_runtime (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -248,6 +251,7 @@ pub fn initialize() -> rusqlite::Result<()> {
             CREATE INDEX IF NOT EXISTS idx_account_model_usage_account ON account_model_usage(account_id, model);
             CREATE TABLE IF NOT EXISTS account_usage (
                 account_id TEXT PRIMARY KEY,
+                login_identity TEXT,
                 email TEXT,
                 subscription_title TEXT,
                 subscription_type TEXT,
@@ -270,12 +274,21 @@ pub fn initialize() -> rusqlite::Result<()> {
         }
         let usage_cols = columns(conn, "account_usage")?;
         for (col, ddl) in [
+            ("login_identity", "TEXT"),
             ("overage_status", "TEXT"),
             ("overage_used", "REAL"),
             ("email", "TEXT"),
         ] {
             if !usage_cols.iter().any(|c| c == col) {
                 conn.execute_batch(&format!("ALTER TABLE account_usage ADD COLUMN {col} {ddl}"))?;
+            }
+        }
+        let source_cols = columns(conn, "account_sources")?;
+        for col in ["login_identity", "source_fingerprint"] {
+            if !source_cols.iter().any(|c| c == col) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE account_sources ADD COLUMN {col} TEXT"
+                ))?;
             }
         }
         merge_unnormalized_usage_models(conn)?;
@@ -420,6 +433,7 @@ pub fn load_account_sources_in(conn: &Connection) -> rusqlite::Result<Vec<Value>
     Ok(rows
         .flatten()
         .filter_map(|s| serde_json::from_str(&s).ok())
+        .filter(|entry: &Value| entry.get("_kiroLbExpanded").and_then(Value::as_bool) != Some(true))
         .collect())
 }
 
@@ -494,22 +508,46 @@ pub fn replace_account_sources(
     if !ungated {
         require_runtime_writer(conn)?;
     }
-    let existing: HashMap<String, Option<String>> = {
-        let mut stmt = conn.prepare("SELECT account_id, credential_json FROM account_sources")?;
+    let existing: HashMap<String, (Option<String>, Option<String>, Option<String>, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT account_id, credential_json, login_identity, source_fingerprint, config_json, position FROM account_sources",
+        )?;
         let iter = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
+            ))
         })?;
         iter.collect::<rusqlite::Result<_>>()?
     };
+    let expanded_directories = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.get("type").and_then(Value::as_str),
+                Some("json" | "sqlite")
+            )
+        })
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .map(expand_home)
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect::<Vec<_>>();
     conn.execute("DELETE FROM account_sources", [])?;
+    let mut inserted = HashSet::new();
     for (position, entry) in entries.iter().enumerate() {
         let account_id = account_id_for_entry(entry);
+        inserted.insert(account_id.clone());
         let credential = if entry.get("type").and_then(Value::as_str) == Some("internal") {
             entry.get("credential").filter(|v| !v.is_null())
         } else {
             None
         };
-        let mut credential_json = existing.get(&account_id).cloned().flatten();
+        let (mut credential_json, login_identity, source_fingerprint) = existing
+            .get(&account_id)
+            .map(|row| (row.0.clone(), row.1.clone(), row.2.clone()))
+            .unwrap_or_default();
         if credential_json.is_none() {
             credential_json = credential.map(Value::to_string);
         }
@@ -518,8 +556,29 @@ pub fn replace_account_sources(
             obj.remove("credential");
         }
         conn.execute(
-            "INSERT INTO account_sources(account_id, position, config_json, credential_json) VALUES (?1, ?2, ?3, ?4)",
-            params![account_id, position as i64, stored.to_string(), credential_json],
+            "INSERT INTO account_sources(account_id, position, config_json, credential_json, login_identity, source_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![account_id, position as i64, stored.to_string(), credential_json, login_identity, source_fingerprint],
+        )?;
+    }
+    for (account_id, (credential, identity, fingerprint, config_json, position)) in existing {
+        let account_path = PathBuf::from(&account_id);
+        if inserted.contains(&account_id)
+            || !account_path.is_file()
+            || !expanded_directories
+                .iter()
+                .any(|directory| account_path.starts_with(directory))
+            || serde_json::from_str::<Value>(&config_json)
+                .ok()
+                .and_then(|v| v.get("_kiroLbExpanded").and_then(Value::as_bool))
+                != Some(true)
+        {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO account_sources(account_id, position, config_json, credential_json, login_identity, source_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![account_id, position, config_json, credential, identity, fingerprint],
         )?;
     }
     Ok(())
@@ -539,6 +598,20 @@ pub fn load_internal_credential(account_id: &str) -> Option<Value> {
     raw.flatten().and_then(|s| serde_json::from_str(&s).ok())
 }
 
+pub fn load_internal_credential_for_login(account_id: &str, login_identity: &str) -> Option<Value> {
+    let raw: Option<Option<String>> = with(|c| {
+        c.query_row(
+            "SELECT credential_json FROM account_sources WHERE account_id = ?1 AND login_identity = ?2",
+            params![account_id, login_identity],
+            |r| r.get(0),
+        )
+        .optional()
+    })
+    .ok()
+    .flatten();
+    raw.flatten().and_then(|s| serde_json::from_str(&s).ok())
+}
+
 pub fn save_internal_credential(account_id: &str, document: &Value) -> rusqlite::Result<()> {
     let payload = document.to_string();
     with(|c| {
@@ -546,6 +619,115 @@ pub fn save_internal_credential(account_id: &str, document: &Value) -> rusqlite:
         let updated = c.execute(
             "UPDATE account_sources SET credential_json = ?1 WHERE account_id = ?2 AND credential_json IS NOT NULL",
             params![payload, account_id],
+        )?;
+        if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    })
+}
+
+/// Bind a source location to one login lineage. When account-owned metadata is
+/// unavailable, the source fingerprint only detects replacement; the durable
+/// identity is random and does not rotate with tokens refreshed by the gateway.
+pub fn bind_login_identity(
+    account_id: &str,
+    stable_identity: Option<&str>,
+    source_fingerprint: Option<&str>,
+) -> Option<String> {
+    with(|c| {
+        let mut current: Option<(Option<String>, Option<String>)> = c
+            .query_row(
+                "SELECT login_identity, source_fingerprint FROM account_sources WHERE account_id = ?1",
+                [account_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let writable = require_runtime_writer(c).is_ok();
+        if current.is_none() && writable {
+            c.execute(
+                "INSERT OR IGNORE INTO account_sources(account_id, position, config_json)
+                 VALUES (?1, -1, '{\"_kiroLbExpanded\":true}')",
+                [account_id],
+            )?;
+            current = Some((None, None));
+        }
+        let Some((identity, fingerprint)) = current else {
+            return Ok(None);
+        };
+        if !writable {
+            let matches = stable_identity
+                .is_some_and(|stable| identity.as_deref() == Some(stable))
+                || (stable_identity.is_none()
+                    && source_fingerprint.is_some()
+                    && fingerprint.as_deref() == source_fingerprint);
+            return Ok(matches.then_some(identity).flatten());
+        }
+        let selected = if let Some(stable) = stable_identity {
+            stable.to_owned()
+        } else if source_fingerprint.is_some() && fingerprint.as_deref() == source_fingerprint {
+            identity.unwrap_or_else(|| format!("lineage:{}", uuid::Uuid::new_v4().simple()))
+        } else if source_fingerprint.is_some() {
+            format!("lineage:{}", uuid::Uuid::new_v4().simple())
+        } else {
+            return Ok(None);
+        };
+        c.execute(
+            "UPDATE account_sources SET login_identity = ?1, source_fingerprint = ?2 WHERE account_id = ?3",
+            params![selected, source_fingerprint, account_id],
+        )?;
+        Ok(Some(selected))
+    })
+    .ok()
+    .flatten()
+}
+
+pub fn login_identity(account_id: &str) -> Option<String> {
+    with(|c| {
+        c.query_row(
+            "SELECT login_identity FROM account_sources WHERE account_id = ?1",
+            [account_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+    })
+    .ok()
+    .flatten()
+}
+
+pub fn save_credential_for_login(
+    account_id: &str,
+    login_identity: &str,
+    document: &Value,
+    expected_source_fingerprint: Option<&str>,
+    next_source_fingerprint: Option<&str>,
+) -> rusqlite::Result<()> {
+    let payload = document.to_string();
+    with(|c| {
+        require_runtime_writer(c)?;
+        if let Some(expected) = expected_source_fingerprint {
+            let current: Option<String> = c.query_row(
+                "SELECT credential_json FROM account_sources WHERE account_id = ?1 AND login_identity = ?2",
+                params![account_id, login_identity],
+                |r| r.get(0),
+            )?;
+            let current = current
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|doc| {
+                    doc.get("refreshToken")
+                        .and_then(Value::as_str)
+                        .map(|token| format!("source:{}", hex::encode(Sha256::digest(token))))
+                });
+            if current.as_deref() != Some(expected) {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+        }
+        let updated = c.execute(
+            "UPDATE account_sources SET credential_json = ?1,
+                    source_fingerprint = COALESCE(?2, source_fingerprint)
+             WHERE account_id = ?3 AND login_identity = ?4",
+            params![payload, next_source_fingerprint, account_id, login_identity],
         )?;
         if updated == 0 {
             return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -618,21 +800,58 @@ pub fn save_runtime_state(state: &Value) -> bool {
     with(move |c| save_runtime_state_in(c, &state, false)).unwrap_or(false)
 }
 
+fn quota_fresh_after(now: f64, interval: i64) -> Option<i64> {
+    (interval > 0).then(|| now as i64 - interval.max(60).saturating_mul(2))
+}
+
 pub fn load_quota_headroom() -> HashMap<String, f64> {
+    load_quota_headroom_at(now_f64(), config::get().usage_refresh_interval_seconds)
+}
+
+pub fn load_quota_observed_at() -> HashMap<String, f64> {
+    let now = now_f64();
+    let Some(fresh_after) = quota_fresh_after(now, config::get().usage_refresh_interval_seconds)
+    else {
+        return HashMap::new();
+    };
     with(|c| {
         let mut stmt = c.prepare(
-            "SELECT account_id, current_usage, usage_limit FROM account_usage
-             WHERE error IS NULL AND current_usage IS NOT NULL AND usage_limit > 0",
+            "SELECT u.account_id, u.updated_at FROM account_usage u
+             JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity
+             WHERE u.error IS NULL AND u.updated_at >= ?1",
         )?;
-        let iter = stmt.query_map([], |r| {
+        let rows = stmt.query_map([fresh_after], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as f64))
+        })?;
+        rows.collect()
+    })
+    .unwrap_or_default()
+}
+
+pub fn load_quota_headroom_at(now: f64, refresh_interval: i64) -> HashMap<String, f64> {
+    let Some(fresh_after) = quota_fresh_after(now, refresh_interval) else {
+        return HashMap::new();
+    };
+    with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT u.account_id, u.current_usage, u.usage_limit, u.next_date_reset FROM account_usage u
+             JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity
+             WHERE u.error IS NULL AND u.updated_at >= ?1
+               AND u.current_usage IS NOT NULL AND u.usage_limit > 0",
+        )?;
+        let iter = stmt.query_map([fresh_after], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<f64>>(1)?,
                 r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<rusqlite::types::Value>>(3)?,
             ))
         })?;
         let mut out = HashMap::new();
-        for (id, current, limit) in iter.flatten() {
+        for (id, current, limit, reset) in iter.flatten() {
+            if quota_reset_value(reset.as_ref()).is_some_and(|reset| reset <= now) {
+                continue;
+            }
             if let (Some(current), Some(limit)) = (current, limit) {
                 if limit > 0.0 {
                     out.insert(id, (1.0 - current / limit).clamp(0.0, 1.0));
@@ -645,22 +864,32 @@ pub fn load_quota_headroom() -> HashMap<String, f64> {
 }
 
 pub fn load_quota_period() -> HashMap<String, (Option<f64>, Option<bool>)> {
+    load_quota_period_at(now_f64(), config::get().usage_refresh_interval_seconds)
+}
+
+pub fn load_quota_period_at(
+    now: f64,
+    refresh_interval: i64,
+) -> HashMap<String, (Option<f64>, Option<bool>)> {
+    let Some(fresh_after) = quota_fresh_after(now, refresh_interval) else {
+        return HashMap::new();
+    };
     with(|c| {
-        let mut stmt =
-            c.prepare("SELECT account_id, next_date_reset, overage_status FROM account_usage WHERE error IS NULL")?;
-        let iter = stmt.query_map([], |r| {
+        let mut stmt = c.prepare(
+            "SELECT u.account_id, u.next_date_reset, u.overage_status FROM account_usage u
+             JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity
+             WHERE u.error IS NULL AND u.updated_at >= ?1",
+        )?;
+        let iter = stmt.query_map([fresh_after], |r| {
             let reset: Option<rusqlite::types::Value> = r.get(1)?;
             Ok((r.get::<_, String>(0)?, reset, r.get::<_, Option<String>>(2)?))
         })?;
         let mut out = HashMap::new();
         for (id, reset, status) in iter.flatten() {
-            let reset_at = match reset {
-                Some(rusqlite::types::Value::Real(f)) => Some(f),
-                Some(rusqlite::types::Value::Integer(i)) => Some(i as f64),
-                Some(rusqlite::types::Value::Text(s)) => s.trim().parse::<f64>().ok(),
-                _ => None,
+            let reset_at = quota_reset_value(reset.as_ref());
+            if reset_at.is_some_and(|reset| reset <= now) {
+                continue;
             }
-            .filter(|v| v.is_finite() && *v > 0.0);
             let overage = status.map(|s| s.trim().to_ascii_uppercase()).and_then(|s| match s.as_str() {
                 "ENABLED" => Some(true),
                 "DISABLED" => Some(false),
@@ -674,6 +903,16 @@ pub fn load_quota_period() -> HashMap<String, (Option<f64>, Option<bool>)> {
         Ok(out)
     })
     .unwrap_or_default()
+}
+
+fn quota_reset_value(value: Option<&rusqlite::types::Value>) -> Option<f64> {
+    match value {
+        Some(rusqlite::types::Value::Real(f)) => Some(*f),
+        Some(rusqlite::types::Value::Integer(i)) => Some(*i as f64),
+        Some(rusqlite::types::Value::Text(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 pub fn now_f64() -> f64 {
