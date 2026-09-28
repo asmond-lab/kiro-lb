@@ -28,6 +28,12 @@ async fn once(
     auth: &crate::auth::KiroAuth,
     model: &str,
 ) -> Value {
+    let url = match ep.url(&auth.api_region) {
+        Ok(url) => url,
+        Err(e) => {
+            return json!({"ok": false, "statusCode": null, "ttfbMs": null, "error": e.to_string()})
+        }
+    };
     let token = match auth.access_token().await {
         Ok(t) => t,
         Err(e) => {
@@ -41,7 +47,7 @@ async fn once(
     }
     let mut req = state
         .http
-        .post(ep.url(&auth.api_region))
+        .post(url)
         .timeout(Duration::from_secs(45))
         .json(&body);
     let mut headers = kiro_headers(&token);
