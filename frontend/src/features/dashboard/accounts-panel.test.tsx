@@ -59,6 +59,36 @@ describe("AccountsPanel", () => {
     expect(html).toContain('aria-label="Delete account acc_deletable1"');
     expect(html).toContain('disabled=""');
   });
+
+  it("keeps a paused account's snapshot visible and offers a clear resume action", () => {
+    const paused: Account = {
+      ...deletableAccount,
+      enabled: false,
+      routingState: "disabled",
+      requests: 41,
+      failures: 3,
+      sessions: 1,
+      usage: {
+        email: "paused@example.com",
+        subscriptionTitle: "Kiro Pro",
+        usagePercent: 42,
+        currentUsage: 420,
+        usageLimit: 1000,
+      },
+    };
+    const html = renderToString(
+      <AccountsPanel accounts={[paused]} isLoading={false} onToggleAccount={() => undefined} />
+    );
+
+    expect(html).toContain("Paused accounts");
+    expect(html).toContain("last known details are kept");
+    expect(html).toContain("paused@example.com");
+    expect(html).toContain("Kiro Pro");
+    expect(html).toContain("42.00%");
+    expect(html).toContain(">41<");
+    expect(html).toContain(">3<");
+    expect(html).toContain(">Resume<");
+  });
 });
 
 describe("RoutingStateCell", () => {
@@ -110,8 +140,8 @@ describe("RoutingStateCell", () => {
 
     // The id appears several times per row (tooltip, aria-label, visible text),
     // so the normalization has to rewrite every occurrence, not the first.
-    expect(spent.replace("Quota Spent", "QUOTA").replaceAll(spentAccount.id, "ID")).toBe(
-      exhausted.replace("Quota Exhausted", "QUOTA").replaceAll(exhaustedAccount.id, "ID")
+    expect(spent.replaceAll("Quota Spent", "QUOTA").replaceAll(spentAccount.id, "ID")).toBe(
+      exhausted.replaceAll("Quota Exhausted", "QUOTA").replaceAll(exhaustedAccount.id, "ID")
     );
   });
 

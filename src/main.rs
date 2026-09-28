@@ -374,8 +374,11 @@ async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::Insta
         started_at: store::now_f64(),
         version: Default::default(),
         quiesced: AtomicBool::new(quiesced),
+        data_plane_paused: AtomicBool::new(false),
         inflight: AtomicI64::new(0),
         drained: tokio::sync::Notify::new(),
+        data_inflight: AtomicI64::new(0),
+        data_drained: tokio::sync::Notify::new(),
     });
     if !quiesced {
         let s = state.clone();
@@ -557,8 +560,11 @@ mod tests {
             started_at: 0.0,
             version: Default::default(),
             quiesced: AtomicBool::new(false),
+            data_plane_paused: AtomicBool::new(false),
             inflight: AtomicI64::new(0),
             drained: tokio::sync::Notify::new(),
+            data_inflight: AtomicI64::new(0),
+            data_drained: tokio::sync::Notify::new(),
         })
     }
 
