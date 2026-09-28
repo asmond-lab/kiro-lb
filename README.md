@@ -67,6 +67,9 @@ must be writable; no privilege escalation is attempted. An install failure keeps
 the existing process running. A failure to launch the new executable restores the
 backup and attempts to restart it; a failure occurring *after* successful launch
 still requires manual recovery from `.previous` and is not automatically rolled back.
+On Windows, a failure during executable replacement disables further installs in
+that process: restart from the original executable before retrying. If restoring
+the original path also failed, recover `.previous` first.
 
 Docker, blue/green managed deployments, debug builds and unsupported platforms
 only offer checks and update instructions, not executable replacement. Docker

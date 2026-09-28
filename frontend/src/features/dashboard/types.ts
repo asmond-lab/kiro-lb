@@ -10,7 +10,7 @@ export type Overview = {
     status: "idle" | "downloading" | "restarting" | "failed";
     version: string | null;
     error: string | null;
-    disabledReason: "container" | "managed" | "unsupported" | "development" | null;
+    disabledReason: "container" | "managed" | "unsupported" | "development" | "restart_required" | null;
   };
   requests24h: number;
   successes24h: number;

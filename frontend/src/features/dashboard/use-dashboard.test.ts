@@ -10,6 +10,9 @@ type Timer = () => Promise<void>;
 interface Harness {
   effects: Effect[];
   stateIndex: number;
+  stateOverrides: Record<number, unknown>;
+  refs: { current: unknown }[];
+  refIndex: number;
   latestAccounts: Account[];
   latestOverview?: Overview;
   latestRate?: RequestRate;
@@ -39,6 +42,9 @@ interface Harness {
 const harness = vi.hoisted((): Harness => ({
   effects: [],
   stateIndex: 0,
+  stateOverrides: {},
+  refs: [],
+  refIndex: 0,
   latestAccounts: [],
   latestOverview: undefined,
   latestRate: undefined,
@@ -88,11 +94,15 @@ vi.mock("react", () => {
   const useEffect = (effect: Effect) => {
     harness.effects.push(effect);
   };
-  const useRef = <T,>(initial: T): { current: T } => ({ current: initial });
+  const useRef = <T,>(initial: T): { current: T } => {
+    const index = harness.refIndex++;
+    return (harness.refs[index] ??= { current: initial }) as { current: T };
+  };
   function useState<T>(initial: T): [T, (value: T) => void];
   function useState(initial: unknown): [unknown, (value: unknown) => void] {
     const index = harness.stateIndex++;
-    return [index === STATE_IS_AUTHENTICATED ? true : initial, (value: unknown) => {
+    const current = index in harness.stateOverrides ? harness.stateOverrides[index] : index === STATE_IS_AUTHENTICATED ? true : initial;
+    return [current, (value: unknown) => {
       if (index === STATE_OVERVIEW) harness.latestOverview = value as Overview;
       if (index === STATE_ACCOUNTS && isAccountArray(value)) harness.latestAccounts = value;
       if (index === STATE_RATE) harness.latestRate = value as RequestRate;
@@ -175,6 +185,9 @@ describe("useDashboard", () => {
     vi.useFakeTimers();
     harness.effects = [];
     harness.stateIndex = 0;
+    harness.stateOverrides = {};
+    harness.refs = [];
+    harness.refIndex = 0;
     harness.latestAccounts = [];
     harness.latestOverview = undefined;
     harness.latestRate = undefined;
@@ -186,8 +199,9 @@ describe("useDashboard", () => {
     harness.timerDelays = [];
     Object.values(harness.api).forEach((method) => method.mockReset());
     harness.api.requestLogs.mockResolvedValue(logs);
-    vi.stubGlobal("document", { visibilityState: "visible" });
+    vi.stubGlobal("document", { visibilityState: "visible", querySelector: vi.fn().mockReturnValue(null) });
     vi.stubGlobal("window", {
+      location: { reload: vi.fn() },
       clearTimeout: vi.fn(),
       setTimeout: (callback: Timer, delay?: number) => {
         harness.timers.push(callback);
@@ -264,6 +278,95 @@ describe("useDashboard", () => {
     harness.api.keyUsage.mockResolvedValue({ usage: {} });
     harness.api.accountTokenUsage.mockResolvedValue({ usage: {} });
   };
+
+  it.each([
+    ["0.2.1", "0.2.2", 1],
+    ["0.2.2", "0.2.2", 0],
+    ["0.2.2", "0.2.1", 1],
+    ["0.2.2-rc.1", "0.2.2", 1],
+  ] as const)("compares document %s with first API version %s even when installation was never observed", (loaded, current, reloads) => {
+    vi.mocked(document.querySelector).mockReturnValue({ content: loaded } as HTMLMetaElement);
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).not.toHaveBeenCalled();
+
+    // No overview succeeded before the server restarted (or before sign-in).
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = {
+      ...healthyOverview(),
+      version: { current, latest: current, status: "latest", releaseUrl: null },
+      update: { status: "idle", version: null, error: null, disabledReason: null },
+    };
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).toHaveBeenCalledTimes(reloads);
+    expect(harness.api.installUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["0.2.1", "0.2.2", 1],
+    ["0.2.1", "0.2.1", 0],
+    ["0.2.2", "0.2.1", 1],
+    [undefined, "0.2.2", 0],
+  ] as const)("reloads %s → %s only when the running version changes, without observing an install", (before, current, reloads) => {
+    const overview: Overview = {
+      ...healthyOverview(),
+      version: before ? { current: before, latest: null, status: "unavailable", releaseUrl: null } : undefined,
+      update: { status: "idle", version: null, error: null, disabledReason: null },
+    };
+    harness.stateOverrides[STATE_OVERVIEW] = overview;
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(harness.api.installUpdate).not.toHaveBeenCalled();
+
+    // An authentication gap must not discard the version this document used.
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = undefined;
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).not.toHaveBeenCalled();
+
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = {
+      ...overview,
+      version: { current, latest: current, status: "latest", releaseUrl: null },
+    };
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).toHaveBeenCalledTimes(reloads);
+  });
+
+  it("reloads after a lost install response even when the next snapshot is already idle on the new version", async () => {
+    mockHealthyLoad();
+    const overview: Overview = {
+      ...healthyOverview(),
+      version: { current: "0.2.1", latest: "0.2.2", status: "update_available", releaseUrl: null },
+      update: { status: "idle", version: null, error: null, disabledReason: null },
+    };
+    harness.stateOverrides[STATE_OVERVIEW] = overview;
+    const dashboard = useDashboard();
+    harness.effects[3]!();
+    harness.api.installUpdate.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    harness.api.overview.mockResolvedValue({ ...overview, version: { ...overview.version, current: "0.2.2" } });
+    await dashboard.installUpdate("0.2.2");
+    expect(harness.latestActionError).toBe("Failed to fetch");
+    expect(harness.latestOverview?.update?.status).toBe("idle");
+
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = harness.latestOverview;
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).toHaveBeenCalledOnce();
+  });
 
   it("coalesces manual update checks and reloads the result without a polling tick", async () => {
     mockHealthyLoad();

@@ -179,6 +179,26 @@ async fn overview_serves_cached_version_only_to_dashboard_sessions() {
     );
     assert!(state.version.pending.lock().is_none());
     assert!(!state.quiesced.load(std::sync::atomic::Ordering::SeqCst));
+    // A Windows replacement failure can relocate the running image. A restored
+    // original path is safe to launch, but this process must not install again.
+    assert!(state.version.installation.read().disabled_reason.is_none());
+    state.version.installation.write().disabled_reason = Some("restart_required");
+    assert!(kiro_lb::updates::start_install(state.clone(), "9.0.0").is_err());
+    let rejected = app
+        .oneshot(
+            Request::post("/api/dashboard/updates/install")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"version":"9.0.0"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        state.version.installation.read().status,
+        InstallStatus::Failed
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 

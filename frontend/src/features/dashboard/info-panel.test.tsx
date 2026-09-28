@@ -84,4 +84,16 @@ describe("InfoPanel version status", () => {
     expect(container).not.toContain("Update and restart");
     expect(container).toContain("recreate the container");
   });
+
+  it.each(["update_available", "unavailable"] as const)("keeps recovery instructions visible with %s after a replacement failure", (status) => {
+    const html = render(
+      { current: "0.2.1", latest: "0.2.2", status, releaseUrl: null },
+      false,
+      { status: "failed", version: "0.2.2", error: "replacement failed", disabledReason: "restart_required" },
+    );
+    expect(html).toContain("Restart the gateway from its original executable before retrying");
+    expect(html).toContain("replacement failed");
+    expect(html).not.toContain("Update and restart");
+    expect(html).toContain("Check now");
+  });
 });
