@@ -404,19 +404,7 @@ async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::Insta
         }
     );
     tokio::spawn(kiro_lb::updates::run(state.clone()));
-    let app = router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
-    let stopping = state.clone();
-    let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = shutdown() => {},
-                _ = stopping.version.restart.notified() => {},
-            }
-            stopping
-                .quiesced
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-        .await;
+    let installed = serve_until_shutdown(listener, router(state.clone()), state, shutdown()).await;
     tracing::info!("Shutting down: final flush");
     let p = pool.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -426,8 +414,40 @@ async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::Insta
         p.save_state();
     })
     .await;
-    let installed = state.version.pending.lock().take();
     installed
+}
+
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    state: app::Shared,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Option<kiro_lb::update_install::InstalledUpdate> {
+    let stopping = state.clone();
+    let (reason_tx, reason_rx) = tokio::sync::oneshot::channel();
+    let _ = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let restart = tokio::select! {
+            biased;
+            _ = stop => false,
+            _ = stopping.version.restart.notified() => true,
+        };
+        stopping
+            .quiesced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = reason_tx.send(restart);
+    })
+    .await;
+    // An install completing during an operator-requested drain must not turn
+    // that stop into a restart. Both ready signals favor the operator's stop.
+    if reason_rx.await.unwrap_or(false) {
+        state.version.pending.lock().take()
+    } else {
+        None
+    }
 }
 
 fn restart_updated(installed: kiro_lb::update_install::InstalledUpdate) {
@@ -525,6 +545,125 @@ fn print_banner(addr: &SocketAddr) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    fn state() -> super::app::Shared {
+        use super::*;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        Arc::new(AppState {
+            pool: AccountManager::new(http.clone()),
+            transport: Arc::new(Transport {
+                shared: http.clone(),
+            }),
+            http,
+            started_at: 0.0,
+            version: Default::default(),
+            quiesced: AtomicBool::new(false),
+            inflight: AtomicI64::new(0),
+            drained: tokio::sync::Notify::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_its_original_reason_while_requests_drain() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        use tokio::sync::{oneshot, Notify};
+
+        for update_first in [false, true] {
+            let state = state();
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (started, finish) = (entered.clone(), release.clone());
+            let app = Router::new().route(
+                "/hold",
+                get(move || {
+                    let (started, finish) = (started.clone(), finish.clone());
+                    async move {
+                        started.notify_one();
+                        finish.notified().await;
+                        "finished"
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/hold", listener.local_addr().unwrap());
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let server = tokio::spawn(serve_until_shutdown(listener, app, state.clone(), async {
+                let _ = stop_rx.await;
+            }));
+            let client = state.http.clone();
+            let request =
+                tokio::spawn(
+                    async move { client.get(url).send().await.unwrap().text().await.unwrap() },
+                );
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            let finish_install = || {
+                *state.version.pending.lock() = Some(kiro_lb::update_install::InstalledUpdate {
+                    executable: "new-executable".into(),
+                    backup: "new-executable.previous".into(),
+                });
+                state.version.restart.notify_one();
+            };
+            if update_first {
+                finish_install();
+            } else {
+                stop_tx.send(()).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !state.quiesced.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if !update_first {
+                // Installation finishes after an operator stop, during the drain.
+                finish_install();
+            }
+            assert!(
+                !server.is_finished(),
+                "active request must finish before returning"
+            );
+            release.notify_one();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), request)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "finished"
+            );
+            let installed = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                installed.is_some(),
+                update_first,
+                "only an update-triggered shutdown can restart"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_stop_wins_when_both_shutdown_signals_are_ready() {
+        use super::*;
+        let state = state();
+        *state.version.pending.lock() = Some(kiro_lb::update_install::InstalledUpdate {
+            executable: "new-executable".into(),
+            backup: "new-executable.previous".into(),
+        });
+        state.version.restart.notify_one();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let installed = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_until_shutdown(listener, Router::new(), state, std::future::ready(())),
+        )
+        .await
+        .unwrap();
+        assert!(installed.is_none());
+    }
+
     #[test]
     fn restart_preserves_context_and_restores_unlaunchable_candidate() {
         use std::os::unix::fs::PermissionsExt;

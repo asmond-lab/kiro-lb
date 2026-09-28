@@ -87,13 +87,11 @@ export function useDashboard(): DashboardState {
   const [logOrder, setLogOrder] = useState<RequestLogOrder>("newest");
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
-  const [installingVersion, setInstallingVersion] = useState<string | null>(null);
   const [isRequestingInstall, setIsRequestingInstall] = useState(false);
   const installingRef = useRef(false);
   const checkingUpdatesRef = useRef(false);
+  const loadedVersionRef = useRef<string | undefined>(undefined);
   const currentVersion = overview?.version?.current;
-  const updateVersion = overview?.update?.version;
-  const updateStatus = overview?.update?.status;
   const isInstallingUpdate = isRequestingInstall || overview?.update?.status === "downloading" || overview?.update?.status === "restarting";
   // Pagination reads must not resurrect a stale page after a newer request.
   const logRequestId = useRef(0);
@@ -247,16 +245,15 @@ export function useDashboard(): DashboardState {
   }, [handleFailure, isAuthenticated, limit, loadLogs, offset]);
 
   useEffect(() => {
-    // Another tab may have started the update, or this tab may have reloaded
-    // during installation. Preserve the server's target before restart clears it.
-    if (updateVersion && (updateStatus === "downloading" || updateStatus === "restarting")) {
-      setInstallingVersion(updateVersion);
-    }
-    if (installingVersion && currentVersion === installingVersion) {
-      // Load the assets embedded in the new binary, not just its API data.
+    if (!currentVersion) return;
+    // A hidden tab or a lost install response can miss the entire installation.
+    // Reload on a running-version change, even if the server is already idle.
+    if (loadedVersionRef.current && loadedVersionRef.current !== currentVersion) {
       window.location.reload();
+    } else {
+      loadedVersionRef.current = currentVersion;
     }
-  }, [installingVersion, currentVersion, updateVersion, updateStatus]);
+  }, [currentVersion]);
 
   // Used by the periodic quota refresh. runAction would flip isMutating and call
   // reload(), which repaints every panel through its loading state.
@@ -310,7 +307,6 @@ export function useDashboard(): DashboardState {
     try {
       await runAction(async () => {
         const update = await dashboardApi.installUpdate(version);
-        setInstallingVersion(version);
         // Keep polling through a lost reload response, even while live is
         // paused. A restored old process reports idle and clears the busy UI.
         setOverview((current) => current ? { ...current, update } : current);

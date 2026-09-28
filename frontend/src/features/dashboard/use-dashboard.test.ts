@@ -11,7 +11,8 @@ interface Harness {
   effects: Effect[];
   stateIndex: number;
   stateOverrides: Record<number, unknown>;
-  latestInstallingVersion?: string | null;
+  refs: { current: unknown }[];
+  refIndex: number;
   latestAccounts: Account[];
   latestOverview?: Overview;
   latestRate?: RequestRate;
@@ -42,6 +43,8 @@ const harness = vi.hoisted((): Harness => ({
   effects: [],
   stateIndex: 0,
   stateOverrides: {},
+  refs: [],
+  refIndex: 0,
   latestAccounts: [],
   latestOverview: undefined,
   latestRate: undefined,
@@ -86,13 +89,15 @@ const STATE_IS_LOGS_LOADING = 12;
 const STATE_CONNECTION_ERROR = 16;
 const STATE_ACTION_ERROR = 17;
 const STATE_IS_CHECKING_UPDATES = 21;
-const STATE_INSTALLING_VERSION = 22;
 
 vi.mock("react", () => {
   const useEffect = (effect: Effect) => {
     harness.effects.push(effect);
   };
-  const useRef = <T,>(initial: T): { current: T } => ({ current: initial });
+  const useRef = <T,>(initial: T): { current: T } => {
+    const index = harness.refIndex++;
+    return (harness.refs[index] ??= { current: initial }) as { current: T };
+  };
   function useState<T>(initial: T): [T, (value: T) => void];
   function useState(initial: unknown): [unknown, (value: unknown) => void] {
     const index = harness.stateIndex++;
@@ -106,7 +111,6 @@ vi.mock("react", () => {
       if (index === STATE_ACTION_ERROR) harness.latestActionError = value as string | null;
       if (index === STATE_IS_LOGS_LOADING) harness.latestLogsLoading = value as boolean;
       if (index === STATE_IS_CHECKING_UPDATES) harness.latestCheckingUpdates = value as boolean;
-      if (index === STATE_INSTALLING_VERSION) harness.latestInstallingVersion = value as string | null;
     }];
   }
   return { useCallback: <T,>(callback: T) => callback, useEffect, useRef, useState };
@@ -182,7 +186,8 @@ describe("useDashboard", () => {
     harness.effects = [];
     harness.stateIndex = 0;
     harness.stateOverrides = {};
-    harness.latestInstallingVersion = undefined;
+    harness.refs = [];
+    harness.refIndex = 0;
     harness.latestAccounts = [];
     harness.latestOverview = undefined;
     harness.latestRate = undefined;
@@ -275,34 +280,66 @@ describe("useDashboard", () => {
   };
 
   it.each([
-    ["downloading", "0.2.1", 0],
-    ["downloading", "0.2.2", 1],
-    ["restarting", "0.2.1", 0],
-    ["restarting", "0.2.2", 1],
-  ] as const)("recovers a %s target and, when current becomes %s, reloads %i times", (status, current, reloads) => {
+    ["0.2.1", "0.2.2", 1],
+    ["0.2.1", "0.2.1", 0],
+    ["0.2.2", "0.2.1", 1],
+    [undefined, "0.2.2", 0],
+  ] as const)("reloads %s → %s only when the running version changes, without observing an install", (before, current, reloads) => {
     const overview: Overview = {
       ...healthyOverview(),
-      version: { current: "0.2.1", latest: "0.2.2", status: "update_available", releaseUrl: null },
-      update: { status, version: "0.2.2", error: null, disabledReason: null },
+      version: before ? { current: before, latest: null, status: "unavailable", releaseUrl: null } : undefined,
+      update: { status: "idle", version: null, error: null, disabledReason: null },
     };
     harness.stateOverrides[STATE_OVERVIEW] = overview;
     useDashboard();
     harness.effects[3]!();
-    expect(harness.latestInstallingVersion).toBe("0.2.2");
     expect(window.location.reload).not.toHaveBeenCalled();
     expect(harness.api.installUpdate).not.toHaveBeenCalled();
 
-    harness.stateOverrides[STATE_INSTALLING_VERSION] = harness.latestInstallingVersion;
+    // An authentication gap must not discard the version this document used.
     harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = undefined;
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).not.toHaveBeenCalled();
+
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
     harness.effects = [];
     harness.stateOverrides[STATE_OVERVIEW] = {
       ...overview,
-      version: { ...overview.version, current },
-      update: { ...overview.update, status: "idle", version: null },
+      version: { current, latest: current, status: "latest", releaseUrl: null },
     };
     useDashboard();
     harness.effects[3]!();
     expect(window.location.reload).toHaveBeenCalledTimes(reloads);
+  });
+
+  it("reloads after a lost install response even when the next snapshot is already idle on the new version", async () => {
+    mockHealthyLoad();
+    const overview: Overview = {
+      ...healthyOverview(),
+      version: { current: "0.2.1", latest: "0.2.2", status: "update_available", releaseUrl: null },
+      update: { status: "idle", version: null, error: null, disabledReason: null },
+    };
+    harness.stateOverrides[STATE_OVERVIEW] = overview;
+    const dashboard = useDashboard();
+    harness.effects[3]!();
+    harness.api.installUpdate.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    harness.api.overview.mockResolvedValue({ ...overview, version: { ...overview.version, current: "0.2.2" } });
+    await dashboard.installUpdate("0.2.2");
+    expect(harness.latestActionError).toBe("Failed to fetch");
+    expect(harness.latestOverview?.update?.status).toBe("idle");
+
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = harness.latestOverview;
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).toHaveBeenCalledOnce();
   });
 
   it("coalesces manual update checks and reloads the result without a polling tick", async () => {
