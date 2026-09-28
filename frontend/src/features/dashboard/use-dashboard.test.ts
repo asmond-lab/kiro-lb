@@ -10,6 +10,8 @@ type Timer = () => Promise<void>;
 interface Harness {
   effects: Effect[];
   stateIndex: number;
+  stateOverrides: Record<number, unknown>;
+  latestInstallingVersion?: string | null;
   latestAccounts: Account[];
   latestOverview?: Overview;
   latestRate?: RequestRate;
@@ -39,6 +41,7 @@ interface Harness {
 const harness = vi.hoisted((): Harness => ({
   effects: [],
   stateIndex: 0,
+  stateOverrides: {},
   latestAccounts: [],
   latestOverview: undefined,
   latestRate: undefined,
@@ -83,6 +86,7 @@ const STATE_IS_LOGS_LOADING = 12;
 const STATE_CONNECTION_ERROR = 16;
 const STATE_ACTION_ERROR = 17;
 const STATE_IS_CHECKING_UPDATES = 21;
+const STATE_INSTALLING_VERSION = 22;
 
 vi.mock("react", () => {
   const useEffect = (effect: Effect) => {
@@ -92,7 +96,8 @@ vi.mock("react", () => {
   function useState<T>(initial: T): [T, (value: T) => void];
   function useState(initial: unknown): [unknown, (value: unknown) => void] {
     const index = harness.stateIndex++;
-    return [index === STATE_IS_AUTHENTICATED ? true : initial, (value: unknown) => {
+    const current = index in harness.stateOverrides ? harness.stateOverrides[index] : index === STATE_IS_AUTHENTICATED ? true : initial;
+    return [current, (value: unknown) => {
       if (index === STATE_OVERVIEW) harness.latestOverview = value as Overview;
       if (index === STATE_ACCOUNTS && isAccountArray(value)) harness.latestAccounts = value;
       if (index === STATE_RATE) harness.latestRate = value as RequestRate;
@@ -101,6 +106,7 @@ vi.mock("react", () => {
       if (index === STATE_ACTION_ERROR) harness.latestActionError = value as string | null;
       if (index === STATE_IS_LOGS_LOADING) harness.latestLogsLoading = value as boolean;
       if (index === STATE_IS_CHECKING_UPDATES) harness.latestCheckingUpdates = value as boolean;
+      if (index === STATE_INSTALLING_VERSION) harness.latestInstallingVersion = value as string | null;
     }];
   }
   return { useCallback: <T,>(callback: T) => callback, useEffect, useRef, useState };
@@ -175,6 +181,8 @@ describe("useDashboard", () => {
     vi.useFakeTimers();
     harness.effects = [];
     harness.stateIndex = 0;
+    harness.stateOverrides = {};
+    harness.latestInstallingVersion = undefined;
     harness.latestAccounts = [];
     harness.latestOverview = undefined;
     harness.latestRate = undefined;
@@ -188,6 +196,7 @@ describe("useDashboard", () => {
     harness.api.requestLogs.mockResolvedValue(logs);
     vi.stubGlobal("document", { visibilityState: "visible" });
     vi.stubGlobal("window", {
+      location: { reload: vi.fn() },
       clearTimeout: vi.fn(),
       setTimeout: (callback: Timer, delay?: number) => {
         harness.timers.push(callback);
@@ -264,6 +273,37 @@ describe("useDashboard", () => {
     harness.api.keyUsage.mockResolvedValue({ usage: {} });
     harness.api.accountTokenUsage.mockResolvedValue({ usage: {} });
   };
+
+  it.each([
+    ["downloading", "0.2.1", 0],
+    ["downloading", "0.2.2", 1],
+    ["restarting", "0.2.1", 0],
+    ["restarting", "0.2.2", 1],
+  ] as const)("recovers a %s target and, when current becomes %s, reloads %i times", (status, current, reloads) => {
+    const overview: Overview = {
+      ...healthyOverview(),
+      version: { current: "0.2.1", latest: "0.2.2", status: "update_available", releaseUrl: null },
+      update: { status, version: "0.2.2", error: null, disabledReason: null },
+    };
+    harness.stateOverrides[STATE_OVERVIEW] = overview;
+    useDashboard();
+    harness.effects[3]!();
+    expect(harness.latestInstallingVersion).toBe("0.2.2");
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(harness.api.installUpdate).not.toHaveBeenCalled();
+
+    harness.stateOverrides[STATE_INSTALLING_VERSION] = harness.latestInstallingVersion;
+    harness.stateIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = {
+      ...overview,
+      version: { ...overview.version, current },
+      update: { ...overview.update, status: "idle", version: null },
+    };
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).toHaveBeenCalledTimes(reloads);
+  });
 
   it("coalesces manual update checks and reloads the result without a polling tick", async () => {
     mockHealthyLoad();

@@ -121,9 +121,21 @@ pub fn start_install(state: Shared, version: &str) -> Result<Installation, &'sta
                 .and_then(|p| p.canonicalize())
                 .map_err(|e| e.to_string())?;
             let prepared = crate::update_install::prepare(&state.http, executable, &tag).await?;
-            tokio::task::spawn_blocking(move || prepared.replace())
-                .await
-                .map_err(|e| e.to_string())?
+            let updating = state.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = prepared.replace();
+                // Windows may already have renamed the running image before
+                // replacement fails. Restoring the original path does not fix
+                // current_exe() for this process; another attempt could update
+                // the relocated image instead of the installed executable.
+                if cfg!(windows) && result.is_err() {
+                    updating.version.installation.write().disabled_reason =
+                        Some("restart_required");
+                }
+                result
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         .await;
         match result {

@@ -118,7 +118,7 @@ export function InfoPanel({ overview, accounts, routableAccounts, lastUpdatedAt,
                 </Button>
               )}
             </div>
-            {versionStatus === "update_available" && update?.disabledReason && (
+            {update?.disabledReason && (versionStatus === "update_available" || update.disabledReason === "restart_required") && (
               <p className="text-sm leading-relaxed text-muted-foreground">{t(`info.installDisabled.${update.disabledReason}`)}</p>
             )}
             {isInstallingUpdate && !isCheckingUpdates && (

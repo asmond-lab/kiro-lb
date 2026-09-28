@@ -92,6 +92,8 @@ export function useDashboard(): DashboardState {
   const installingRef = useRef(false);
   const checkingUpdatesRef = useRef(false);
   const currentVersion = overview?.version?.current;
+  const updateVersion = overview?.update?.version;
+  const updateStatus = overview?.update?.status;
   const isInstallingUpdate = isRequestingInstall || overview?.update?.status === "downloading" || overview?.update?.status === "restarting";
   // Pagination reads must not resurrect a stale page after a newer request.
   const logRequestId = useRef(0);
@@ -245,11 +247,16 @@ export function useDashboard(): DashboardState {
   }, [handleFailure, isAuthenticated, limit, loadLogs, offset]);
 
   useEffect(() => {
+    // Another tab may have started the update, or this tab may have reloaded
+    // during installation. Preserve the server's target before restart clears it.
+    if (updateVersion && (updateStatus === "downloading" || updateStatus === "restarting")) {
+      setInstallingVersion(updateVersion);
+    }
     if (installingVersion && currentVersion === installingVersion) {
       // Load the assets embedded in the new binary, not just its API data.
       window.location.reload();
     }
-  }, [installingVersion, currentVersion]);
+  }, [installingVersion, currentVersion, updateVersion, updateStatus]);
 
   // Used by the periodic quota refresh. runAction would flip isMutating and call
   // reload(), which repaints every panel through its loading state.
