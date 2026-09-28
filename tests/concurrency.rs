@@ -23,9 +23,13 @@ fn state() -> Shared {
         }),
         http,
         started_at: 0.0,
+        version: Default::default(),
         quiesced: AtomicBool::new(false),
+        data_plane_paused: AtomicBool::new(false),
         inflight: AtomicI64::new(0),
         drained: tokio::sync::Notify::new(),
+        data_inflight: AtomicI64::new(0),
+        data_drained: tokio::sync::Notify::new(),
     })
 }
 
@@ -119,6 +123,61 @@ async fn an_account_mutation_counts_toward_the_drain() {
         .unwrap();
     assert_eq!(seen.load(Ordering::SeqCst), 1);
     assert_eq!(s.inflight.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pausing_the_data_plane_waits_for_admitted_work_and_rejects_new_work() {
+    let s = state();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered_handler, release_handler) = (entered.clone(), release.clone());
+    let router = Router::new()
+        .route(
+            "/v1/test",
+            post(move || {
+                let (entered, release) = (entered_handler.clone(), release_handler.clone());
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "done"
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            s.clone(),
+            app::data_plane_middleware,
+        ))
+        .with_state(s.clone());
+    let active_router = router.clone();
+    let active = tokio::spawn(async move {
+        let response = active_router
+            .oneshot(Request::post("/v1/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    });
+    entered.notified().await;
+
+    let pause = app::pause_data_plane(&s);
+    let mut drained = Box::pin(app::wait_for_data_plane_drain(&s));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut drained)
+            .await
+            .is_err()
+    );
+    let rejected = router
+        .clone()
+        .oneshot(Request::post("/v1/test").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    release.notify_one();
+    drained.await;
+    active.await.unwrap();
+    drop(pause);
 }
 
 fn holding(

@@ -22,9 +22,13 @@ fn state() -> Shared {
         }),
         http,
         started_at: 0.0,
+        version: Default::default(),
         quiesced: AtomicBool::new(false),
+        data_plane_paused: AtomicBool::new(false),
         inflight: AtomicI64::new(0),
         drained: tokio::sync::Notify::new(),
+        data_inflight: AtomicI64::new(0),
+        data_drained: tokio::sync::Notify::new(),
     })
 }
 

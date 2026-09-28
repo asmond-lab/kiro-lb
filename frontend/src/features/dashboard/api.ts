@@ -52,6 +52,8 @@ export const dashboardApi = {
   login: (password: string) => request<{ ok: boolean }>("/api/dashboard/login", { method: "POST", body: JSON.stringify({ password }) }),
   logout: () => request<{ ok: boolean }>("/api/dashboard/logout", { method: "POST" }),
   overview: () => request<Overview>("/api/dashboard/overview"),
+  checkForUpdates: () => request<NonNullable<Overview["version"]>>("/api/dashboard/updates/check", { method: "POST" }),
+  installUpdate: (version: string) => request<NonNullable<Overview["update"]>>("/api/dashboard/updates/install", { method: "POST", body: JSON.stringify({ version }) }),
   endpoints: () => request<EndpointsResponse>("/api/dashboard/endpoints"),
   saveEndpoints: (settings: EndpointSettings) =>
     request<{ settings: EndpointSettings }>("/api/dashboard/endpoints", {

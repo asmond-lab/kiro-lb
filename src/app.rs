@@ -23,9 +23,13 @@ pub struct AppState {
     pub transport: Arc<Transport>,
     pub http: reqwest::Client,
     pub started_at: f64,
+    pub version: crate::updates::UpdateChecker,
     pub quiesced: AtomicBool,
+    pub data_plane_paused: AtomicBool,
     pub inflight: AtomicI64,
     pub drained: tokio::sync::Notify,
+    pub data_inflight: AtomicI64,
+    pub data_drained: tokio::sync::Notify,
 }
 
 pub type Shared = Arc<AppState>;
@@ -112,7 +116,13 @@ pub async fn data_plane_middleware(
     if !path.starts_with("/v1/") {
         return next.run(req).await;
     }
-    if state.quiesced.load(Ordering::SeqCst) {
+    if state.quiesced.load(Ordering::SeqCst) || state.data_plane_paused.load(Ordering::SeqCst) {
+        return openai_error(503, "Service temporarily unavailable");
+    }
+    let guard = InflightGuard::enter_data(&state);
+    // Close the race with a drain beginning after the first check but before
+    // this request registered itself as in flight.
+    if state.quiesced.load(Ordering::SeqCst) || state.data_plane_paused.load(Ordering::SeqCst) {
         return openai_error(503, "Service temporarily unavailable");
     }
     let started = Instant::now();
@@ -132,7 +142,6 @@ pub async fn data_plane_middleware(
         .then(crate::debug::Capture::new)
         .flatten();
     ctx.capture = capture.clone();
-    let guard = InflightGuard::enter(&state);
     let mut log = RequestLogGuard {
         route: path,
         started,
@@ -272,6 +281,7 @@ pub fn is_account_mutation(method: &axum::http::Method, path: &str) -> bool {
 /// drops it and the count cannot leak.
 pub struct InflightGuard {
     state: Shared,
+    data_plane: bool,
 }
 
 impl InflightGuard {
@@ -279,15 +289,51 @@ impl InflightGuard {
         state.inflight.fetch_add(1, Ordering::SeqCst);
         InflightGuard {
             state: state.clone(),
+            data_plane: false,
+        }
+    }
+
+    fn enter_data(state: &Shared) -> Self {
+        state.inflight.fetch_add(1, Ordering::SeqCst);
+        state.data_inflight.fetch_add(1, Ordering::SeqCst);
+        InflightGuard {
+            state: state.clone(),
+            data_plane: true,
         }
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
+        if self.data_plane && self.state.data_inflight.fetch_sub(1, Ordering::SeqCst) <= 1 {
+            self.state.data_drained.notify_waiters();
+        }
         if self.state.inflight.fetch_sub(1, Ordering::SeqCst) <= 1 {
             self.state.drained.notify_waiters();
         }
+    }
+}
+
+pub struct DataPlanePause(Shared);
+
+impl Drop for DataPlanePause {
+    fn drop(&mut self) {
+        self.0.data_plane_paused.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn pause_data_plane(state: &Shared) -> DataPlanePause {
+    state.data_plane_paused.store(true, Ordering::SeqCst);
+    DataPlanePause(state.clone())
+}
+
+pub async fn wait_for_data_plane_drain(state: &Shared) {
+    while state.data_inflight.load(Ordering::SeqCst) > 0 {
+        let notified = state.data_drained.notified();
+        if state.data_inflight.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        notified.await;
     }
 }
 

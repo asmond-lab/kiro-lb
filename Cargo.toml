@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "=0.8.4", default-features = false, features = ["http1", "http2", "tokio", "json", "query"] }
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "process", "io-util"] }
 tokio-util = { version = "=0.7.19", features = ["io"] }
 reqwest = { version = "=0.12.23", default-features = false, features = ["rustls-tls", "http2", "stream", "socks", "json"] }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
@@ -40,6 +40,11 @@ mime_guess = "=2.0.5"
 dotenvy = "0.15"
 unicode-general-category = "1"
 hostname = "0.4"
+semver = "1"
+self-replace = "=1.5.0"
+tempfile = "3"
+tar = "0.4"
+flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
@@ -52,7 +57,6 @@ winresource = "=0.1.23"
 
 [dev-dependencies]
 hex = "=0.4.3"
-flate2 = "1"
 tower = { version = "=0.5.3", features = ["util"] }
 
 [profile.release]

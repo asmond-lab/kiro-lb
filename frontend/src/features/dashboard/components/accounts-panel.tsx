@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
-import { AtSign, Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2 } from "lucide-react";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -44,7 +44,7 @@ function RoutingStateCell({ account }: { account: Account }) {
   const { t } = usePreferences();
   const state = account.routingState;
   const label = ROUTING_STATE_LABEL[state] ? t(`accounts.state.${state}`) : state;
-  const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
+  const variant = state === "available" ? "secondary" : state === "uninitialized" || state === "disabled" ? "outline" : "destructive";
   const suspended = state === "suspended";
   const authDead = state === "auth_dead";
   // The one reset display for the row: the countdown from the router, stated
@@ -138,11 +138,8 @@ function AccountCell({ account }: { account: Account }) {
   if (!email) return <CopyableAccountId id={account.id} />;
   return (
     <div className="group flex min-w-0 flex-col gap-0.5">
-      <span className="flex min-w-0 items-center gap-1.5 font-medium" title={email}>
-        <AtSign size={13} className="shrink-0 text-muted-foreground" />
-        <span className="truncate">{email}</span>
-      </span>
-      <CopyableAccountId id={account.id} className="pl-[1.15rem] text-muted-foreground" />
+      <span className="block truncate font-medium" title={email}>{email}</span>
+      <CopyableAccountId id={account.id} className="text-muted-foreground" />
     </div>
   );
 }
@@ -195,6 +192,82 @@ function UsageCell({ account }: { account: Account }) {
   );
 }
 
+function AccountCard({
+  account,
+  isMutating,
+  onDelete,
+  onToggle,
+}: {
+  account: Account;
+  isMutating?: boolean;
+  onDelete: (account: Account) => void;
+  onToggle?: (id: string, enabled: boolean) => void;
+}) {
+  const { t } = usePreferences();
+  const overage = account.usage?.overageStatus;
+  return (
+    <article className={cn("space-y-4 rounded-lg border p-4", account.enabled === false && "bg-muted/15 text-muted-foreground")}>
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0 flex-1"><AccountCell account={account} /></div>
+        <RoutingStateCell account={account} />
+      </div>
+      <UsageCell account={account} />
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm sm:grid-cols-3">
+        <div className="min-w-0">
+          <dt className="text-xs text-muted-foreground">{t("accounts.col.plan")}</dt>
+          <dd className="truncate text-foreground">{account.usage?.subscriptionTitle ?? "—"}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t("accounts.col.overage")}</dt>
+          <dd className="text-foreground">
+            {overage == null || overage === "UNKNOWN"
+              ? "—"
+              : overage === "DISABLED"
+                ? t("accounts.overage.disabled")
+                : overage === "ENABLED"
+                  ? t("accounts.overage.enabled")
+                  : overage}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t("accounts.col.requests")}</dt>
+          <dd className="tabular-nums text-foreground">{account.requests.toLocaleString()}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t("accounts.col.failures")}</dt>
+          <dd className="tabular-nums text-foreground">{account.failures.toLocaleString()}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t("accounts.col.sessions")}</dt>
+          <dd className="tabular-nums text-foreground">{(account.sessions ?? 0).toLocaleString()}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t("accounts.col.updated")}</dt>
+          <dd className="text-xs text-foreground">{formatTimestamp(account.usage?.updatedAt)}</dd>
+        </div>
+      </dl>
+      <div className="flex items-center justify-end gap-2 border-t pt-3">
+        {onToggle && account.enabled !== undefined && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={isMutating}
+            onClick={() => onToggle(account.id, !account.enabled)}
+          >
+            {account.enabled ? <PauseCircle /> : <PlayCircle />}
+            {t(account.enabled ? "accounts.pause" : "accounts.resume")}
+          </Button>
+        )}
+        {account.deletable && (
+          <Button size="sm" variant="ghost" className="text-muted-foreground hover:text-destructive" disabled={isMutating} onClick={() => onDelete(account)}>
+            <Trash2 /> {t("accounts.delete")}
+          </Button>
+        )}
+      </div>
+    </article>
+  );
+}
+
 export type AccountsPanelProps = {
   accounts: Account[];
   isLoading: boolean;
@@ -206,10 +279,14 @@ export type AccountsPanelProps = {
 export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
   const { t } = usePreferences();
   const [deleting, setDeleting] = useState<Account | null>(null);
+  const activeAccounts = accounts.filter((account) => account.enabled !== false);
+  const pausedAccounts = accounts.filter((account) => account.enabled === false);
+  const displayedAccounts = [...activeAccounts, ...pausedAccounts];
   return (
     <Card>
       <CardHeader>
         <CardTitle>{t("accounts.title")}</CardTitle>
+        <CardDescription>{t("accounts.description")}</CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading ? (
@@ -217,7 +294,25 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
         ) : accounts.length === 0 ? (
           <EmptyState icon={ServerCog} title={t("accounts.emptyTitle")} description={t("accounts.emptyDescription")} />
         ) : (
-          <Table>
+          <>
+            <div className="space-y-3 lg:hidden">
+              {activeAccounts.map((account) => (
+                <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+              ))}
+              {pausedAccounts.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <div className="rounded-md bg-muted/30 px-3 py-2">
+                    <p className="font-medium">{t("accounts.pausedSection")}</p>
+                    <p className="text-xs text-muted-foreground">{t("accounts.pausedDescription")}</p>
+                  </div>
+                  {pausedAccounts.map((account) => (
+                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="hidden lg:block">
+              <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>{t("accounts.col.account")}</TableHead>
@@ -234,78 +329,88 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
               </TableRow>
             </TableHeader>
             <TableBody>
-              {accounts.map((account) => (
-                <TableRow key={account.id}>
-                  <TableCell className="max-w-56">
-                    <AccountCell account={account} />
-                  </TableCell>
-                  <TableCell>
-                    <RoutingStateCell account={account} />
-                  </TableCell>
-                  <TableCell className="hidden md:table-cell">{account.usage?.subscriptionTitle ?? "—"}</TableCell>
-                  <TableCell className="hidden md:table-cell">
-                    {account.usage?.overageStatus == null || account.usage.overageStatus === "UNKNOWN" ? (
-                      "—"
-                    ) : (
-                      <Badge variant={account.usage.overageStatus === "DISABLED" ? "outline" : "secondary"}>
-                        {account.usage.overageStatus === "DISABLED"
-                          ? t("accounts.overage.disabled")
-                          : account.usage.overageStatus === "ENABLED"
-                            ? t("accounts.overage.enabled")
-                            : account.usage.overageStatus}
-                        {account.usage.overageUsed ? ` · ${account.usage.overageUsed.toFixed(2)}` : ""}
-                      </Badge>
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    <UsageCell account={account} />
-                  </TableCell>
-                  <TableCell className="text-right tabular-nums">{account.requests.toLocaleString()}</TableCell>
-                  <TableCell className="text-right tabular-nums">{account.failures.toLocaleString()}</TableCell>
-                  <TableCell className="hidden text-right tabular-nums md:table-cell">
-                    {(account.sessions ?? 0).toLocaleString()}
-                  </TableCell>
-                  <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
-                    {formatTimestamp(account.usage?.updatedAt)}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      {onToggleAccount && account.enabled !== undefined ? (
-                        <Button
-                          size="xs"
-                          variant="ghost"
-                          className="text-muted-foreground hover:text-foreground"
-                          disabled={isMutating}
-                          title={
-                            account.enabled
-                              ? t("accounts.disableTitle")
-                              : t("accounts.enableTitle")
-                          }
-                          aria-label={t(account.enabled ? "accounts.disableAria" : "accounts.enableAria", { id: account.id })}
-                          onClick={() => onToggleAccount(account.id, !account.enabled)}
-                        >
-                          {account.enabled ? <PauseCircle size={14} /> : <PlayCircle size={14} />}
-                        </Button>
-                      ) : null}
-                      {account.deletable ? (
-                        <Button
-                          size="xs"
-                          variant="ghost"
-                          className="text-muted-foreground hover:text-destructive"
-                          disabled={isMutating}
-                          title={t("accounts.delete")}
-                          aria-label={t("accounts.deleteAria", { id: account.id })}
-                          onClick={() => setDeleting(account)}
-                        >
-                          <Trash2 size={14} />
-                        </Button>
-                      ) : null}
-                    </div>
-                  </TableCell>
-                </TableRow>
+              {displayedAccounts.map((account, index) => (
+                <Fragment key={account.id}>
+                  {account.enabled === false && (index === 0 || displayedAccounts[index - 1]?.enabled !== false) && (
+                    <TableRow className="bg-muted/30 hover:bg-muted/30">
+                      <TableCell colSpan={10} className="whitespace-normal py-3">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="font-medium text-foreground">{t("accounts.pausedSection")}</span>
+                          <span className="text-xs text-muted-foreground">{t("accounts.pausedDescription")}</span>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  <TableRow className={account.enabled === false ? "bg-muted/15 text-muted-foreground hover:bg-muted/25" : undefined}>
+                    <TableCell className="max-w-56">
+                      <AccountCell account={account} />
+                    </TableCell>
+                    <TableCell>
+                      <RoutingStateCell account={account} />
+                    </TableCell>
+                    <TableCell className="hidden md:table-cell">{account.usage?.subscriptionTitle ?? "—"}</TableCell>
+                    <TableCell className="hidden md:table-cell">
+                      {account.usage?.overageStatus == null || account.usage.overageStatus === "UNKNOWN" ? (
+                        "—"
+                      ) : (
+                        <Badge variant={account.usage.overageStatus === "DISABLED" ? "outline" : "secondary"}>
+                          {account.usage.overageStatus === "DISABLED"
+                            ? t("accounts.overage.disabled")
+                            : account.usage.overageStatus === "ENABLED"
+                              ? t("accounts.overage.enabled")
+                              : account.usage.overageStatus}
+                          {account.usage.overageUsed ? ` · ${account.usage.overageUsed.toFixed(2)}` : ""}
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <UsageCell account={account} />
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{account.requests.toLocaleString()}</TableCell>
+                    <TableCell className="text-right tabular-nums">{account.failures.toLocaleString()}</TableCell>
+                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                      {(account.sessions ?? 0).toLocaleString()}
+                    </TableCell>
+                    <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
+                      {formatTimestamp(account.usage?.updatedAt)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        {onToggleAccount && account.enabled !== undefined ? (
+                          <Button
+                            size="xs"
+                            variant={account.enabled ? "ghost" : "outline"}
+                            className={account.enabled ? "text-muted-foreground hover:text-foreground" : "text-primary hover:text-primary"}
+                            disabled={isMutating}
+                            title={account.enabled ? t("accounts.disableTitle") : t("accounts.enableTitle")}
+                            aria-label={t(account.enabled ? "accounts.disableAria" : "accounts.enableAria", { id: account.id })}
+                            onClick={() => onToggleAccount(account.id, !account.enabled)}
+                          >
+                            {account.enabled ? <PauseCircle size={14} /> : <PlayCircle size={14} />}
+                          </Button>
+                        ) : null}
+                        {account.deletable ? (
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            className="text-muted-foreground hover:text-destructive"
+                            disabled={isMutating}
+                            title={t("accounts.delete")}
+                            aria-label={t("accounts.deleteAria", { id: account.id })}
+                            onClick={() => setDeleting(account)}
+                          >
+                            <Trash2 size={14} />
+                          </Button>
+                        ) : null}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                </Fragment>
               ))}
             </TableBody>
-          </Table>
+              </Table>
+            </div>
+          </>
         )}
       </CardContent>
 

@@ -81,6 +81,8 @@ fn router(state: app::Shared) -> Router {
         )
         .route("/api/dashboard/accounts/usage", get(d::account_usage))
         .route("/api/dashboard/overview", get(d::overview))
+        .route("/api/dashboard/updates/check", post(d::check_updates))
+        .route("/api/dashboard/updates/install", post(d::install_update))
         .route(
             "/api/dashboard/accounts",
             get(d::accounts).post(d::register_account),
@@ -244,6 +246,12 @@ fn parse_args() -> (String, u16) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // The updater probes a staged binary before replacing anything. This must
+    // run before bootstrap so --version never writes .env or opens the store.
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("kirolb {}", config::APP_VERSION);
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("client") {
         std::process::exit(kiro_lb::client_setup::cli(&args[2..]));
     }
@@ -288,10 +296,14 @@ fn main() {
         .enable_all()
         .build()
         .expect("runtime");
-    runtime.block_on(serve(host, port));
+    let installed = runtime.block_on(serve(host, port));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    if let Some(installed) = installed {
+        restart_updated(installed);
+    }
 }
 
-async fn serve(host: String, port: u16) {
+async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::InstalledUpdate> {
     let cfg = config::get();
     if cfg.first_token_timeout >= cfg.streaming_read_timeout {
         tracing::warn!(
@@ -360,9 +372,13 @@ async fn serve(host: String, port: u16) {
         }),
         http: http.clone(),
         started_at: store::now_f64(),
+        version: Default::default(),
         quiesced: AtomicBool::new(quiesced),
+        data_plane_paused: AtomicBool::new(false),
         inflight: AtomicI64::new(0),
         drained: tokio::sync::Notify::new(),
+        data_inflight: AtomicI64::new(0),
+        data_drained: tokio::sync::Notify::new(),
     });
     if !quiesced {
         let s = state.clone();
@@ -390,9 +406,19 @@ async fn serve(host: String, port: u16) {
             ""
         }
     );
+    tokio::spawn(kiro_lb::updates::run(state.clone()));
     let app = router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    let stopping = state.clone();
     let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown() => {},
+                _ = stopping.version.restart.notified() => {},
+            }
+            stopping
+                .quiesced
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        })
         .await;
     tracing::info!("Shutting down: final flush");
     let p = pool.clone();
@@ -403,6 +429,35 @@ async fn serve(host: String, port: u16) {
         p.save_state();
     })
     .await;
+    let installed = state.version.pending.lock().take();
+    installed
+}
+
+fn restart_updated(installed: kiro_lb::update_install::InstalledUpdate) {
+    fn launch(path: &std::path::Path) -> std::io::Result<()> {
+        let mut command = std::process::Command::new(path);
+        command.args(std::env::args_os().skip(1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            Err(command.exec())
+        }
+        #[cfg(not(unix))]
+        {
+            command.spawn().map(|_| ())
+        }
+    }
+    if let Err(error) = launch(&installed.executable) {
+        tracing::error!("Cannot restart updated executable: {error}; restoring backup");
+        if let Err(error) = installed.restore() {
+            tracing::error!("Cannot restore {}: {error}", installed.backup.display());
+            std::process::exit(1);
+        }
+        if let Err(error) = launch(&installed.executable) {
+            tracing::error!("Cannot restart restored executable: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn shutdown() {
@@ -469,4 +524,57 @@ fn print_banner(addr: &SocketAddr) {
     println!("  {green}\u{279C}{reset}  {cyan}https://github.com/minpeter/kiro-lb/issues{reset}");
     println!("  {dim}{rule}{reset}");
     println!();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn restart_preserves_context_and_restores_unlaunchable_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root) = std::env::var_os("KIROLB_TEST_RESTART_CHILD") {
+            let root = std::path::PathBuf::from(root);
+            super::restart_updated(kiro_lb::update_install::InstalledUpdate {
+                executable: root.join("candidate"),
+                backup: root.join("candidate.previous"),
+            });
+            panic!("successful Unix restart must replace the process");
+        }
+        let filter = "tests::restart_preserves_context_and_restores_unlaunchable_candidate";
+        for rollback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let candidate = dir.path().join("candidate");
+            let backup = dir.path().join("candidate.previous");
+            let script = "#!/bin/sh\nprintf '%s\\n' \"$KIROLB_TEST_CONTEXT\" \"$PWD\" \"$@\"\n";
+            std::fs::write(&backup, script).unwrap();
+            std::fs::write(
+                &candidate,
+                if rollback {
+                    "#!/nonexistent-kirolb-interpreter\n"
+                } else {
+                    script
+                },
+            )
+            .unwrap();
+            for path in [&candidate, &backup] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .current_dir(dir.path())
+                .env("KIROLB_TEST_RESTART_CHILD", dir.path())
+                .env("KIROLB_TEST_CONTEXT", "preserved environment")
+                .args(["--exact", filter, "--nocapture"])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(
+                stdout.contains(&format!(
+                    "preserved environment\n{}\n--exact\n{filter}\n--nocapture\n",
+                    dir.path().display()
+                )),
+                "{stdout}"
+            );
+            assert_eq!(std::fs::read_to_string(&candidate).unwrap(), script);
+        }
+    }
 }

@@ -153,9 +153,13 @@ pub fn state(pool: Arc<AccountManager>, http: &reqwest::Client, quiesced: bool) 
         }),
         http: http.clone(),
         started_at: 0.0,
+        version: Default::default(),
         quiesced: AtomicBool::new(quiesced),
+        data_plane_paused: AtomicBool::new(false),
         inflight: AtomicI64::new(0),
         drained: tokio::sync::Notify::new(),
+        data_inflight: AtomicI64::new(0),
+        data_drained: tokio::sync::Notify::new(),
     })
 }
 
