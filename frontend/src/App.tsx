@@ -5,7 +5,6 @@ import {
   CreditCard,
   Wallet,
   Info,
-  Palette,
   KeyRound,
   LayoutDashboard,
   ServerCog,
@@ -186,10 +185,6 @@ export default function App() {
               <Settings aria-hidden />
               <span className="hidden sm:inline">{t("settings")}</span>
             </TabsTrigger>
-            <TabsTrigger value="theme" className="gap-2 px-2 sm:px-3" title={t("theme")}>
-              <Palette aria-hidden />
-              <span className="hidden sm:inline">{t("theme")}</span>
-            </TabsTrigger>
             <TabsTrigger value="info" className="gap-2 px-2 sm:px-3" title={t("info")}>
               <Info aria-hidden />
               <span className="hidden sm:inline">{t("info")}</span>
@@ -323,11 +318,10 @@ export default function App() {
           </TabsContent>
 
           <TabsContent value="settings">
-            <SettingsPanel onNotice={dashboard.notify} />
-          </TabsContent>
-
-          <TabsContent value="theme">
-            <AppearancePanel />
+            <div className="space-y-6">
+              <AppearancePanel />
+              <SettingsPanel onNotice={dashboard.notify} />
+            </div>
           </TabsContent>
         </Tabs>
       </main>
