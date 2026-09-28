@@ -73,7 +73,6 @@ impl RequestCtx {
         GenerationCredits {
             usage: self.usage.clone(),
             attribution,
-            snapshot: None,
         }
     }
 
@@ -122,28 +121,26 @@ impl RequestCtx {
     }
 }
 
-/// Credit snapshot reducer for one physical generation. A request can own
-/// several of these (for example, a search follow-up), whose final snapshots
-/// contribute additively to the request total.
+/// Adds every valid credit event, matching the official Kiro CLI's usage summary.
+/// Attribution stays bound to the account that started this physical generation,
+/// including when a retry or search follow-up changes the request's account.
 pub struct GenerationCredits {
     usage: Arc<Mutex<RequestUsage>>,
     attribution: Option<Key>,
-    snapshot: Option<f64>,
 }
 
 impl GenerationCredits {
     pub fn report(&mut self, event: &crate::parser::MeteringEvent) {
-        let Some(next) = event.credits() else {
+        let Some(credits) = event.credits() else {
             return;
         };
-        let previous = self.snapshot.replace(next).unwrap_or(0.0);
         let mut usage = self.usage.lock();
-        usage.credits = Some(usage.credits.unwrap_or(0.0) + next - previous);
+        usage.credits = Some(usage.credits.unwrap_or(0.0) + credits);
         drop(usage);
         if let Some(key) = &self.attribution {
             let mut pending = PENDING.lock();
             let entry = pending.entry(key.clone()).or_default();
-            entry.credits = Some(entry.credits.unwrap_or(0.0) + next - previous);
+            entry.credits = Some(entry.credits.unwrap_or(0.0) + credits);
         }
     }
 }

@@ -211,6 +211,21 @@ The generated fields and paths follow the current official client contracts:
 - [Connect Claude Code to an LLM gateway](https://code.claude.com/docs/en/llm-gateway-connect)
 - [Claude Code gateway compatibility guide](https://code.claude.com/docs/en/llm-gateway-protocol)
 
+## Credit accounting
+
+Credit metering follows the additive usage-summary policy in official Kiro CLI
+2.24.1 (`@kiro/agent` 0.66.8). Every valid `credit` or `credits` event adds to
+the request total, including repeated values within one upstream response and
+events from retry or search follow-up generations. A zero contributes zero; it
+does not erase earlier readings. Missing credits remain unknown, distinct from a
+measured zero, and each generation's credits stay attributed to its origin account.
+
+This is an explicit official-client compatibility policy, not an independently
+verified upstream billing contract; see [#85](https://github.com/minpeter/kiro-lb/issues/85)
+for the source evidence and live-capture limits. Metered credits remain separate
+from model-cost estimates and cache-token counts. Existing stored totals are not
+recalculated because individual historical metering events are not retained.
+
 ## Release maintenance
 
 Release-plz opens or updates a release PR after changes reach `main`. Review its

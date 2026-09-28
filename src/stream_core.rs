@@ -172,9 +172,8 @@ pub fn parse_kiro_stream_metered(
 }
 
 /// Attributes metering to one physical upstream generation while leaving the
-/// event stream intact for protocol conversion. Each call establishes a new
-/// additive generation boundary; repeated frames inside it replace its latest
-/// snapshot.
+/// event stream intact for protocol conversion. Each call binds the generation's
+/// origin account; every valid credit event adds to the request total.
 pub fn meter_generation(mut events: EventStream, request: &RequestCtx) -> EventStream {
     let mut meter = request.begin_generation();
     Box::pin(async_stream::stream! {

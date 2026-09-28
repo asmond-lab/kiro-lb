@@ -99,7 +99,7 @@ pub fn stream(
                 KiroEvent::Metering(m) => {
                     metering_reported = true;
                     if let Some(credits) = m.credits() {
-                        metering = Some(credits);
+                        metering = Some(metering.unwrap_or(0.0) + credits);
                     }
                 }
                 KiroEvent::Usage(_) => legacy_usage_reported = true,

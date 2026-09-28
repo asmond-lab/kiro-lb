@@ -111,13 +111,19 @@ fn schema_rejects_invalid_values_and_excludes_other_units() {
 }
 
 #[tokio::test]
-async fn repeated_snapshots_replace_but_separate_generations_add() {
+async fn repeated_credit_events_add_within_and_across_generations() {
     let request = RequestCtx::new(None);
     let first = metered(
         &request,
         vec![
             Ok(KiroEvent::Metering(reading(
-                json!({"unit": "credit", "usage": 0.04582331509121062}),
+                json!({"unit": "credit", "usage": 0.125}),
+            ))),
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.0625}),
+            ))),
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.125}),
             ))),
             Ok(KiroEvent::Metering(reading(
                 json!({"unit": "credits", "amount": 0}),
@@ -125,20 +131,20 @@ async fn repeated_snapshots_replace_but_separate_generations_add() {
         ],
     );
     first.collect::<Vec<_>>().await;
-    assert_eq!(request.usage.lock().credits, Some(0.0));
+    assert_eq!(request.usage.lock().credits, Some(0.3125));
 
     let second = metered(
         &request,
         vec![Ok(KiroEvent::Metering(reading(
-            json!({"unit": "credit", "usage": 0.01}),
+            json!({"unit": "credit", "usage": 0.25}),
         )))],
     );
     second.collect::<Vec<_>>().await;
-    assert_eq!(request.usage.lock().credits, Some(0.01));
+    assert_eq!(request.usage.lock().credits, Some(0.5625));
 }
 
 #[tokio::test]
-async fn missing_and_wrong_units_remain_unknown() {
+async fn missing_wrong_units_and_measured_zero_stay_distinct() {
     let request = RequestCtx::new(None);
     metered(&request, vec![Ok(KiroEvent::Content("answer".into()))])
         .collect::<Vec<_>>()
@@ -152,37 +158,57 @@ async fn missing_and_wrong_units_remain_unknown() {
     .collect::<Vec<_>>()
     .await;
     assert_eq!(request.usage.lock().credits, None);
+
+    metered(
+        &request,
+        vec![Ok(KiroEvent::Metering(reading(
+            json!({"unit": "credit", "usage": 0}),
+        )))],
+    )
+    .collect::<Vec<_>>()
+    .await;
+    assert_eq!(request.usage.lock().credits, Some(0.0));
 }
 
 #[tokio::test]
-async fn error_and_disconnect_retain_the_latest_observed_snapshot() {
+async fn error_and_disconnect_retain_all_observed_credits() {
     let failed = RequestCtx::new(None);
     let mut stream = metered(
         &failed,
         vec![
             Ok(KiroEvent::Metering(reading(
-                json!({"unit": "credit", "usage": 0.03}),
+                json!({"unit": "credit", "usage": 0.125}),
+            ))),
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.0625}),
             ))),
             Err(StreamError::Upstream("broken stream".into())),
         ],
     );
     assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_ok());
     assert!(stream.next().await.unwrap().is_err());
-    assert_eq!(failed.usage.lock().credits, Some(0.03));
+    assert_eq!(failed.usage.lock().credits, Some(0.1875));
 
     let disconnected = RequestCtx::new(None);
     let mut stream = metered(
         &disconnected,
         vec![
             Ok(KiroEvent::Metering(reading(
-                json!({"unit": "credit", "usage": 0.04}),
+                json!({"unit": "credit", "usage": 0.25}),
             ))),
-            Ok(KiroEvent::Content("unread".into())),
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.03125}),
+            ))),
+            Ok(KiroEvent::Metering(reading(
+                json!({"unit": "credit", "usage": 0.5}),
+            ))),
         ],
     );
     assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_ok());
     drop(stream);
-    assert_eq!(disconnected.usage.lock().credits, Some(0.04));
+    assert_eq!(disconnected.usage.lock().credits, Some(0.28125));
 }
 
 fn initialize_store() {
@@ -225,10 +251,11 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
         ],
     );
     assert!(account_a.next().await.unwrap().is_ok());
+    assert_eq!(kiro_lb::dashboard_store::flush_key_model_usage(), 1);
+    request.set_account("account-b");
     assert!(account_a.next().await.unwrap().is_ok());
     drop(account_a);
 
-    request.set_account("account-b");
     let mut account_b = metered(
         &request,
         vec![
@@ -270,8 +297,8 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
 
     let request_credits = request.usage.lock().credits.unwrap();
     assert!(
-        (request_credits - 0.1125).abs() < f64::EPSILON * 4.0,
-        "aggregate credit mismatch: expected 0.1125, actual {request_credits}"
+        (request_credits - 0.1525).abs() < f64::EPSILON * 4.0,
+        "aggregate credit mismatch: expected 0.1525, actual {request_credits}"
     );
     assert_eq!(kiro_lb::dashboard_store::flush_key_model_usage(), 4);
     let rows = kiro_lb::store::with(|connection| {
@@ -296,7 +323,7 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
             "account-zero"
         ]
     );
-    for ((account, actual), expected) in rows.iter().zip([0.0125, 0.03, 0.07, 0.0]) {
+    for ((account, actual), expected) in rows.iter().zip([0.0525, 0.03, 0.07, 0.0]) {
         let actual =
             actual.unwrap_or_else(|| panic!("missing credits for {account}; rows={rows:?}"));
         assert!(
@@ -307,20 +334,11 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
 }
 
 #[tokio::test]
-async fn openai_stream_exposes_the_final_generation_snapshot_including_zero() {
+async fn openai_stream_exposes_the_credit_sum_despite_a_final_zero() {
     let request = RequestCtx::new(None);
-    let upstream = metered(
+    let upstream = parsed(
         &request,
-        vec![
-            Ok(KiroEvent::Content("answer".into())),
-            Ok(KiroEvent::Metering(reading(
-                json!({"unit": "credit", "usage": 0.05}),
-            ))),
-            Ok(KiroEvent::Metering(reading(
-                json!({"unit": "credits", "usage": 0}),
-            ))),
-            Ok(KiroEvent::StopReason("end_turn".into())),
-        ],
+        br#"{"content":"answer"}{"unit":"credit","usage":0.125}{"unit":"credits","amount":0.0625}{"unit":"credit","usage":0.125}{"unit":"credit","usage":0}{"unit":"token","usage":9}{"stopReason":"end_turn"}"#,
     );
     let chunks: Vec<String> = stream_openai::stream(upstream, context(request.clone()), options())
         .map(|chunk| chunk.unwrap())
@@ -332,8 +350,8 @@ async fn openai_stream_exposes_the_final_generation_snapshot_including_zero() {
         .filter_map(|body| serde_json::from_str::<Value>(body.trim()).ok())
         .find_map(|chunk| chunk.get("usage").cloned())
         .expect("terminal usage");
-    assert_eq!(usage["credits_used"], 0.0);
-    assert_eq!(request.usage.lock().credits, Some(0.0));
+    assert_eq!(usage["credits_used"], 0.3125);
+    assert_eq!(request.usage.lock().credits, Some(0.3125));
 }
 
 #[tokio::test]
@@ -481,7 +499,7 @@ async fn parsed_route_pipeline_records_metering_for_non_streaming_openai() {
     let bytes: stream_core::ByteStream =
         Box::pin(futures_util::stream::iter(vec![
             Ok::<Bytes, reqwest::Error>(Bytes::from_static(
-                br#"{"content":"answer"}{"unit":"credit","usage":0.0125}{"stopReason":"end_turn"}"#,
+                br#"{"content":"answer"}{"unit":"credit","usage":0.125}{"unit":"credits","amount":0.0625}{"unit":"credit","usage":0.125}{"unit":"credit","usage":0}{"stopReason":"end_turn"}"#,
             )),
         ]));
     let metered = stream_core::parse_kiro_stream_metered(bytes, 1.0, 1.0, &request);
@@ -490,8 +508,67 @@ async fn parsed_route_pipeline_records_metering_for_non_streaming_openai() {
         .await
         .unwrap();
 
-    assert_eq!(response["usage"]["credits_used"], 0.0125);
-    assert_eq!(request.usage.lock().credits, Some(0.0125));
+    assert_eq!(response["usage"]["credits_used"], 0.3125);
+    assert_eq!(request.usage.lock().credits, Some(0.3125));
+}
+
+#[tokio::test]
+async fn anthropic_and_responses_record_additive_credits_in_both_stream_modes() {
+    const FRAMES: &[u8] = br#"{"content":"answer"}{"contextUsagePercentage":1.0}{"unit":"credit","usage":0.125}{"unit":"credits","amount":0.0625}{"unit":"credit","usage":0.125}{"unit":"credit","usage":0}{"stopReason":"end_turn"}"#;
+
+    for anthropic in [true, false] {
+        for streaming in [true, false] {
+            let request = RequestCtx::new(None);
+            let upstream = parsed(&request, FRAMES);
+            let context = context(request.clone());
+            if streaming {
+                let stream = if anthropic {
+                    kiro_lb::stream_anthropic::stream(upstream, context)
+                } else {
+                    kiro_lb::stream_responses::translate(
+                        stream_openai::stream(upstream, context, options()),
+                        "claude-sonnet-4.5".into(),
+                        "resp_1".into(),
+                        Default::default(),
+                    )
+                };
+                let chunks: Vec<String> = stream.map(|chunk| chunk.unwrap()).collect().await;
+                let terminal = if anthropic {
+                    "event: message_stop"
+                } else {
+                    "event: response.completed"
+                };
+                assert!(chunks.iter().any(|chunk| chunk.starts_with(terminal)));
+                assert!(!chunks.concat().contains("credits_used"));
+            } else {
+                let response = if anthropic {
+                    kiro_lb::stream_anthropic::collect(upstream, context)
+                        .await
+                        .unwrap()
+                } else {
+                    let chat = stream_openai::collect(upstream, context, options(), false)
+                        .await
+                        .unwrap();
+                    kiro_lb::convert_responses::chat_completion_to_responses(
+                        &chat,
+                        "claude-sonnet-4.5",
+                        &Default::default(),
+                    )
+                };
+                if anthropic {
+                    assert_eq!(response["stop_reason"], "end_turn");
+                } else {
+                    assert_eq!(response["status"], "completed");
+                }
+                assert!(response["usage"].get("credits_used").is_none());
+            }
+            assert_eq!(
+                request.usage.lock().credits,
+                Some(0.3125),
+                "anthropic={anthropic}, streaming={streaming}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
