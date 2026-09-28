@@ -11,25 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- route requests by model capability
+- Support native GPT reasoning effort controls without synthesizing reasoning text.
+- Route requests by model capability and available account capacity while retaining suitable session affinity.
+- Add reversible Codex CLI and Claude Code setup, diagnosis, status, and restoration commands. Automatic setup and restoration are Linux-only; read-only commands remain cross-platform.
 
 ### Fixed
 
-- join scheduled account initialization
-- redact account keys from capacity errors
-- recover uninitialized accounts in background
-- route around saturated accounts
-- keep catalog refresh off request path
-- refresh unknown model catalogs
-- isolate late account failures
-- commit affinity only for live accounts
+- Keep catalog refresh and failed-account recovery off the request path, with single-flight initialization and bounded warm-up waits.
+- Validate authentication and API regions before outbound requests, reject malformed credential imports, and preserve the last-good credential snapshot on source-read failures.
+- Meter credits per physical generation on the originating account, handle repeated snapshots without double counting, and distinguish valid non-credit completion markers from malformed metering frames.
+- Bind durable authentication and quota state to the current login, discard stale refresh results, and apply the same quota freshness rules to account eligibility and routing weight.
+- Preserve concurrent client edits and recovery journals during setup failures, bound diagnostic responses and configuration files, clear competing Claude credentials and provider selectors, and reject unsafe plaintext proxy configurations.
+- Avoid exposing account identifiers in capacity errors and prevent late requests from mutating replacement accounts or refreshing their affinity.
 
 ### Other
 
-- reconcile login state with reviewed gateway improvements
-- Merge pull request #76 from minpeter/improve/credit-metering
-- Merge pull request #74 from minpeter/improve/region-validation
-- replace release PAT with GITHUB_TOKEN
+- Use the short-lived GitHub Actions token for draft releases, validating all four binary artifacts and their checksums before publication.
 
 ## [0.2.1](https://github.com/minpeter/kiro-lb/compare/v0.2.0...v0.2.1) - 2026-09-27
 
