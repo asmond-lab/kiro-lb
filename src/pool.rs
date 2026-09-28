@@ -179,6 +179,15 @@ pub struct AccountManager {
 /// immediately for this long instead of sweeping dead accounts on every poll.
 pub const WARM_UP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn source_for_account(account: &Account) -> Option<Source> {
+    match account.config.get("type").and_then(Value::as_str) {
+        Some("internal") | Some("refresh_token") => Some(Source::Internal(account.id.clone())),
+        Some("sqlite") => Some(Source::Sqlite(account.id.clone())),
+        Some("json") => Some(Source::File(account.id.clone())),
+        _ => None,
+    }
+}
+
 impl AccountManager {
     pub fn new(http: reqwest::Client) -> Arc<AccountManager> {
         Arc::new(AccountManager {
@@ -371,11 +380,8 @@ impl AccountManager {
                 .unwrap_or(0) as usize;
         }
         for account in self.accounts() {
-            let source = match account.config.get("type").and_then(Value::as_str) {
-                Some("internal") | Some("refresh_token") => Source::Internal(account.id.clone()),
-                Some("sqlite") => Source::Sqlite(account.id.clone()),
-                Some("json") => Source::File(account.id.clone()),
-                _ => continue,
+            let Some(source) = source_for_account(&account) else {
+                continue;
             };
             let identity = KiroAuth::bind_source_login(&source);
             self.bind_login_state(&account, identity.as_deref());
@@ -410,6 +416,16 @@ impl AccountManager {
                 }
             }
         }
+        self.seed_quota();
+    }
+
+    pub fn restore_account_state(&self, id: &str) {
+        let Some(account) = self.get(id) else { return };
+        let Some(source) = source_for_account(&account) else {
+            return;
+        };
+        let identity = KiroAuth::bind_source_login(&source);
+        self.bind_login_state(&account, identity.as_deref());
         self.seed_quota();
     }
 

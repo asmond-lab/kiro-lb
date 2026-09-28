@@ -696,9 +696,13 @@ pub async fn set_enabled(
     }
     let mut updated = entries.clone();
     updated[idx]["enabled"] = json!(enabled);
+    let _data_plane_pause = (!enabled).then(|| crate::app::pause_data_plane(&state));
+    if !enabled {
+        crate::app::wait_for_data_plane_drain(&state).await;
+    }
     let document = if enabled {
-        // Keep the paused snapshot through this transaction so load_state can
-        // restore its counters after the credential returns to the live pool.
+        // Keep the paused snapshot through this transaction so the resumed
+        // account can restore its counters after returning to the live pool.
         state.pool.state_document()
     } else {
         let sessions = state.pool.session_counts().get(&id).copied().unwrap_or(0);
@@ -722,7 +726,7 @@ pub async fn set_enabled(
     }
     if enabled {
         state.pool.load_credentials();
-        state.pool.load_state();
+        state.pool.restore_account_state(&id);
     }
     json_response(
         200,
