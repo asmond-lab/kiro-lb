@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{AuthError, AuthType, KiroAuth, Source};
 use crate::errors::{is_suspension_error, ErrorType};
-use crate::model_resolver::{self, normalize_model_name, ModelInfoCache};
+use crate::model_resolver::{self, normalize_model_name, ModelInfoCache, ModelSupport};
 use crate::{config, settings, store};
 
 pub fn account_label(id: &str) -> String {
@@ -65,7 +65,11 @@ pub struct Account {
     pub models: Arc<ModelInfoCache>,
     pub state: Mutex<AccountState>,
     init: tokio::sync::Mutex<()>,
+    init_retry_at: Mutex<Option<Instant>>,
+    init_scheduled: std::sync::atomic::AtomicBool,
+    init_complete: tokio::sync::Notify,
     models_refresh: tokio::sync::Mutex<()>,
+    models_refresh_scheduled: std::sync::atomic::AtomicBool,
 }
 
 impl Account {
@@ -191,12 +195,26 @@ impl AccountManager {
             .map(|a| {
                 let pool = self.clone();
                 tokio::spawn(async move {
-                    if tokio::time::timeout(per_account, pool.initialize(&a))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!("Account {} did not initialize within {per_account:?}; it will be retried on first use", a.id);
+                    if a.init_scheduled.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = tokio::time::timeout(per_account, async {
+                            loop {
+                                let complete = a.init_complete.notified();
+                                if !a.init_scheduled.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                complete.await;
+                            }
+                        })
+                        .await;
+                        return;
                     }
+                    if a.init_retry_at
+                        .lock()
+                        .is_some_and(|retry_at| Instant::now() < retry_at)
+                    {
+                        return;
+                    }
+                    pool.initialize_for_maintenance(&a, per_account).await;
                 })
             })
             .collect();
@@ -312,7 +330,11 @@ impl AccountManager {
                         models: Arc::new(ModelInfoCache::new()),
                         state: Mutex::new(AccountState::default()),
                         init: tokio::sync::Mutex::new(()),
+                        init_retry_at: Mutex::new(None),
+                        init_scheduled: false.into(),
+                        init_complete: tokio::sync::Notify::new(),
                         models_refresh: tokio::sync::Mutex::new(()),
+                        models_refresh_scheduled: false.into(),
                     }),
                 );
             }
@@ -518,7 +540,7 @@ impl AccountManager {
         match auth.access_token().await {
             Ok(_) => {}
             Err(AuthError::CredentialDead { status, .. }) => {
-                self.report_credential_dead(&id, status);
+                self.commit_credential_dead(a, status);
                 return false;
             }
             Err(e) => {
@@ -564,6 +586,19 @@ impl AccountManager {
         }
     }
 
+    async fn initialize_for_maintenance(&self, a: &Arc<Account>, timeout: Duration) -> bool {
+        let result = tokio::time::timeout(timeout, self.initialize(a)).await;
+        let initialized = matches!(result, Ok(true));
+        *a.init_retry_at.lock() = (!initialized).then(|| Instant::now() + WARM_UP_RETRY_AFTER);
+        if result.is_err() {
+            tracing::warn!(
+                "Account {} did not initialize within {timeout:?}; it will be retried in the background",
+                a.id
+            );
+        }
+        initialized
+    }
+
     /// Single-flight per account: selectors that see the same expired cache
     /// queue on one refresh and reuse its result instead of each calling
     /// ListAvailableModels.
@@ -582,19 +617,92 @@ impl AccountManager {
         Fut: std::future::Future<Output = Option<Vec<Value>>>,
     {
         let _flight = a.models_refresh.lock().await;
-        let ttl = config::get().account_cache_ttl as f64;
+        let ttl = if a.models.is_authoritative() {
+            config::get().account_cache_ttl as f64
+        } else {
+            config::MODEL_CACHE_TTL as f64
+        };
         let cached = a.state.lock().models_cached_at;
         if cached > 0.0 && store::now_f64() - cached <= ttl {
             return;
         }
         let Some(auth) = a.auth() else { return };
+        let refresh_revision = a.models.refresh_revision();
         let refreshed = fetch(auth).await;
         match refreshed {
-            Some(m) => a.models.update(m),
+            Some(m) => a.models.update_after_refresh(m, refresh_revision),
             None => a.models.seed_fallback(),
         }
         a.state.lock().models_cached_at = store::now_f64();
         self.mark_dirty();
+    }
+
+    fn schedule_account_maintenance(self: &Arc<Self>) {
+        // Hold an idle warm-up lock through scheduling so startup warm-up and
+        // background recovery cannot enqueue consecutive attempts.
+        let warm_idle = self.warm.try_lock().ok();
+        let now = store::now_f64();
+        for a in self.accounts() {
+            if a.auth.lock().is_none() {
+                if warm_idle.is_none() {
+                    continue;
+                }
+                if a.state.lock().auth_dead_until > now {
+                    continue;
+                }
+                let retry_due = a
+                    .init_retry_at
+                    .lock()
+                    .is_none_or(|retry_at| Instant::now() >= retry_at);
+                if retry_due
+                    && a.init_scheduled
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    let (pool, account) = (self.clone(), a.clone());
+                    tokio::spawn(async move {
+                        pool.initialize_for_maintenance(&account, WARM_UP_ACCOUNT_TIMEOUT)
+                            .await;
+                        account
+                            .init_scheduled
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        account.init_complete.notify_waiters();
+                    });
+                }
+                continue;
+            }
+            let ttl = if a.models.is_authoritative() {
+                config::get().account_cache_ttl as f64
+            } else {
+                config::MODEL_CACHE_TTL as f64
+            };
+            let cached = a.state.lock().models_cached_at;
+            if cached <= 0.0
+                || now - cached <= ttl
+                || a.models_refresh_scheduled
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+            let (pool, account) = (self.clone(), a.clone());
+            tokio::spawn(async move {
+                pool.refresh_models(&account).await;
+                account
+                    .models_refresh_scheduled
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
     }
 
     fn routing_weight(s: &AccountState) -> f64 {
@@ -608,8 +716,8 @@ impl AccountManager {
         }
     }
 
-    fn candidate_order(&self, session: Option<u64>) -> Vec<Arc<Account>> {
-        let mut inner = self.inner.lock();
+    fn candidate_order(&self, model: &str, session: Option<u64>) -> Vec<Arc<Account>> {
+        let inner = self.inner.lock();
         let ids = inner.order.clone();
         if ids.is_empty() {
             return vec![];
@@ -637,6 +745,7 @@ impl AccountManager {
             keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
             keyed.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         };
+        let mut pinned = None;
         let ordered: Vec<String> = if !config::get().quota_weighted_routing || strategy == "sticky"
         {
             rotate(inner.current_index)
@@ -658,16 +767,14 @@ impl AccountManager {
             v
         } else if let Some(key) = session.filter(|_| strategy == "session") {
             let ttl = Duration::from_secs(config::get().session_affinity_ttl_seconds);
-            let pinned = inner
+            let pinned_id = inner
                 .sessions
-                .get_mut(&key)
+                .get(&key)
                 .filter(|e| e.touched.elapsed() < ttl)
-                .map(|e| {
-                    e.touched = Instant::now();
-                    e.account.clone()
-                });
+                .map(|e| e.account.clone());
             let mut rest = weighted(&inner);
-            if let Some(p) = pinned.filter(|p| inner.accounts.contains_key(p)) {
+            if let Some(p) = pinned_id.filter(|p| inner.accounts.contains_key(p)) {
+                pinned = Some(p.clone());
                 rest.retain(|x| *x != p);
                 rest.insert(0, p);
             }
@@ -675,18 +782,46 @@ impl AccountManager {
         } else {
             weighted(&inner)
         };
-        ordered
+        let mut accounts: Vec<Arc<Account>> = ordered
             .into_iter()
             .filter_map(|id| inner.accounts.get(&id).cloned())
-            .collect()
+            .collect();
+        let pinned = pinned.and_then(|id| {
+            accounts
+                .iter()
+                .position(|a| a.id == id && a.models.support(model) != ModelSupport::Unsupported)
+                .map(|index| accounts.remove(index))
+        });
+        let pinned = pinned.and_then(|a| {
+            if crate::upstream::http::account_concurrency_load(&a.id)
+                .is_none_or(|(held, limit)| held < limit)
+            {
+                Some(a)
+            } else {
+                accounts.push(a);
+                None
+            }
+        });
+        accounts.sort_by_key(|a| {
+            let support = a.models.support(model);
+            let load = crate::upstream::http::account_concurrency_load(&a.id)
+                .map(|(held, limit)| (held >= limit, held))
+                .unwrap_or((false, 0));
+            (load.0, support, load.1)
+        });
+        if let Some(pinned) = pinned {
+            accounts.insert(0, pinned);
+        }
+        accounts
     }
 
     pub async fn next_account(
-        &self,
+        self: &Arc<Self>,
         model: &str,
         exclude: &HashSet<String>,
         session: Option<u64>,
     ) -> Option<Arc<Account>> {
+        self.schedule_account_maintenance();
         if let Some(a) = self.select(model, exclude, session, false).await {
             return Some(a);
         }
@@ -706,14 +841,15 @@ impl AccountManager {
 
     async fn select(
         &self,
-        _model: &str,
+        model: &str,
         exclude: &HashSet<String>,
         session: Option<u64>,
         last_resort: bool,
     ) -> Option<Arc<Account>> {
-        let candidates = self.candidate_order(session);
+        let candidates = self.candidate_order(model, session);
         let single = candidates.len() == 1;
         let cfg = config::get();
+        let mut unsupported = None;
         for a in candidates {
             if exclude.contains(&a.id) {
                 continue;
@@ -739,16 +875,7 @@ impl AccountManager {
                 }
             }
             if a.auth.lock().is_none() {
-                if !self.initialize(&a).await {
-                    a.state.lock().failures += 1;
-                    self.mark_dirty();
-                    continue;
-                }
-            } else {
-                let cached = a.state.lock().models_cached_at;
-                if cached > 0.0 && now - cached > cfg.account_cache_ttl as f64 {
-                    self.refresh_models(&a).await;
-                }
+                continue;
             }
             let still_member = self
                 .inner
@@ -757,10 +884,14 @@ impl AccountManager {
                 .get(&a.id)
                 .is_some_and(|live| Arc::ptr_eq(live, &a));
             if still_member && a.auth.lock().is_some() {
-                return Some(a);
+                if a.models.support(model) == ModelSupport::Unsupported {
+                    unsupported.get_or_insert(a);
+                } else {
+                    return Some(a);
+                }
             }
         }
-        None
+        unsupported
     }
 
     pub fn pin_session(&self, session: Option<u64>, account_id: &str) {
@@ -769,6 +900,10 @@ impl AccountManager {
             return;
         }
         let mut inner = self.inner.lock();
+        Self::pin_session_locked(&mut inner, key, account_id);
+    }
+
+    fn pin_session_locked(inner: &mut PoolInner, key: u64, account_id: &str) {
         let cap = config::get().session_affinity_capacity.max(1);
         let previous = inner.sessions.get(&key).map(|e| e.account.clone());
         if previous.as_deref() == Some(account_id) {
@@ -820,9 +955,8 @@ impl AccountManager {
         out
     }
 
-    fn record_event(&self, id: &str, outcome: &str) {
+    fn record_event_locked(inner: &mut PoolInner, id: &str, outcome: &str) {
         let at = store::now_f64();
-        let mut inner = self.inner.lock();
         let cutoff = at - config::get().rate_window_seconds as f64;
         let rpm = inner
             .observations
@@ -845,6 +979,23 @@ impl AccountManager {
 
     pub fn report_success(&self, id: &str, model: &str) {
         let Some(a) = self.get(id) else { return };
+        self.commit_success(&a, model, None);
+    }
+
+    /// Commits a successful request only if its original account object is
+    /// still the live pool member. Membership, affinity, model evidence and
+    /// account statistics change under one pool lock so a same-ID replacement
+    /// cannot receive an old request's completion.
+    pub fn commit_success(&self, a: &Arc<Account>, model: &str, session: Option<u64>) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&a.id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            return false;
+        }
+        a.models.record_supported(model);
         {
             let mut s = a.state.lock();
             s.failures = 0;
@@ -852,27 +1003,35 @@ impl AccountManager {
             s.auth_dead_until = 0.0;
             if s.suspended_until > 0.0 {
                 s.suspended_until = 0.0;
-                tracing::info!("Account {id} is serving again; suspension lifted");
+                tracing::info!("Account {} is serving again; suspension lifted", a.id);
             }
             if s.quota_exhausted_until > 0.0 {
                 s.quota_exhausted_until = 0.0;
-                tracing::info!("Account {id} is serving again; quota quarantine cleared");
+                tracing::info!(
+                    "Account {} is serving again; quota quarantine cleared",
+                    a.id
+                );
             }
             s.stats.total += 1;
             s.stats.success += 1;
         }
-        self.record_event(id, "success");
+        Self::record_event_locked(&mut inner, &a.id, "success");
         let normalized = normalize_model_name(model);
-        let mut inner = self.inner.lock();
         let list = inner.model_to_accounts.entry(normalized).or_default();
-        if !list.iter().any(|x| x == id) {
-            list.push(id.to_owned());
+        if !list.iter().any(|x| x == &a.id) {
+            list.push(a.id.clone());
         }
-        if let Some(i) = inner.order.iter().position(|x| x == id) {
+        if let Some(i) = inner.order.iter().position(|x| x == &a.id) {
             inner.current_index = i;
+        }
+        if settings::tunables().load_balancing == "session" {
+            if let Some(key) = session {
+                Self::pin_session_locked(&mut inner, key, &a.id);
+            }
         }
         drop(inner);
         self.mark_dirty();
+        true
     }
 
     fn quota_quarantine_until(s: &AccountState, now: f64) -> f64 {
@@ -895,26 +1054,48 @@ impl AccountManager {
         message: Option<&str>,
     ) {
         let Some(a) = self.get(id) else { return };
+        self.commit_failure(&a, model, error_type, status, reason, message);
+    }
+
+    pub fn commit_failure(
+        &self,
+        a: &Arc<Account>,
+        model: &str,
+        error_type: ErrorType,
+        status: u16,
+        reason: Option<&str>,
+        message: Option<&str>,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&a.id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            return false;
+        }
         let cfg = config::get();
         let now = store::now_f64();
         let outcome = {
             let mut s = a.state.lock();
             if reason == Some("INVALID_MODEL_ID") {
+                a.models.record_unsupported(model);
                 s.stats.total += 1;
-                tracing::warn!("Model '{model}' not available on account {id}: status={status}, reason=INVALID_MODEL_ID");
+                tracing::warn!("Model '{model}' not available on account {}: status={status}, reason=INVALID_MODEL_ID", a.id);
                 None
             } else if reason == Some("USER_REQUEST_RATE_EXCEEDED") {
                 s.rate_limited_until = now + cfg.account_rate_limit_cooldown as f64;
                 s.stats.total += 1;
                 s.stats.failed += 1;
-                tracing::warn!("Account {id} rate limited: status={status}, cooldown={} (failures unchanged at {})", format_duration(cfg.account_rate_limit_cooldown as f64), s.failures);
+                tracing::warn!("Account {} rate limited: status={status}, cooldown={} (failures unchanged at {})", a.id, format_duration(cfg.account_rate_limit_cooldown as f64), s.failures);
                 Some("rate_limited")
             } else if is_suspension_error(status, message, reason) {
                 s.suspended_until = now + cfg.account_suspension_quarantine as f64;
                 s.stats.total += 1;
                 s.stats.failed += 1;
                 tracing::error!(
-                    "Account {id} is SUSPENDED upstream: status={status}; excluded for {}",
+                    "Account {} is SUSPENDED upstream: status={status}; excluded for {}",
+                    a.id,
                     format_duration(cfg.account_suspension_quarantine as f64)
                 );
                 Some("suspended")
@@ -923,7 +1104,8 @@ impl AccountManager {
                 s.stats.total += 1;
                 s.stats.failed += 1;
                 tracing::warn!(
-                    "Account {id} monthly quota exhausted; excluded for {}",
+                    "Account {} monthly quota exhausted; excluded for {}",
+                    a.id,
                     format_duration((s.quota_exhausted_until - now).max(0.0))
                 );
                 Some("quota_exhausted")
@@ -932,7 +1114,8 @@ impl AccountManager {
                     s.failures += 1;
                     s.last_failure_time = now;
                     tracing::warn!(
-                        "Account {id} failure #{}: status={status}, reason={reason:?}",
+                        "Account {} failure #{}: status={status}, reason={reason:?}",
+                        a.id,
                         s.failures
                     );
                 }
@@ -942,13 +1125,27 @@ impl AccountManager {
             }
         };
         if let Some(o) = outcome {
-            self.record_event(id, o);
+            Self::record_event_locked(&mut inner, &a.id, o);
         }
+        drop(inner);
         self.mark_dirty();
+        true
     }
 
     pub fn report_credential_dead(&self, id: &str, status: u16) {
         let Some(a) = self.get(id) else { return };
+        self.commit_credential_dead(&a, status);
+    }
+
+    pub fn commit_credential_dead(&self, a: &Arc<Account>, status: u16) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .accounts
+            .get(&a.id)
+            .is_some_and(|live| Arc::ptr_eq(live, a))
+        {
+            return false;
+        }
         let now = store::now_f64();
         let already = {
             let mut s = a.state.lock();
@@ -959,10 +1156,12 @@ impl AccountManager {
             already
         };
         if !already {
-            self.record_event(id, "auth_dead");
-            tracing::error!("Account {id} credential is DEAD (HTTP {status} from the auth host); re-register or re-login to restore it.");
+            Self::record_event_locked(&mut inner, &a.id, "auth_dead");
+            tracing::error!("Account {} credential is DEAD (HTTP {status} from the auth host); re-register or re-login to restore it.", a.id);
         }
+        drop(inner);
         self.mark_dirty();
+        true
     }
 
     pub fn set_quota(
@@ -1140,4 +1339,124 @@ pub fn session_key(system: &str, first_user: &str) -> Option<u64> {
         .chain_update(first_user.as_bytes())
         .finalize();
     Some(u64::from_be_bytes(digest[..8].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(id: &str) -> Arc<Account> {
+        Arc::new(Account {
+            id: id.into(),
+            config: json!({}),
+            auth: Mutex::new(None),
+            models: Arc::new(ModelInfoCache::new()),
+            state: Mutex::new(AccountState::default()),
+            init: tokio::sync::Mutex::new(()),
+            init_retry_at: Mutex::new(None),
+            init_scheduled: false.into(),
+            init_complete: tokio::sync::Notify::new(),
+            models_refresh: tokio::sync::Mutex::new(()),
+            models_refresh_scheduled: false.into(),
+        })
+    }
+
+    #[test]
+    fn affinity_lookup_does_not_extend_a_near_expiry_pin() {
+        assert_eq!(settings::tunables().load_balancing, "session");
+        let pool = AccountManager::new(reqwest::Client::new());
+        let a = account("a");
+        let touched = Instant::now()
+            - Duration::from_secs(config::get().session_affinity_ttl_seconds.saturating_sub(1));
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push(a.id.clone());
+            inner.accounts.insert(a.id.clone(), a);
+            inner.sessions.insert(
+                7,
+                SessionEntry {
+                    account: "a".into(),
+                    touched,
+                },
+            );
+        }
+
+        pool.candidate_order("model", Some(7));
+        pool.candidate_order("model", Some(7));
+
+        assert_eq!(pool.inner.lock().sessions.get(&7).unwrap().touched, touched);
+    }
+
+    #[test]
+    fn old_completion_cannot_mutate_or_pin_a_same_id_replacement() {
+        assert_eq!(settings::tunables().load_balancing, "session");
+        let pool = AccountManager::new(reqwest::Client::new());
+        let old = account("a");
+        let replacement = account("a");
+        replacement.state.lock().failures = 3;
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("a".into());
+            inner.accounts.insert("a".into(), replacement.clone());
+        }
+
+        assert!(!pool.commit_success(&old, "model", Some(9)));
+        assert_eq!(replacement.state.lock().failures, 3);
+        assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
+        assert!(pool.session_counts().is_empty());
+
+        assert!(pool.commit_success(&replacement, "model", Some(9)));
+        assert_eq!(replacement.state.lock().failures, 0);
+        assert_eq!(replacement.models.support("model"), ModelSupport::Supported);
+        assert_eq!(pool.session_counts().get("a"), Some(&1));
+    }
+
+    #[test]
+    fn old_failures_cannot_mutate_a_same_id_replacement() {
+        let pool = AccountManager::new(reqwest::Client::new());
+        let old = account("a");
+        let replacement = account("a");
+        replacement.state.lock().failures = 3;
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("a".into());
+            inner.accounts.insert("a".into(), replacement.clone());
+        }
+
+        assert!(!pool.commit_failure(
+            &old,
+            "model",
+            ErrorType::Fatal,
+            400,
+            Some("INVALID_MODEL_ID"),
+            None,
+        ));
+        assert!(!pool.commit_failure(
+            &old,
+            "model",
+            ErrorType::Recoverable,
+            429,
+            Some("USER_REQUEST_RATE_EXCEEDED"),
+            None,
+        ));
+        assert!(!pool.commit_failure(
+            &old,
+            "model",
+            ErrorType::Recoverable,
+            402,
+            Some("MONTHLY_REQUEST_COUNT"),
+            None,
+        ));
+        assert!(!pool.commit_credential_dead(&old, 401));
+
+        let state = replacement.state.lock();
+        assert_eq!(state.failures, 3);
+        assert_eq!(state.rate_limited_until, 0.0);
+        assert_eq!(state.quota_exhausted_until, 0.0);
+        assert_eq!(state.auth_dead_until, 0.0);
+        assert_eq!(state.stats.total, 0);
+        drop(state);
+        assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
+        assert!(pool.inner.lock().observations.is_empty());
+    }
 }

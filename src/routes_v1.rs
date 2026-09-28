@@ -193,17 +193,17 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     let body = Bytes::from(built.serialized.clone());
     let result = state
         .transport
-        .generate(&auth, body.clone(), &model_id, true, false)
+        .generate(&account.id, &auth, body.clone(), &model_id, true, false)
         .await;
     let response = match result {
         Ok(r) => r,
         Err(TransportError::Auth(AuthError::CredentialDead { status, .. })) => {
-            state.pool.report_credential_dead(&account.id, status);
+            state.pool.commit_credential_dead(&account, status);
             return Attempt::Next { status: 502, message: format!("Account credential rejected by the auth host (HTTP {status}); re-login required.") };
         }
         Err(TransportError::Http { status, detail }) if status == 502 || status == 504 => {
-            state.pool.report_failure(
-                &account.id,
+            state.pool.commit_failure(
+                &account,
                 &plan.model,
                 ErrorType::Recoverable,
                 status,
@@ -223,8 +223,8 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             return Attempt::Done(error_for(plan.protocol, status, detail))
         }
         Err(TransportError::Auth(e)) => {
-            state.pool.report_failure(
-                &account.id,
+            state.pool.commit_failure(
+                &account,
                 &plan.model,
                 ErrorType::Recoverable,
                 502,
@@ -252,8 +252,8 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             ),
         };
         let kind = classify_error(status, reason.as_deref());
-        state.pool.report_failure(
-            &account.id,
+        state.pool.commit_failure(
+            &account,
             &plan.model,
             kind,
             status,
@@ -278,12 +278,11 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             message: user_message,
         };
     }
-    state.pool.pin_session(plan.session, &account.id);
     let input_tokens = built.input_tokens as i64;
     let followup: Option<SearchFollowup> = (plan.protocol == Protocol::Anthropic).then(|| {
-        let (state, plan, auth, cid, arn) = (state.clone(), plan.clone(), auth.clone(), conversation_id.clone(), arn.clone());
+        let (state, plan, account_id, auth, cid, arn) = (state.clone(), plan.clone(), account.id.clone(), auth.clone(), conversation_id.clone(), arn.clone());
         let f: SearchFollowup = Arc::new(move |tool_id: String, query: String, content: String| {
-            let (state, plan, auth, cid, arn) = (state.clone(), plan.clone(), auth.clone(), cid.clone(), arn.clone());
+            let (state, plan, account_id, auth, cid, arn) = (state.clone(), plan.clone(), account_id.clone(), auth.clone(), cid.clone(), arn.clone());
             Box::pin(async move {
                 let mut req = plan.req.clone();
                 let msgs = req["messages"].as_array_mut().ok_or(StreamError::Protocol("web_search follow-up has no messages"))?;
@@ -294,7 +293,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                     .map_err(|_| StreamError::Protocol("web_search follow-up build panicked"))?
                     .map_err(|e| StreamError::Upstream(format!("web_search follow-up could not be built: {e}")))?;
                 let model = built.payload.pointer("/conversationState/currentMessage/userInputMessage/modelId").and_then(Value::as_str).unwrap_or("").to_owned();
-                match state.transport.generate(&auth, Bytes::from(built.serialized), &model, true, false).await {
+                match state.transport.generate(&account_id, &auth, Bytes::from(built.serialized), &model, true, false).await {
                     Ok(r) if r.status == 200 => Ok(events_of(r, &plan.ctx)),
                     Ok(r) => Err(StreamError::UpstreamStatus(r.status)),
                     Err(e) => Err(StreamError::Upstream(e.to_string())),
@@ -314,13 +313,13 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     };
     let retry = Retry {
         state: state.clone(),
+        account_id: account.id.clone(),
         auth: auth.clone(),
         body,
         model_id,
         ctx: plan.ctx.clone(),
     };
     let events = first_token_retry(events_of(response, &plan.ctx), retry);
-    let account_id = account.id.clone();
     let pool = state.pool.clone();
     let model = plan.model.clone();
     match plan.protocol {
@@ -329,15 +328,16 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             Attempt::Done(sse_response(
                 s,
                 pool,
-                account_id,
+                account,
                 model,
+                plan.session,
                 Protocol::Anthropic,
                 &plan.ctx,
             ))
         }
         Protocol::Anthropic => match stream_anthropic::collect(events, sctx).await {
             Ok(v) => {
-                pool.report_success(&account_id, &model);
+                pool.commit_success(&account, &model, plan.session);
                 Attempt::Done(json_response(200, v))
             }
             Err(e) => Attempt::Done(stream_failure(Protocol::Anthropic, e)),
@@ -371,8 +371,9 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                     return Attempt::Done(sse_response(
                         s,
                         pool,
-                        account_id,
+                        account,
                         model,
+                        plan.session,
                         Protocol::OpenAI,
                         &plan.ctx,
                     ));
@@ -380,15 +381,16 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                 Attempt::Done(sse_response(
                     s,
                     pool,
-                    account_id,
+                    account,
                     model,
+                    plan.session,
                     Protocol::OpenAI,
                     &plan.ctx,
                 ))
             } else {
                 match stream_openai::collect(events, sctx, opts, strip_fence).await {
                     Ok(v) => {
-                        pool.report_success(&account_id, &model);
+                        pool.commit_success(&account, &model, plan.session);
                         match &plan.responses {
                             Some((_, freeform)) => Attempt::Done(json_response(
                                 200,
@@ -433,6 +435,7 @@ fn events_of(r: UpstreamResponse, ctx: &RequestCtx) -> EventStream {
 
 struct Retry {
     state: Shared,
+    account_id: String,
     auth: Arc<crate::auth::KiroAuth>,
     body: Bytes,
     model_id: String,
@@ -452,6 +455,7 @@ fn first_token_retry(first: EventStream, retry: Retry) -> EventStream {
                     .state
                     .transport
                     .generate(
+                        &retry.account_id,
                         &retry.auth,
                         retry.body.clone(),
                         &retry.model_id,
@@ -584,8 +588,9 @@ pub fn sse_body(
 fn sse_response(
     s: ChunkStream,
     pool: Arc<pool::AccountManager>,
-    account_id: String,
+    account: Arc<Account>,
     model: String,
+    session: Option<u64>,
     protocol: Protocol,
     request: &RequestCtx,
 ) -> Response {
@@ -593,7 +598,7 @@ fn sse_response(
     let body = sse_body(s, protocol == Protocol::Anthropic, move |ok| {
         failed.store(!ok, std::sync::atomic::Ordering::SeqCst);
         if ok {
-            pool.report_success(&account_id, &model);
+            pool.commit_success(&account, &model, session);
             tracing::info!("HTTP 200 - {model} (streaming) - completed");
         }
     });

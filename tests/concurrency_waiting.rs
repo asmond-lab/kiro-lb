@@ -1,5 +1,7 @@
 use kiro_lb::settings::{self, TunableKey};
-use kiro_lb::upstream::http::{concurrency_slot, concurrency_status, reset_concurrency};
+use kiro_lb::upstream::http::{
+    concurrency_slot, concurrency_status, reset_concurrency, TransportError,
+};
 use serde_json::json;
 use std::sync::Once;
 use std::time::Duration;
@@ -23,6 +25,9 @@ fn configure(global: i64, account: i64) {
         .unwrap()
         .unwrap();
     settings::set_tunable(&TunableKey::MaxAccountConcurrency, &json!(account))
+        .unwrap()
+        .unwrap();
+    settings::set_tunable(&TunableKey::QueueTimeoutSeconds, &json!(1))
         .unwrap()
         .unwrap();
     reset_concurrency();
@@ -56,4 +61,26 @@ async fn a_cancelled_waiter_on_the_account_gate_is_not_counted() {
     init();
     configure(0, 1);
     abandoned_waiter_leaves_no_queue("acct-account").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_capacity_error_does_not_disclose_its_internal_key() {
+    let _serial = SERIAL.lock().await;
+    init();
+    configure(0, 1);
+    let account = "/home/service/.config/kiro/credentials.json";
+    let held = concurrency_slot(account).await.unwrap();
+
+    let detail = match concurrency_slot(account).await {
+        Err(TransportError::Http {
+            status: 503,
+            detail,
+        }) => detail,
+        _ => panic!("a saturated account must return a capacity error"),
+    };
+
+    drop(held);
+    assert!(detail.contains("per-account slot"), "{detail}");
+    assert!(!detail.contains(account), "{detail}");
+    assert!(!detail.contains("credentials.json"), "{detail}");
 }
