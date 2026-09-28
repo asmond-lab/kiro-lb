@@ -84,16 +84,16 @@ fn fingerprint(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+/// A profile ARN names the Kiro profile a login routes through, not the user:
+/// social (GitHub/Google) logins all receive the same shared Kiro profile, so
+/// it cannot tell two users apart. It only changes which login lineage an
+/// account belongs to; the lineage itself is minted per credential source
+/// (see `bind_login_identity`) and marked in the stored credential.
 fn stable_login_identity(c: &Creds) -> Option<String> {
-    if let Some(identity) = c.bound_identity.as_deref() {
-        return Some(identity.to_owned());
-    }
-    let descriptor = c
-        .profile_arn
+    c.bound_identity
         .as_deref()
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| format!("profile:{}", v.trim()))?;
-    Some(format!("login:{}", fingerprint(&descriptor)))
+        .filter(|identity| !store::is_legacy_profile_identity(identity))
+        .map(str::to_owned)
 }
 
 fn source_fingerprint(c: &Creds) -> Option<String> {
