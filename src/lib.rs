@@ -34,6 +34,8 @@ pub mod stream_core;
 pub mod stream_openai;
 pub mod stream_responses;
 pub mod tokenizer;
+pub mod update_install;
+pub mod updates;
 pub mod upstream;
 pub mod usage_tracking;
 pub mod utils;

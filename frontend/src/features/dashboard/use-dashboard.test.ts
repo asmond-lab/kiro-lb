@@ -17,6 +17,7 @@ interface Harness {
   latestConnectionError?: string | null;
   latestActionError?: string | null;
   latestLogsLoading?: boolean;
+  latestCheckingUpdates?: boolean;
   timers: Timer[];
   timerDelays: number[];
   api: {
@@ -30,6 +31,8 @@ interface Harness {
     overview: ReturnType<typeof vi.fn>;
     requestLogs: ReturnType<typeof vi.fn>;
     requestRate: ReturnType<typeof vi.fn>;
+    checkForUpdates: ReturnType<typeof vi.fn>;
+    installUpdate: ReturnType<typeof vi.fn>;
   };
 }
 
@@ -55,6 +58,8 @@ const harness = vi.hoisted((): Harness => ({
     overview: vi.fn(),
     requestLogs: vi.fn(),
     requestRate: vi.fn(),
+    checkForUpdates: vi.fn(),
+    installUpdate: vi.fn(),
   },
 }));
 
@@ -77,6 +82,7 @@ const STATE_IS_LOGS_LOADING = 12;
 // above stay put.
 const STATE_CONNECTION_ERROR = 16;
 const STATE_ACTION_ERROR = 17;
+const STATE_IS_CHECKING_UPDATES = 21;
 
 vi.mock("react", () => {
   const useEffect = (effect: Effect) => {
@@ -94,6 +100,7 @@ vi.mock("react", () => {
       if (index === STATE_CONNECTION_ERROR) harness.latestConnectionError = value as string | null;
       if (index === STATE_ACTION_ERROR) harness.latestActionError = value as string | null;
       if (index === STATE_IS_LOGS_LOADING) harness.latestLogsLoading = value as boolean;
+      if (index === STATE_IS_CHECKING_UPDATES) harness.latestCheckingUpdates = value as boolean;
     }];
   }
   return { useCallback: <T,>(callback: T) => callback, useEffect, useRef, useState };
@@ -135,10 +142,12 @@ const accounts = (ids: string[]): { accounts: Account[] } => ({
 
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 };
 
 const awaitCompletion = <T,>(completion: Promise<T>, timeoutMs: number): Promise<T> =>
@@ -172,6 +181,7 @@ describe("useDashboard", () => {
     harness.latestAuth = undefined;
     harness.latestConnectionError = undefined;
     harness.latestActionError = undefined;
+    harness.latestCheckingUpdates = undefined;
     harness.timers = [];
     harness.timerDelays = [];
     Object.values(harness.api).forEach((method) => method.mockReset());
@@ -254,6 +264,60 @@ describe("useDashboard", () => {
     harness.api.keyUsage.mockResolvedValue({ usage: {} });
     harness.api.accountTokenUsage.mockResolvedValue({ usage: {} });
   };
+
+  it("coalesces manual update checks and reloads the result without a polling tick", async () => {
+    mockHealthyLoad();
+    const pending = deferred<void>();
+    harness.api.checkForUpdates.mockReturnValueOnce(pending.promise);
+    const dashboard = useDashboard();
+    const first = dashboard.checkForUpdates();
+    await dashboard.checkForUpdates();
+    expect(harness.api.checkForUpdates).toHaveBeenCalledTimes(1);
+    expect(harness.latestCheckingUpdates).toBe(true);
+    expect(harness.api.overview).not.toHaveBeenCalled();
+
+    const updated: Overview = {
+      ...healthyOverview(),
+      version: { current: "0.2.1", latest: "0.2.2", status: "update_available", releaseUrl: "https://github.com/minpeter/kiro-lb/releases/tag/v0.2.2" },
+    };
+    harness.api.overview.mockResolvedValue(updated);
+    pending.resolve();
+    await first;
+    expect(harness.latestOverview?.version).toEqual(updated.version);
+    expect(harness.latestCheckingUpdates).toBe(false);
+  });
+
+  it("clears the update-check spinner on failure and permits retry", async () => {
+    mockHealthyLoad();
+    harness.api.checkForUpdates.mockRejectedValueOnce(new DashboardApiError("check rejected", 503));
+    const dashboard = useDashboard();
+    await dashboard.checkForUpdates();
+    expect(harness.latestActionError).toBe("check rejected");
+    expect(harness.latestCheckingUpdates).toBe(false);
+
+    harness.api.checkForUpdates.mockResolvedValueOnce({});
+    await dashboard.checkForUpdates();
+    expect(harness.api.checkForUpdates).toHaveBeenCalledTimes(2);
+    expect(harness.latestActionError).toBeNull();
+    expect(harness.latestCheckingUpdates).toBe(false);
+  });
+
+  it("sends the confirmed version exactly once and reports a rejected installation", async () => {
+    mockHealthyLoad();
+    const pending = deferred<void>();
+    harness.api.installUpdate.mockReturnValueOnce(pending.promise);
+    const dashboard = useDashboard();
+    const first = dashboard.installUpdate("0.2.2");
+    await dashboard.installUpdate("0.2.2");
+    expect(harness.api.installUpdate).toHaveBeenCalledExactlyOnceWith("0.2.2");
+    pending.reject(new DashboardApiError("The available version changed", 409));
+    await first;
+    expect(harness.latestActionError).toBe("The available version changed");
+    harness.api.installUpdate.mockResolvedValueOnce({ status: "downloading" });
+    await dashboard.installUpdate("0.2.3");
+    expect(harness.api.installUpdate).toHaveBeenLastCalledWith("0.2.3");
+    expect(harness.latestActionError).toBeNull();
+  });
 
   it("keeps data and reports a connection error on a non-401 failure, then clears it on recovery", async () => {
     mockHealthyLoad();

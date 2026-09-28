@@ -292,11 +292,52 @@ pub async fn overview(State(state): State<Shared>, headers: HeaderMap) -> Respon
         200,
         json!({
             "proxy": {"status": "healthy", "uptimeSeconds": (store::now_f64() - state.started_at) as i64},
+            "version": &*state.version.info.read(),
+            "update": &*state.version.installation.read(),
             "requests24h": requests, "successes24h": successes, "averageLatencyMs": avg.round() as i64,
             "accounts": {"total": accounts.len(), "initialized": accounts.iter().filter(|a| a.auth().is_some()).count()},
             "models": if models == 0 { config::FALLBACK_MODELS.len() } else { models },
         }),
     )
+}
+
+pub async fn check_updates(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    guard!(headers);
+    json_response(200, json!(state.version.refresh(&state.http).await))
+}
+
+pub async fn install_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guard!(headers);
+    // Require JSON so a cross-origin HTML form cannot trigger a restart using
+    // the operator's session cookie. Credentialed cross-origin CORS is disabled.
+    if headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .map(str::trim)
+        != Some("application/json")
+    {
+        return detail(415, "Expected application/json");
+    }
+    let payload = match json_body(&body) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let Some(version) = payload.get("version").and_then(Value::as_str) else {
+        return detail(400, "Expected a confirmed release version");
+    };
+    if state.version.installation.read().disabled_reason.is_some() {
+        return detail(409, "This deployment must be updated externally");
+    }
+    state.version.refresh(&state.http).await;
+    match crate::updates::start_install(state, version) {
+        Ok(install) => json_response(202, json!(install)),
+        Err(error) => detail(409, error),
+    }
 }
 
 fn account_view(a: &pool::Account, deletable: bool, sessions: i64) -> Value {

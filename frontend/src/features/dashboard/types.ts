@@ -1,5 +1,17 @@
 export type Overview = {
   proxy: { status: string; uptimeSeconds: number };
+  version?: {
+    current: string;
+    latest: string | null;
+    status: "checking" | "latest" | "update_available" | "ahead" | "unavailable";
+    releaseUrl: string | null;
+  };
+  update?: {
+    status: "idle" | "downloading" | "restarting" | "failed";
+    version: string | null;
+    error: string | null;
+    disabledReason: "container" | "managed" | "unsupported" | "development" | null;
+  };
   requests24h: number;
   successes24h: number;
   averageLatencyMs: number;
