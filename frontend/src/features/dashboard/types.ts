@@ -244,7 +244,7 @@ export type DeviceLoginFlow = {
   expiresInSeconds: number;
 };
 
-export const TAB_IDS = ["overview", "accounts", "keys", "settings", "theme", "info"] as const;
+export const TAB_IDS = ["overview", "accounts", "keys", "settings", "info"] as const;
 export type TabId = (typeof TAB_IDS)[number];
 
 export interface EndpointOption {

@@ -4,6 +4,7 @@ import { TAB_IDS, type TabId } from "./types";
 const isTabId = (value: string): value is TabId => (TAB_IDS as readonly string[]).includes(value);
 const readHash = (): TabId => {
   const candidate = window.location.hash.replace(/^#/, "");
+  if (candidate === "theme") return "settings";
   return isTabId(candidate) ? candidate : "overview";
 };
 
