@@ -3,6 +3,7 @@
 pub mod app;
 pub mod auth;
 pub mod bootstrap;
+pub mod client_setup;
 pub mod config;
 pub mod convert_anthropic;
 pub mod convert_core;

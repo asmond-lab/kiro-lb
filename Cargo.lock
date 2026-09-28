@@ -842,6 +842,7 @@ dependencies = [
  "hmac",
  "hostname",
  "include_dir",
+ "libc",
  "mimalloc",
  "mime_guess",
  "parking_lot",
@@ -863,6 +864,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-general-category",
  "uuid",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
