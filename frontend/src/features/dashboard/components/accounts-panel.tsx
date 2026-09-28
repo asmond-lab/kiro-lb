@@ -19,6 +19,7 @@ import { formatDuration, formatTimestamp, formatUsage } from "../format";
 import { usageIndicatorClass } from "../quota-display";
 import { usePreferences } from "../preferences";
 import type { Account, AccountRoutingState } from "../types";
+import { groupAccounts } from "./account-groups";
 import { TableSkeleton } from "./skeletons";
 
 /**
@@ -279,10 +280,7 @@ export type AccountsPanelProps = {
 export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
   const { t } = usePreferences();
   const [deleting, setDeleting] = useState<Account | null>(null);
-  const activeAccounts = accounts.filter((account) => account.enabled !== false && account.routingState !== "suspended");
-  const pausedAccounts = accounts.filter((account) => account.enabled === false && account.routingState !== "suspended");
-  const bannedAccounts = accounts.filter((account) => account.routingState === "suspended");
-  const displayedAccounts = [...activeAccounts, ...pausedAccounts, ...bannedAccounts];
+  const { activeAccounts, pausedAccounts, bannedAccounts, displayedAccounts } = groupAccounts(accounts);
   return (
     <Card>
       <CardHeader>

@@ -1,5 +1,6 @@
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { groupAccounts } from "./components/account-groups";
 import { AccountsPanel } from "./components/accounts-panel";
 import type { Account } from "./types";
 
@@ -111,6 +112,30 @@ describe("banned account grouping", () => {
   const otherStates: Account[] = ["rate_limited", "auth_dead", "quota_depleted", "cooling_down", "quota_exhausted", "uninitialized"].map(
     (state) => ({ ...mockAccount, id: `acc_${state}`, routingState: state as Account["routingState"] }),
   );
+
+  it("partitions without mutating the input or replacing account objects", () => {
+    const secondBanned = { ...banned, id: "acc_banned_second" };
+    const accounts = Object.freeze([banned, paused, ...otherStates, secondBanned, mockAccount]);
+    const groups = groupAccounts(accounts);
+
+    expect(groups).toEqual({
+      activeAccounts: [...otherStates, mockAccount],
+      pausedAccounts: [paused],
+      bannedAccounts: [banned, secondBanned],
+      displayedAccounts: [...otherStates, mockAccount, paused, banned, secondBanned],
+    });
+    expect(groups.pausedAccounts[0]).toBe(paused);
+    expect(groups.bannedAccounts[0]).toBe(banned);
+  });
+
+  it("returns empty groups for an empty pool", () => {
+    expect(groupAccounts([])).toEqual({
+      activeAccounts: [],
+      pausedAccounts: [],
+      bannedAccounts: [],
+      displayedAccounts: [],
+    });
+  });
 
   it("groups only suspended accounts last in both card and table layouts, preserving order within groups", () => {
     const secondBanned = { ...banned, id: "acc_banned_second" };
