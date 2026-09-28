@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/minpeter/kiro-lb/compare/v0.2.2...v0.2.3) - 2026-09-28
+
+### Added
+
+- check releases and install standalone updates from dashboard
+
+### Fixed
+
+- use official model provider marks
+- seed dashboard reload detection from served document version
+- preserve stop intent and reload dashboards on version changes
+- guard failed Windows replacements and recover update targets
+
+### Other
+
+- Move appearance controls into settings
+- Merge main and preserve dashboard update review fixes
+
 ## [0.2.2](https://github.com/minpeter/kiro-lb/compare/v0.2.1...v0.2.2) - 2026-09-28
 
 ### Added
