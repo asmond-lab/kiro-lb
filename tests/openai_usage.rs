@@ -1,8 +1,9 @@
 use futures_util::StreamExt;
 use kiro_lb::auth::{KiroAuth, Source};
 use kiro_lb::model_resolver::ModelInfoCache;
+use kiro_lb::parser::MeteringEvent;
 use kiro_lb::stream_anthropic::StreamCtx;
-use kiro_lb::stream_core::{EventStream, KiroEvent, StreamError};
+use kiro_lb::stream_core::{self, EventStream, KiroEvent, StreamError};
 use kiro_lb::stream_openai::{self, OpenAIOptions};
 use kiro_lb::upstream::http::Transport;
 use kiro_lb::usage_tracking::RequestCtx;
@@ -37,10 +38,16 @@ fn ctx() -> (StreamCtx, RequestCtx) {
 fn no_context_usage() -> EventStream {
     let events: Vec<Result<KiroEvent, StreamError>> = vec![
         Ok(KiroEvent::Content("Hello there".into())),
-        Ok(KiroEvent::Usage(json!({"unit": "credit", "usage": 0.02}))),
+        Ok(KiroEvent::Metering(
+            MeteringEvent::parse(json!({"unit": "credit", "usage": 0.02})).unwrap(),
+        )),
         Ok(KiroEvent::StopReason("end_turn".into())),
     ];
     Box::pin(futures_util::stream::iter(events))
+}
+
+fn metered(events: EventStream, request: &RequestCtx) -> EventStream {
+    stream_core::meter_generation(events, request)
 }
 
 fn opts() -> OpenAIOptions {
@@ -55,10 +62,11 @@ fn opts() -> OpenAIOptions {
 #[tokio::test]
 async fn streaming_chat_reports_the_precomputed_input_count() {
     let (ctx, request) = ctx();
-    let chunks: Vec<String> = stream_openai::stream(no_context_usage(), ctx, opts())
-        .map(|c| c.unwrap())
-        .collect()
-        .await;
+    let chunks: Vec<String> =
+        stream_openai::stream(metered(no_context_usage(), &request), ctx, opts())
+            .map(|c| c.unwrap())
+            .collect()
+            .await;
     let last_usage = chunks
         .iter()
         .rev()
@@ -73,7 +81,7 @@ async fn streaming_chat_reports_the_precomputed_input_count() {
 #[tokio::test]
 async fn non_streaming_chat_reports_the_precomputed_input_count() {
     let (ctx, request) = ctx();
-    let v = stream_openai::collect(no_context_usage(), ctx, opts(), false)
+    let v = stream_openai::collect(metered(no_context_usage(), &request), ctx, opts(), false)
         .await
         .unwrap();
     assert_eq!(v["usage"]["prompt_tokens"], PRECOMPUTED);
@@ -83,7 +91,7 @@ async fn non_streaming_chat_reports_the_precomputed_input_count() {
 #[tokio::test]
 async fn streaming_responses_reports_the_precomputed_input_count() {
     let (ctx, request) = ctx();
-    let chat = stream_openai::stream(no_context_usage(), ctx, opts());
+    let chat = stream_openai::stream(metered(no_context_usage(), &request), ctx, opts());
     let out: Vec<String> =
         kiro_lb::stream_responses::translate(chat, "m".into(), "resp_1".into(), Default::default())
             .map(|c| c.unwrap())
@@ -107,7 +115,7 @@ async fn streaming_responses_reports_the_precomputed_input_count() {
 #[tokio::test]
 async fn non_streaming_responses_reports_the_precomputed_input_count() {
     let (ctx, request) = ctx();
-    let chat = stream_openai::collect(no_context_usage(), ctx, opts(), false)
+    let chat = stream_openai::collect(metered(no_context_usage(), &request), ctx, opts(), false)
         .await
         .unwrap();
     let response =
