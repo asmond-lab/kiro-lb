@@ -199,7 +199,7 @@ describe("useDashboard", () => {
     harness.timerDelays = [];
     Object.values(harness.api).forEach((method) => method.mockReset());
     harness.api.requestLogs.mockResolvedValue(logs);
-    vi.stubGlobal("document", { visibilityState: "visible" });
+    vi.stubGlobal("document", { visibilityState: "visible", querySelector: vi.fn().mockReturnValue(null) });
     vi.stubGlobal("window", {
       location: { reload: vi.fn() },
       clearTimeout: vi.fn(),
@@ -278,6 +278,32 @@ describe("useDashboard", () => {
     harness.api.keyUsage.mockResolvedValue({ usage: {} });
     harness.api.accountTokenUsage.mockResolvedValue({ usage: {} });
   };
+
+  it.each([
+    ["0.2.1", "0.2.2", 1],
+    ["0.2.2", "0.2.2", 0],
+    ["0.2.2", "0.2.1", 1],
+    ["0.2.2-rc.1", "0.2.2", 1],
+  ] as const)("compares document %s with first API version %s even when installation was never observed", (loaded, current, reloads) => {
+    vi.mocked(document.querySelector).mockReturnValue({ content: loaded } as HTMLMetaElement);
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).not.toHaveBeenCalled();
+
+    // No overview succeeded before the server restarted (or before sign-in).
+    harness.stateIndex = 0;
+    harness.refIndex = 0;
+    harness.effects = [];
+    harness.stateOverrides[STATE_OVERVIEW] = {
+      ...healthyOverview(),
+      version: { current, latest: current, status: "latest", releaseUrl: null },
+      update: { status: "idle", version: null, error: null, disabledReason: null },
+    };
+    useDashboard();
+    harness.effects[3]!();
+    expect(window.location.reload).toHaveBeenCalledTimes(reloads);
+    expect(harness.api.installUpdate).not.toHaveBeenCalled();
+  });
 
   it.each([
     ["0.2.1", "0.2.2", 1],

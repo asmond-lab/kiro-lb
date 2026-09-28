@@ -90,7 +90,9 @@ export function useDashboard(): DashboardState {
   const [isRequestingInstall, setIsRequestingInstall] = useState(false);
   const installingRef = useRef(false);
   const checkingUpdatesRef = useRef(false);
-  const loadedVersionRef = useRef<string | undefined>(undefined);
+  // The server stamps the document before any API request can observe a restart.
+  // Vite development pages have no stamp and fall back to the first API version.
+  const loadedVersionRef = useRef(document.querySelector<HTMLMetaElement>('meta[name="kirolb-version"]')?.content);
   const currentVersion = overview?.version?.current;
   const isInstallingUpdate = isRequestingInstall || overview?.update?.status === "downloading" || overview?.update?.status === "restarting";
   // Pagination reads must not resurrect a stale page after a newer request.

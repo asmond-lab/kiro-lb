@@ -38,10 +38,29 @@ async fn static_file(uri: Uri) -> Response {
             } else {
                 "no-cache"
             };
+            let body = if path == "index.html" {
+                // Identify the binary that served this document, even if the
+                // first API response arrives from its replacement after restart.
+                Body::from(
+                    f.contents_utf8()
+                        .expect("dashboard HTML is UTF-8")
+                        .replacen(
+                            "<head>",
+                            concat!(
+                                "<head><meta name=\"kirolb-version\" content=\"",
+                                env!("CARGO_PKG_VERSION"),
+                                "\">"
+                            ),
+                            1,
+                        ),
+                )
+            } else {
+                Body::from(f.contents())
+            };
             Response::builder()
                 .header(header::CONTENT_TYPE, mime.as_ref())
                 .header(header::CACHE_CONTROL, cache)
-                .body(Body::from(f.contents()))
+                .body(body)
                 .unwrap()
         }
         None => Response::builder()
@@ -548,6 +567,41 @@ fn print_banner(addr: &SocketAddr) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[tokio::test]
+    async fn dashboard_document_identifies_the_serving_binary_before_any_api_call() {
+        use super::*;
+        let marker = format!(
+            "<meta name=\"kirolb-version\" content=\"{}\">",
+            env!("CARGO_PKG_VERSION")
+        );
+        for path in ["/", "/index.html"] {
+            let response = static_file(path.parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert_eq!(html.matches(&marker).count(), 1, "{path}: {html}");
+            assert!(html.find(&marker).unwrap() < html.find("<script").unwrap());
+        }
+        let asset = STATIC
+            .get_dir("assets")
+            .unwrap()
+            .files()
+            .find(|f| f.path().extension().is_some_and(|ext| ext == "js"))
+            .unwrap();
+        let response = static_file(format!("/{}", asset.path().display()).parse().unwrap()).await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), asset.contents());
+    }
+
     fn state() -> super::app::Shared {
         use super::*;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
