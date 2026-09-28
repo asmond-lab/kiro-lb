@@ -19,6 +19,7 @@ import { formatDuration, formatTimestamp, formatUsage } from "../format";
 import { usageIndicatorClass } from "../quota-display";
 import { usePreferences } from "../preferences";
 import type { Account, AccountRoutingState } from "../types";
+import { groupAccounts } from "./account-groups";
 import { TableSkeleton } from "./skeletons";
 
 /**
@@ -206,9 +207,9 @@ function AccountCard({
   const { t } = usePreferences();
   const overage = account.usage?.overageStatus;
   return (
-    <article className={cn("space-y-4 rounded-lg border p-4", account.enabled === false && "bg-muted/15 text-muted-foreground")}>
-      <div className="flex min-w-0 items-start justify-between gap-3">
-        <div className="min-w-0 flex-1"><AccountCell account={account} /></div>
+    <article className={cn("space-y-4 rounded-lg border p-4", (account.enabled === false || account.routingState === "suspended") && "bg-muted/15 text-muted-foreground")}>
+      <div className={cn("flex min-w-0 items-start justify-between gap-3", account.routingState === "suspended" && "flex-col")}>
+        <div className="min-w-0 max-w-full flex-1"><AccountCell account={account} /></div>
         <RoutingStateCell account={account} />
       </div>
       <UsageCell account={account} />
@@ -279,9 +280,7 @@ export type AccountsPanelProps = {
 export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
   const { t } = usePreferences();
   const [deleting, setDeleting] = useState<Account | null>(null);
-  const activeAccounts = accounts.filter((account) => account.enabled !== false);
-  const pausedAccounts = accounts.filter((account) => account.enabled === false);
-  const displayedAccounts = [...activeAccounts, ...pausedAccounts];
+  const { activeAccounts, pausedAccounts, bannedAccounts, displayedAccounts } = groupAccounts(accounts);
   return (
     <Card>
       <CardHeader>
@@ -303,9 +302,23 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                 <div className="space-y-3 pt-2">
                   <div className="rounded-md bg-muted/30 px-3 py-2">
                     <p className="font-medium">{t("accounts.pausedSection")}</p>
-                    <p className="text-xs text-muted-foreground">{t("accounts.pausedDescription")}</p>
+                    <p className="text-xs break-keep text-muted-foreground">{t("accounts.pausedDescription")}</p>
                   </div>
                   {pausedAccounts.map((account) => (
+                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                  ))}
+                </div>
+              )}
+              {bannedAccounts.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <div className="rounded-md bg-destructive/5 px-3 py-2">
+                    <p className="flex items-center gap-2 font-medium text-destructive">
+                      <Ban size={14} aria-hidden="true" />
+                      {t("accounts.bannedSection")}
+                    </p>
+                    <p className="text-xs break-keep text-muted-foreground">{t("accounts.bannedDescription")}</p>
+                  </div>
+                  {bannedAccounts.map((account) => (
                     <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
                   ))}
                 </div>
@@ -329,9 +342,9 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
               </TableRow>
             </TableHeader>
             <TableBody>
-              {displayedAccounts.map((account, index) => (
+              {displayedAccounts.map((account) => (
                 <Fragment key={account.id}>
-                  {account.enabled === false && (index === 0 || displayedAccounts[index - 1]?.enabled !== false) && (
+                  {account === pausedAccounts[0] && (
                     <TableRow className="bg-muted/30 hover:bg-muted/30">
                       <TableCell colSpan={10} className="whitespace-normal py-3">
                         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -341,7 +354,20 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                       </TableCell>
                     </TableRow>
                   )}
-                  <TableRow className={account.enabled === false ? "bg-muted/15 text-muted-foreground hover:bg-muted/25" : undefined}>
+                  {account === bannedAccounts[0] && (
+                    <TableRow className="bg-destructive/5 hover:bg-destructive/5">
+                      <TableCell colSpan={10} className="whitespace-normal py-3">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="inline-flex items-center gap-2 font-medium text-destructive">
+                            <Ban size={14} aria-hidden="true" />
+                            {t("accounts.bannedSection")}
+                          </span>
+                          <span className="text-xs text-muted-foreground">{t("accounts.bannedDescription")}</span>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  <TableRow className={account.enabled === false || account.routingState === "suspended" ? "bg-muted/15 text-muted-foreground hover:bg-muted/25" : undefined}>
                     <TableCell className="max-w-56">
                       <AccountCell account={account} />
                     </TableCell>

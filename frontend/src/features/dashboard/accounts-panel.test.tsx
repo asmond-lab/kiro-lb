@@ -1,5 +1,6 @@
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { groupAccounts } from "./components/account-groups";
 import { AccountsPanel } from "./components/accounts-panel";
 import type { Account } from "./types";
 
@@ -88,6 +89,104 @@ describe("AccountsPanel", () => {
     expect(html).toContain(">41<");
     expect(html).toContain(">3<");
     expect(html).toContain(">Resume<");
+  });
+});
+
+describe("banned account grouping", () => {
+  const banned: Account = {
+    ...deletableAccount,
+    id: "acc_banned_first",
+    enabled: true,
+    routingState: "suspended",
+    requests: 73,
+    failures: 5,
+    usage: {
+      email: "banned@example.com",
+      subscriptionTitle: "Kiro Pro",
+      usagePercent: 37,
+      currentUsage: 370,
+      usageLimit: 1000,
+    },
+  };
+  const paused: Account = { ...mockAccount, id: "acc_paused", enabled: false, routingState: "disabled" };
+  const otherStates: Account[] = ["rate_limited", "auth_dead", "quota_depleted", "cooling_down", "quota_exhausted", "uninitialized"].map(
+    (state) => ({ ...mockAccount, id: `acc_${state}`, routingState: state as Account["routingState"] }),
+  );
+
+  it("partitions without mutating the input or replacing account objects", () => {
+    const secondBanned = { ...banned, id: "acc_banned_second" };
+    const accounts = Object.freeze([banned, paused, ...otherStates, secondBanned, mockAccount]);
+    const groups = groupAccounts(accounts);
+
+    expect(groups).toEqual({
+      activeAccounts: [...otherStates, mockAccount],
+      pausedAccounts: [paused],
+      bannedAccounts: [banned, secondBanned],
+      displayedAccounts: [...otherStates, mockAccount, paused, banned, secondBanned],
+    });
+    expect(groups.pausedAccounts[0]).toBe(paused);
+    expect(groups.bannedAccounts[0]).toBe(banned);
+  });
+
+  it("returns empty groups for an empty pool", () => {
+    expect(groupAccounts([])).toEqual({
+      activeAccounts: [],
+      pausedAccounts: [],
+      bannedAccounts: [],
+      displayedAccounts: [],
+    });
+  });
+
+  it("groups only suspended accounts last in both card and table layouts, preserving order within groups", () => {
+    const secondBanned = { ...banned, id: "acc_banned_second" };
+    const html = renderToString(
+      <AccountsPanel accounts={[banned, paused, ...otherStates, secondBanned, mockAccount]} isLoading={false} />,
+    );
+    const [cards, table] = html.split("<table");
+    for (const layout of [cards, table]) {
+      expect(layout.match(/Paused accounts/g)).toHaveLength(1);
+      expect(layout.match(/Banned accounts/g)).toHaveLength(1);
+      for (const account of [...otherStates, mockAccount]) {
+        expect(layout).toContain(account.id);
+        expect(layout.lastIndexOf(account.id)).toBeLessThan(layout.indexOf("Paused accounts"));
+      }
+      expect(layout.indexOf("Paused accounts")).toBeLessThan(layout.indexOf(paused.id));
+      expect(layout.lastIndexOf(paused.id)).toBeLessThan(layout.indexOf("Banned accounts"));
+      expect(layout.indexOf("Banned accounts")).toBeLessThan(layout.indexOf(banned.id));
+      expect(layout.lastIndexOf(banned.id)).toBeLessThan(layout.indexOf(secondBanned.id));
+    }
+    expect(cards.match(/<article /g)).toHaveLength(10);
+    expect(table.match(/<tr /g)).toHaveLength(13); // Header, two dividers, ten accounts.
+  });
+
+  it("shows the section even when every account is banned, keeping snapshots and actions", () => {
+    const html = renderToString(
+      <AccountsPanel accounts={[banned]} isLoading={false} onToggleAccount={() => undefined} />,
+    );
+    const [cards, table] = html.split("<table");
+    for (const layout of [cards, table]) {
+      expect(layout).toContain("Banned accounts");
+      expect(layout).not.toContain("Paused accounts");
+      expect(layout).not.toContain("No accounts registered");
+      expect(layout).toContain("last known details are kept");
+      expect(layout).toContain("banned@example.com");
+      expect(layout).toContain("Kiro Pro");
+      expect(layout).toContain("37.00%");
+      expect(layout).toContain(">73<");
+      expect(layout).toContain(">5<");
+      expect(layout).toContain("contact support");
+    }
+    expect(cards).toContain(">Pause<");
+    expect(cards).toContain("Delete");
+    expect(table).toContain('aria-label="Delete account acc_banned_first"');
+  });
+
+  it("does not create a banned section for other exclusions or paused accounts", () => {
+    const html = renderToString(
+      <AccountsPanel accounts={[paused, ...otherStates]} isLoading={false} />,
+    );
+    expect(html).toContain("Paused accounts");
+    expect(html).not.toContain("Banned accounts");
   });
 });
 
