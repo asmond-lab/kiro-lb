@@ -292,6 +292,22 @@ pub fn reset_concurrency() {
     *GATES.lock() = None;
 }
 
+/// Current use of an account's generation slots. `None` means per-account
+/// concurrency is unlimited.
+pub fn account_concurrency_load(account: &str) -> Option<(usize, usize)> {
+    let limit = settings::tunables().max_account_concurrency.max(0) as usize;
+    if limit == 0 {
+        return None;
+    }
+    let held = GATES
+        .lock()
+        .as_ref()
+        .and_then(|gates| gates.accounts.get(account))
+        .map(|gate| gate.limit.saturating_sub(gate.sem.available_permits()))
+        .unwrap_or(0);
+    Some((held, limit))
+}
+
 async fn acquire(
     sem: Arc<Semaphore>,
     timeout: f64,
@@ -344,7 +360,7 @@ pub async fn concurrency_slot(account: &str) -> Result<Vec<OwnedSemaphorePermit>
             permits.push(acquire(g, timeout, "global", global_limit).await?);
         }
         if let Some(a) = a {
-            permits.push(acquire(a, timeout, &format!("account {account}"), account_limit).await?);
+            permits.push(acquire(a, timeout, "per-account", account_limit).await?);
         }
         Ok::<(), TransportError>(())
     }
@@ -659,14 +675,14 @@ impl Transport {
 
     pub async fn generate(
         &self,
+        account_id: &str,
         auth: &KiroAuth,
         body: Bytes,
         model: &str,
         stream: bool,
         retry_rate_limits: bool,
     ) -> Result<UpstreamResponse, TransportError> {
-        let account_key = auth.profile_arn().unwrap_or_else(|| "default".into());
-        let permits = concurrency_slot(&account_key).await?;
+        let permits = concurrency_slot(account_id).await?;
         let s = settings::endpoint_settings();
         let result = if !s.rotation {
             self.through_proxies(

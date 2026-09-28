@@ -18,6 +18,8 @@ use crate::upstream::http::Transport;
 use crate::usage_tracking::{GenerationTimer, RequestCtx};
 use crate::{pyjson, utils, web_search};
 
+const SEARCH_TERMINAL_DRAIN_SECONDS: u64 = 1;
+
 /// Builds the generation that answers after an intercepted web_search.
 /// `Err` is a real failure (transport error, non-200) and fails the turn; it is
 /// never turned into a quiet fallback that would credit the account.
@@ -219,6 +221,17 @@ pub fn stream(
                             if let (Some(query), Some(followup)) = (input.get("query").and_then(Value::as_str).filter(|q| !q.is_empty()).map(str::to_owned), ctx.search_followup.clone()) {
                                 tracing::info!("Intercepted web_search tool call (Path B - MCP emulation)");
                                 if let Some((srv_id, results)) = web_search::call_mcp(&query, &ctx.auth, &ctx.transport).await {
+                                    let drain = async {
+                                        while let Some(trailing) = current.next().await {
+                                            trailing?;
+                                        }
+                                        Ok::<(), StreamError>(())
+                                    };
+                                    match tokio::time::timeout(std::time::Duration::from_secs(SEARCH_TERMINAL_DRAIN_SECONDS), drain).await {
+                                        Ok(result) => result?,
+                                        Err(_) => tracing::warn!("Timed out draining terminal events before web_search follow-up"),
+                                    }
+                                    drop(std::mem::replace(&mut current, Box::pin(futures_util::stream::empty())));
                                     yield em.emit("content_block_start", json!({"type": "content_block_start", "index": index, "content_block": {"id": srv_id, "type": "server_tool_use", "name": "web_search", "input": {}}}))?;
                                     yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": pyjson::dumps(&json!({"query": query}))}}))?;
                                     yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
@@ -227,7 +240,6 @@ pub fn stream(
                                     yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
                                     index += 1;
                                     intercepted.insert(tool_call_signature(&json!({"function": {"name": name, "arguments": pyjson::dumps(&input)}})));
-                                    drop(std::mem::replace(&mut current, Box::pin(futures_util::stream::empty())));
                                     current = followup(id.clone(), query.clone(), web_search::summary(&query, &results)).await?;
                                     stop_reason = None;
                                     context_usage = None;
@@ -245,11 +257,11 @@ pub fn stream(
                         index += 1;
                     }
                     KiroEvent::ContextUsage(p) => context_usage = Some(p),
+                    KiroEvent::Metering(m) => {
+                        cache_usage.extend(cache_fields(m.raw()));
+                    }
                     KiroEvent::Usage(u) => {
-                        if !stream_core::is_zero(&u) {
-                            ctx.request.report_credits(&u);
-                            cache_usage.extend(cache_fields(&u));
-                        }
+                        cache_usage.extend(cache_fields(&u));
                     }
                     KiroEvent::StopReason(s) => if !s.is_empty() { stop_reason = Some(s) },
                 }
@@ -406,7 +418,10 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         let next = followup(id, query.clone(), web_search::summary(&query, &results)).await?;
         result = stream_core::collect(next).await?;
     }
-    let cache = result.usage.as_ref().map(cache_fields).unwrap_or_default();
+    let mut cache = result.usage.as_ref().map(cache_fields).unwrap_or_default();
+    if let Some(metering) = &result.metering {
+        cache.extend(cache_fields(metering.raw()));
+    }
     let mut content = Vec::new();
     for b in &native {
         match b["type"].as_str() {

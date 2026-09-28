@@ -230,7 +230,9 @@ fn parse_args() -> (String, u16) {
                 i += 1;
             }
             "-h" | "--help" => {
-                println!("kirolb [--host HOST] [--port PORT]\n       kirolb replay <capture-dir>");
+                println!(
+                    "kirolb [--host HOST] [--port PORT]\n       kirolb replay <capture-dir>\n       kirolb client <setup|diagnose|status|restore> ..."
+                );
                 std::process::exit(0);
             }
             _ => {}
@@ -241,6 +243,10 @@ fn parse_args() -> (String, u16) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("client") {
+        std::process::exit(kiro_lb::client_setup::cli(&args[2..]));
+    }
     let generated = match kiro_lb::bootstrap::ensure_env() {
         Ok(g) => g,
         Err(e) => {
@@ -264,7 +270,6 @@ fn main() {
         .with_target(false)
         .compact()
         .init();
-    let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("replay") {
         std::process::exit(kiro_lb::debug::replay_cli(&args[2..]));
     }

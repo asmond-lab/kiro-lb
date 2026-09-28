@@ -244,6 +244,7 @@ pub fn initialize() -> rusqlite::Result<()> {
                 requests INTEGER NOT NULL DEFAULT 0,
                 generation_ms INTEGER NOT NULL DEFAULT 0,
                 timed_completion_tokens INTEGER NOT NULL DEFAULT 0,
+                credits REAL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (key_id, account_id, model)
             );
@@ -267,6 +268,10 @@ pub fn initialize() -> rusqlite::Result<()> {
                 error TEXT
             );",
         )?;
+        let account_model_cols = columns(conn, "account_model_usage")?;
+        if !account_model_cols.iter().any(|column| column == "credits") {
+            conn.execute_batch("ALTER TABLE account_model_usage ADD COLUMN credits REAL")?;
+        }
         let usage_cols = columns(conn, "account_usage")?;
         for (col, ddl) in [
             ("login_identity", "TEXT"),

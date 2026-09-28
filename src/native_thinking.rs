@@ -1,10 +1,11 @@
-//! Native reasoning request fields. Kiro accepts only the adaptive form; the
-//! legacy budget form is translated, never forwarded. Unknown members of
-//! additionalModelRequestFields are rejected upstream, so the object is attached
-//! only when reasoning was actually requested.
+//! Native reasoning request fields. GPT and Claude use different upstream
+//! fields, while the legacy Anthropic budget form is translated, never forwarded.
+//! Unknown members of additionalModelRequestFields are rejected upstream, so the
+//! object is attached only for an explicitly supported model and effort.
 
 use serde_json::{json, Value};
 
+const GPT_NATIVE_THINKING_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 pub const NATIVE_THINKING_MODELS: &[&str] = &[
     "claude-opus-4.6",
     "claude-opus-4.7",
@@ -12,6 +13,9 @@ pub const NATIVE_THINKING_MODELS: &[&str] = &[
     "claude-opus-5",
     "claude-opus-5.5",
     "claude-sonnet-4.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
 ];
 const SUPPORTED: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DISABLING: &[&str] = &["none", "off", "disabled", "0"];
@@ -19,6 +23,10 @@ pub const MIN_BUDGET_TOKENS: f64 = 1024.0;
 
 pub fn supports_native_thinking(model_id: &str) -> bool {
     NATIVE_THINKING_MODELS.contains(&model_id)
+}
+
+fn is_disabling_effort(effort: &str) -> bool {
+    DISABLING.contains(&effort.trim().to_lowercase().as_str())
 }
 
 pub fn normalize_effort(effort: Option<&str>) -> Option<&'static str> {
@@ -36,6 +44,15 @@ pub fn normalize_effort(effort: Option<&str>) -> Option<&'static str> {
     None
 }
 
+fn normalize_gpt_effort(effort: Option<&str>) -> Option<&'static str> {
+    let effort = effort?;
+    // GPT defaults to high, so an explicit disable must reach the upstream model.
+    if is_disabling_effort(effort) {
+        return Some("none");
+    }
+    normalize_effort(Some(effort))
+}
+
 pub fn effort_from_anthropic(
     thinking: Option<&Value>,
     output_config: Option<&Value>,
@@ -44,9 +61,13 @@ pub fn effort_from_anthropic(
     if let Some(e) = output_config
         .and_then(|o| o.get("effort"))
         .and_then(Value::as_str)
-        .and_then(|e| normalize_effort(Some(e)))
     {
-        return Some(e);
+        if is_disabling_effort(e) {
+            return Some("none");
+        }
+        if let Some(e) = normalize_effort(Some(e)) {
+            return Some(e);
+        }
     }
     let thinking = thinking?.as_object()?;
     match thinking
@@ -57,7 +78,7 @@ pub fn effort_from_anthropic(
         .to_lowercase()
         .as_str()
     {
-        "disabled" => None,
+        "disabled" => Some("none"),
         "adaptive" => Some("high"),
         "enabled" => {
             let budget = thinking
@@ -88,11 +109,17 @@ pub fn effort_from_anthropic(
 }
 
 pub fn apply_native_thinking(payload: &mut Value, model_id: &str, effort: Option<&str>) {
-    let Some(e) = normalize_effort(effort) else {
-        return;
-    };
-    if !supports_native_thinking(model_id) {
+    if GPT_NATIVE_THINKING_MODELS.contains(&model_id) {
+        let Some(e) = normalize_gpt_effort(effort) else {
+            return;
+        };
+        payload["additionalModelRequestFields"] = json!({"reasoning": {"effort": e}});
         return;
     }
-    payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
+    if supports_native_thinking(model_id) {
+        let Some(e) = normalize_effort(effort) else {
+            return;
+        };
+        payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
+    }
 }

@@ -8,8 +8,10 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::parser::{
-    deduplicate_tool_calls, parse_bracket_tool_calls, AwsEventStreamParser, ParsedEvent,
+    deduplicate_tool_calls, parse_bracket_tool_calls, AwsEventStreamParser, MeteringEvent,
+    ParsedEvent,
 };
+use crate::usage_tracking::{GenerationCredits, RequestCtx};
 
 #[derive(Debug, Clone)]
 pub enum KiroEvent {
@@ -18,6 +20,7 @@ pub enum KiroEvent {
     ThinkingSignature(String),
     ToolUse(Value),
     Usage(Value),
+    Metering(MeteringEvent),
     ContextUsage(f64),
     StopReason(String),
 }
@@ -61,6 +64,7 @@ fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
     Ok(Some(match e {
         ParsedEvent::Content(c) => KiroEvent::Content(c),
         ParsedEvent::Usage(u) => KiroEvent::Usage(u),
+        ParsedEvent::Metering(m) => KiroEvent::Metering(m),
         ParsedEvent::ContextUsage(p) => KiroEvent::ContextUsage(p),
         ParsedEvent::StopReason(r) => KiroEvent::StopReason(r),
         ParsedEvent::Thinking { text, is_first } => {
@@ -79,10 +83,31 @@ fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
     }))
 }
 
-pub fn parse_kiro_stream(
+fn convert_batch(
+    events: Vec<ParsedEvent>,
+    meter: &mut Option<GenerationCredits>,
+) -> Result<Vec<KiroEvent>, StreamError> {
+    if let Some(meter) = meter {
+        for event in &events {
+            if let ParsedEvent::Metering(reading) = event {
+                meter.report(reading);
+            }
+        }
+    }
+    let mut converted = Vec::with_capacity(events.len());
+    for event in events {
+        if let Some(event) = convert(event)? {
+            converted.push(event);
+        }
+    }
+    Ok(converted)
+}
+
+fn parse_kiro_stream_inner(
     mut body: ByteStream,
     first_token_timeout: f64,
     read_timeout: f64,
+    mut meter: Option<GenerationCredits>,
 ) -> EventStream {
     Box::pin(async_stream::try_stream! {
         let mut parser = AwsEventStreamParser::new();
@@ -93,11 +118,10 @@ pub fn parse_kiro_stream(
             Ok(Some(Err(e))) => Err(StreamError::Upstream(e.to_string()))?,
             Ok(Some(Ok(b))) => b,
         };
-        for e in parser.feed(&first) {
-            if let Some(ev) = convert(e)? {
-                received = true;
-                yield ev;
-            }
+        let events = convert_batch(parser.feed(&first), &mut meter)?;
+        received |= !events.is_empty();
+        for event in events {
+            yield event;
         }
         loop {
             let next = match tokio::time::timeout(Duration::from_secs_f64(read_timeout), body.next()).await {
@@ -106,11 +130,10 @@ pub fn parse_kiro_stream(
             };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| StreamError::Upstream(e.to_string()))?;
-            for e in parser.feed(&chunk) {
-                if let Some(ev) = convert(e)? {
-                    received = true;
-                    yield ev;
-                }
+            let events = convert_batch(parser.feed(&chunk), &mut meter)?;
+            received |= !events.is_empty();
+            for event in events {
+                yield event;
             }
         }
         for tc in parser.get_unemitted_tool_calls() {
@@ -126,6 +149,44 @@ pub fn parse_kiro_stream(
     })
 }
 
+pub fn parse_kiro_stream(
+    body: ByteStream,
+    first_token_timeout: f64,
+    read_timeout: f64,
+) -> EventStream {
+    parse_kiro_stream_inner(body, first_token_timeout, read_timeout, None)
+}
+
+pub fn parse_kiro_stream_metered(
+    body: ByteStream,
+    first_token_timeout: f64,
+    read_timeout: f64,
+    request: &RequestCtx,
+) -> EventStream {
+    parse_kiro_stream_inner(
+        body,
+        first_token_timeout,
+        read_timeout,
+        Some(request.begin_generation()),
+    )
+}
+
+/// Attributes metering to one physical upstream generation while leaving the
+/// event stream intact for protocol conversion. Each call establishes a new
+/// additive generation boundary; repeated frames inside it replace its latest
+/// snapshot.
+pub fn meter_generation(mut events: EventStream, request: &RequestCtx) -> EventStream {
+    let mut meter = request.begin_generation();
+    Box::pin(async_stream::stream! {
+        while let Some(event) = events.next().await {
+            if let Ok(KiroEvent::Metering(reading)) = &event {
+                meter.report(reading);
+            }
+            yield event;
+        }
+    })
+}
+
 #[derive(Default, Debug)]
 pub struct StreamResult {
     pub content: String,
@@ -134,6 +195,7 @@ pub struct StreamResult {
     pub content_blocks: Vec<Value>,
     pub tool_calls: Vec<Value>,
     pub usage: Option<Value>,
+    pub metering: Option<MeteringEvent>,
     pub context_usage_percentage: Option<f64>,
     pub stop_reason: Option<String>,
 }
@@ -187,6 +249,24 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     .push(json!({"type": "tool_use", "tool": t}));
             }
             KiroEvent::Usage(u) if !is_zero(&u) => r.usage = Some(u),
+            KiroEvent::Metering(m) => {
+                let mut raw = m
+                    .raw()
+                    .as_object()
+                    .expect("validated metering event is an object")
+                    .clone();
+                if let Some(previous) = r.metering.take() {
+                    for (key, value) in previous.raw().as_object().into_iter().flatten() {
+                        if !matches!(key.as_str(), "unit" | "unitPlural" | "usage" | "amount") {
+                            raw.entry(key.clone()).or_insert_with(|| value.clone());
+                        }
+                    }
+                }
+                r.metering = Some(
+                    MeteringEvent::parse(Value::Object(raw))
+                        .expect("merged metering event remains valid"),
+                );
+            }
             KiroEvent::ContextUsage(p) => r.context_usage_percentage = Some(p),
             KiroEvent::StopReason(s) if !s.is_empty() => r.stop_reason = Some(s),
             _ => {}

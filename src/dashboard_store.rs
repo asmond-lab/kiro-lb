@@ -103,19 +103,25 @@ pub fn flush_key_model_usage() -> usize {
                 updated_at = excluded.updated_at",
         )?;
         let mut per_account = c.prepare_cached(
-            "INSERT INTO account_model_usage(key_id, account_id, model, prompt_tokens, completion_tokens, requests, generation_ms, timed_completion_tokens, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO account_model_usage(key_id, account_id, model, prompt_tokens, completion_tokens, requests, generation_ms, timed_completion_tokens, credits, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(key_id, account_id, model) DO UPDATE SET
                 prompt_tokens = prompt_tokens + excluded.prompt_tokens,
                 completion_tokens = completion_tokens + excluded.completion_tokens,
                 requests = requests + excluded.requests,
                 generation_ms = generation_ms + excluded.generation_ms,
                 timed_completion_tokens = timed_completion_tokens + excluded.timed_completion_tokens,
+                credits = CASE
+                    WHEN account_model_usage.credits IS NULL AND excluded.credits IS NULL THEN NULL
+                    ELSE COALESCE(account_model_usage.credits, 0) + COALESCE(excluded.credits, 0)
+                END,
                 updated_at = excluded.updated_at",
         )?;
-        for (k, a, m, p, cm, r, g, t) in &pending {
-            per_key.execute(params![k, m, p, cm, r, g, t, now])?;
-            per_account.execute(params![k, a, m, p, cm, r, g, t, now])?;
+        for (k, a, m, p, cm, r, g, t, credits) in &pending {
+            if [p, cm, r, g, t].into_iter().any(|value| *value != 0) {
+                per_key.execute(params![k, m, p, cm, r, g, t, now])?;
+            }
+            per_account.execute(params![k, a, m, p, cm, r, g, t, credits, now])?;
         }
         Ok(())
     });
@@ -170,14 +176,18 @@ pub fn account_model_usage() -> Vec<(String, Vec<Value>)> {
         let mut stmt = c.prepare(
             "SELECT account_id, model, SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens,
                     SUM(requests) AS requests, SUM(generation_ms) AS generation_ms,
-                    SUM(timed_completion_tokens) AS timed_completion_tokens, MAX(updated_at) AS updated_at
+                    SUM(timed_completion_tokens) AS timed_completion_tokens, SUM(credits) AS credits,
+                    MAX(updated_at) AS updated_at
              FROM account_model_usage GROUP BY account_id, model ORDER BY SUM(prompt_tokens) + SUM(completion_tokens) DESC",
         )?;
         let mut out: Vec<(String, Vec<Value>)> = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let id: String = r.get(0)?;
-            let view = usage_view(r)?;
+            let mut view = usage_view(r)?;
+            view["credits"] = r
+                .get::<_, Option<f64>>("credits")?
+                .map_or(Value::Null, |credits| json!(credits));
             match out.iter_mut().find(|(k, _)| *k == id) {
                 Some((_, v)) => v.push(view),
                 None => out.push((id, vec![view])),
