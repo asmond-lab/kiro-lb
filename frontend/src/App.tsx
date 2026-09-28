@@ -315,6 +315,10 @@ export default function App() {
               routableAccounts={kpis?.routableAccounts?.count}
               lastUpdatedAt={dashboard.lastUpdatedAt}
               isLive={dashboard.isLive}
+              isCheckingUpdates={dashboard.isCheckingUpdates}
+              onCheckUpdates={() => void dashboard.checkForUpdates()}
+              isInstallingUpdate={dashboard.isInstallingUpdate}
+              onInstallUpdate={(version) => void dashboard.installUpdate(version)}
             />
           </TabsContent>
 

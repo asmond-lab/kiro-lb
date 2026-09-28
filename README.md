@@ -47,6 +47,33 @@ On first run it creates `.env` and `.env.example` with generated credentials
 and prints them. Open http://localhost:8000 and add accounts with device login.
 `SHA256SUMS` in the release lists every file's checksum.
 
+At startup and every hour, the gateway checks GitHub's latest stable
+release in the background. A newer release produces a log notice with a download
+link. Dashboard **Info → Service** shows the running version and update status;
+failed checks are shown as unavailable, not up to date. Checks time out after
+five seconds, send no account credentials, and never install updates automatically.
+Use **Check now** in the Info tab to check manually, even when live updates are
+paused. Concurrent checks share one request, and results less than one minute
+old are reused to avoid exhausting GitHub's API limit. Opening the tab or
+refreshing dashboard data alone does not trigger an external check.
+
+On standalone Linux and Windows release binaries (x64/ARM64), **Update and
+restart** asks for confirmation, downloads the matching release asset, verifies
+`SHA256SUMS` and the candidate's `--version`, and saves `<executable>.previous`
+before replacing the executable. It then drains active requests, flushes runtime
+state, and restarts with the same arguments, environment and working directory.
+The dashboard reconnects and reloads the new frontend. The executable's directory
+must be writable; no privilege escalation is attempted. An install failure keeps
+the existing process running. A failure to launch the new executable restores the
+backup and attempts to restart it; a failure occurring *after* successful launch
+still requires manual recovery from `.previous` and is not automatically rolled back.
+
+Docker, blue/green managed deployments, debug builds and unsupported platforms
+only offer checks and update instructions, not executable replacement. Docker
+must be updated by pulling an image and recreating the container externally.
+Release binaries expose `kirolb --version` without opening the database or
+creating configuration files.
+
 ### Docker
 
 A multi-arch image (`linux/amd64`, `linux/arm64`) is published to GHCR:

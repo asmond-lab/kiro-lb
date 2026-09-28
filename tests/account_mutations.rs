@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use kiro_lb::app::{AppState, Shared};
 use kiro_lb::pool::AccountManager;
@@ -18,11 +18,33 @@ fn source(id: &str) -> Value {
 fn router(state: Shared) -> Router {
     Router::new()
         .route("/api/dashboard/login", post(d::login))
+        .route("/api/dashboard/accounts", get(d::accounts))
         .route(
             "/api/dashboard/accounts/{label}/enabled",
             post(d::set_enabled),
         )
         .with_state(state)
+}
+
+async fn account_rows(app: &Router, session: &str) -> Vec<Value> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/dashboard/accounts")
+                .header("cookie", session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<Value>(&body).unwrap()["accounts"]
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 async fn cookie(app: &Router) -> String {
@@ -61,7 +83,18 @@ async fn concurrent_disables_cannot_both_remove_the_last_account() {
     let http = reqwest::Client::new();
     let pool = AccountManager::new(http.clone());
     pool.load_credentials();
+    pool.load_state();
     assert_eq!(pool.accounts().len(), 2);
+    for (id, total, success, failed) in [("a", 41, 38, 3), ("b", 52, 48, 4)] {
+        let account = pool.get(id).unwrap();
+        let mut account_state = account.state.lock();
+        account_state.failures = failed;
+        account_state.stats.total = total;
+        account_state.stats.success = success;
+        account_state.stats.failed = failed;
+    }
+    pool.pin_session(Some(7), "a");
+    pool.pin_session(Some(8), "b");
     let state: Shared = Arc::new(AppState {
         pool: pool.clone(),
         transport: Arc::new(Transport {
@@ -69,6 +102,7 @@ async fn concurrent_disables_cannot_both_remove_the_last_account() {
         }),
         http,
         started_at: 0.0,
+        version: Default::default(),
         quiesced: AtomicBool::new(false),
         inflight: AtomicI64::new(0),
         drained: tokio::sync::Notify::new(),
@@ -94,15 +128,52 @@ async fn concurrent_disables_cannot_both_remove_the_last_account() {
     let (a, b) = (disable("a"), disable("b"));
     let mut statuses = vec![a.await.unwrap(), b.await.unwrap()];
     statuses.sort();
-    let persisted: Vec<String> = kiro_lb::store::load_account_sources()
-        .into_iter()
+    let sources = kiro_lb::store::load_account_sources();
+    let persisted: Vec<String> = sources
+        .iter()
         .filter(|e| e["enabled"].as_bool().unwrap_or(true))
         .map(|e| e["id"].as_str().unwrap().to_owned())
         .collect();
+    let paused_id = sources
+        .iter()
+        .find(|entry| !entry["enabled"].as_bool().unwrap_or(true))
+        .and_then(|entry| entry["id"].as_str())
+        .unwrap();
     let live: Vec<String> = pool.accounts().iter().map(|a| a.id.clone()).collect();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(statuses, vec![StatusCode::OK, StatusCode::CONFLICT]);
     assert_eq!(live.len(), 1);
     assert_eq!(persisted, live);
+    let label = kiro_lb::pool::account_label(paused_id);
+    let expected = if paused_id == "a" {
+        (41, 38, 3)
+    } else {
+        (52, 48, 4)
+    };
+    let paused = account_rows(&app, &session).await;
+    let account = paused.iter().find(|row| row["id"] == label).unwrap();
+    assert_eq!(account["routingState"], "disabled");
+    assert_eq!(account["requests"], expected.0);
+    assert_eq!(account["failures"], expected.2);
+    assert_eq!(account["sessions"], 1);
+
+    let resume = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/dashboard/accounts/{label}/enabled"))
+                .header("cookie", &session)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume.status(), StatusCode::OK);
+    let restored = pool.get(paused_id).unwrap();
+    let restored_state = restored.state.lock();
+    assert_eq!(restored_state.stats.total, expected.0);
+    assert_eq!(restored_state.stats.success, expected.1);
+    assert_eq!(restored_state.stats.failed, expected.2);
+    drop(restored_state);
+    let _ = std::fs::remove_dir_all(&dir);
 }

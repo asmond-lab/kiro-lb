@@ -8,7 +8,7 @@ RUN apk add --no-cache ca-certificates wget && adduser -D -u 1000 kirolb && mkdi
 WORKDIR /app
 COPY --from=pick /kirolb /usr/local/bin/kirolb
 USER kirolb
-ENV SERVER_HOST=0.0.0.0 SERVER_PORT=8000
+ENV SERVER_HOST=0.0.0.0 SERVER_PORT=8000 KIRO_LB_CONTAINER=1
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8000/health || exit 1
 ENTRYPOINT ["/usr/local/bin/kirolb"]

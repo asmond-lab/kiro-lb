@@ -23,6 +23,7 @@ pub struct AppState {
     pub transport: Arc<Transport>,
     pub http: reqwest::Client,
     pub started_at: f64,
+    pub version: crate::updates::UpdateChecker,
     pub quiesced: AtomicBool,
     pub inflight: AtomicI64,
     pub drained: tokio::sync::Notify,

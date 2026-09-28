@@ -292,11 +292,52 @@ pub async fn overview(State(state): State<Shared>, headers: HeaderMap) -> Respon
         200,
         json!({
             "proxy": {"status": "healthy", "uptimeSeconds": (store::now_f64() - state.started_at) as i64},
+            "version": &*state.version.info.read(),
+            "update": &*state.version.installation.read(),
             "requests24h": requests, "successes24h": successes, "averageLatencyMs": avg.round() as i64,
             "accounts": {"total": accounts.len(), "initialized": accounts.iter().filter(|a| a.auth().is_some()).count()},
             "models": if models == 0 { config::FALLBACK_MODELS.len() } else { models },
         }),
     )
+}
+
+pub async fn check_updates(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    guard!(headers);
+    json_response(200, json!(state.version.refresh(&state.http).await))
+}
+
+pub async fn install_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guard!(headers);
+    // Require JSON so a cross-origin HTML form cannot trigger a restart using
+    // the operator's session cookie. Credentialed cross-origin CORS is disabled.
+    if headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .map(str::trim)
+        != Some("application/json")
+    {
+        return detail(415, "Expected application/json");
+    }
+    let payload = match json_body(&body) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let Some(version) = payload.get("version").and_then(Value::as_str) else {
+        return detail(400, "Expected a confirmed release version");
+    };
+    if state.version.installation.read().disabled_reason.is_some() {
+        return detail(409, "This deployment must be updated externally");
+    }
+    state.version.refresh(&state.http).await;
+    match crate::updates::start_install(state, version) {
+        Ok(install) => json_response(202, json!(install)),
+        Err(error) => detail(409, error),
+    }
 }
 
 fn account_view(a: &pool::Account, deletable: bool, sessions: i64) -> Value {
@@ -352,6 +393,9 @@ pub async fn accounts(State(state): State<Shared>, headers: HeaderMap) -> Respon
     let st = state.clone();
     let views = tokio::task::spawn_blocking(move || {
         let entries = store::load_account_sources();
+        let snapshots = store::load_runtime_state()
+            .and_then(|runtime| runtime.get("accounts").and_then(Value::as_object).cloned())
+            .unwrap_or_default();
         let sessions = st.pool.session_counts();
         let mut views: Vec<Value> = st
             .pool
@@ -365,7 +409,19 @@ pub async fn accounts(State(state): State<Shared>, headers: HeaderMap) -> Respon
             if live.contains(&id) {
                 continue;
             }
-            views.push(json!({"id": account_label(&id), "initialized": false, "routingState": "disabled", "eligibleInSeconds": 0, "requests": 0, "failures": 0, "cooldownSeconds": 0, "deletable": true, "enabled": false, "sessions": 0, "usage": ds::cached_usage(&id)}));
+            let snapshot = snapshots.get(&id);
+            let stats = snapshot.and_then(|value| value.get("stats"));
+            views.push(json!({
+                "id": account_label(&id), "initialized": false, "routingState": "disabled",
+                "eligibleInSeconds": 0,
+                "requests": stats.and_then(|value| value.get("total_requests")).and_then(Value::as_i64).unwrap_or(0),
+                "successfulRequests": stats.and_then(|value| value.get("successful_requests")).and_then(Value::as_i64).unwrap_or(0),
+                "failedRequests": stats.and_then(|value| value.get("failed_requests")).and_then(Value::as_i64).unwrap_or(0),
+                "failures": snapshot.and_then(|value| value.get("failures")).and_then(Value::as_i64).unwrap_or(0),
+                "cooldownSeconds": 0, "deletable": true, "enabled": false,
+                "sessions": snapshot.and_then(|value| value.get("sessions")).and_then(Value::as_i64).unwrap_or(0),
+                "usage": ds::cached_usage(&id),
+            }));
         }
         views
     })
@@ -542,14 +598,13 @@ fn resolve_direct(
 }
 
 fn persist_sources(
-    state: &Shared,
     entries: Vec<Value>,
+    document: Value,
     extra: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<()>,
 ) -> rusqlite::Result<()> {
-    let doc = state.pool.state_document();
     store::with(move |c| {
         store::replace_account_sources(c, &entries, false)?;
-        if !store::save_runtime_state_in(c, &doc, false)? {
+        if !store::save_runtime_state_in(c, &document, false)? {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                 std::io::Error::other(
                     "runtime state write rejected: slot is not the active writer",
@@ -583,8 +638,9 @@ pub async fn delete_account(
         return detail(409, "Cannot remove the last account");
     }
     state.pool.remove_account(&id);
+    let document = state.pool.state_document_for_sources(&remaining);
     let id2 = id.clone();
-    let r = persist_sources(&state, remaining, move |c| {
+    let r = persist_sources(remaining, document, move |c| {
         c.execute("DELETE FROM account_usage WHERE account_id = ?1", [&id2])?;
         c.execute(
             "DELETE FROM rate_observations WHERE account_id = ?1",
@@ -640,15 +696,33 @@ pub async fn set_enabled(
     }
     let mut updated = entries.clone();
     updated[idx]["enabled"] = json!(enabled);
-    if !enabled {
+    let document = if enabled {
+        // Keep the paused snapshot through this transaction so load_state can
+        // restore its counters after the credential returns to the live pool.
+        state.pool.state_document()
+    } else {
+        let sessions = state.pool.session_counts().get(&id).copied().unwrap_or(0);
+        let mut document = state.pool.state_document();
+        if let Some(snapshot) = document
+            .get_mut("accounts")
+            .and_then(Value::as_object_mut)
+            .and_then(|accounts| accounts.get_mut(&id))
+        {
+            snapshot["sessions"] = json!(sessions);
+        }
+        if !store::save_runtime_state(&document) {
+            return detail(500, "Could not preserve the account state");
+        }
         state.pool.remove_account(&id);
-    }
-    if let Err(e) = persist_sources(&state, updated, |_| Ok(())) {
+        state.pool.state_document_for_sources(&updated)
+    };
+    if let Err(e) = persist_sources(updated, document, |_| Ok(())) {
         state.pool.reload_durable_state();
         return detail(500, format!("Could not change the account: {e}"));
     }
     if enabled {
         state.pool.load_credentials();
+        state.pool.load_state();
     }
     json_response(
         200,
