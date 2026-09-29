@@ -57,6 +57,10 @@ const enUS = {
   "accounts.login.expires": "Expires in {m}m {s}s",
   "accounts.login.reopen": "Reopen approval link",
   "accounts.login.continueWith": "Continue with {provider}",
+  "accounts.login.socialNote":
+    "Approving a different Google or GitHub user can sign out a Google or GitHub account added earlier. The other accounts are checked after each sign-in.",
+  "accounts.login.signedOut":
+    "Approving this login signed out {ids}: Kiro revoked its refresh token. Signing it in again may sign out this one.",
   "keys.noTraffic": "No traffic recorded for this key yet.",
   "keys.col.model": "Model",
   "keys.col.requests": "Requests",
@@ -189,6 +193,10 @@ const koKR: Messages = {
   "accounts.login.expires": "{m}분 {s}초 후 만료",
   "accounts.login.reopen": "승인 링크 다시 열기",
   "accounts.login.continueWith": "{provider}(으)로 계속",
+  "accounts.login.socialNote":
+    "다른 Google·GitHub 사용자로 승인하면 앞서 추가한 Google·GitHub 계정이 로그아웃될 수 있습니다. 로그인할 때마다 나머지 계정을 확인합니다.",
+  "accounts.login.signedOut":
+    "이 로그인을 승인하면서 {ids} 계정이 로그아웃되었습니다(Kiro가 갱신 토큰을 폐기함). 그 계정으로 다시 로그인하면 이 계정이 로그아웃될 수 있습니다.",
   "keys.noTraffic": "이 키에 기록된 트래픽이 아직 없습니다.",
   "keys.col.model": "모델",
   "keys.col.requests": "요청",
@@ -318,6 +326,8 @@ const zhCN: Messages = {
   "accounts.login.expires": "{m} 分 {s} 秒后过期",
   "accounts.login.reopen": "重新打开批准链接",
   "accounts.login.continueWith": "使用 {provider} 继续",
+  "accounts.login.socialNote": "批准其他 Google 或 GitHub 用户可能会注销之前添加的 Google 或 GitHub 账户。每次登录后都会检查其他账户。",
+  "accounts.login.signedOut": "批准此登录后，{ids} 已被注销（Kiro 撤销了其刷新令牌）。重新登录该账户可能会注销此账户。",
   "keys.noTraffic": "此密钥尚无流量记录。",
   "keys.col.model": "模型",
   "keys.col.requests": "请求",
@@ -446,6 +456,10 @@ const ptBR: Messages = {
   "accounts.login.expires": "Expira em {m}m {s}s",
   "accounts.login.reopen": "Reabrir link de aprovação",
   "accounts.login.continueWith": "Continuar com {provider}",
+  "accounts.login.socialNote":
+    "Aprovar outro usuário do Google ou GitHub pode desconectar uma conta Google ou GitHub adicionada antes. As outras contas são verificadas após cada login.",
+  "accounts.login.signedOut":
+    "Aprovar este login desconectou {ids}: o Kiro revogou o refresh token. Fazer login nela de novo pode desconectar esta.",
   "keys.noTraffic": "Nenhum tráfego registrado para esta chave ainda.",
   "keys.col.model": "Modelo",
   "keys.col.requests": "Requisições",

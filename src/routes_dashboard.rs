@@ -1066,6 +1066,7 @@ pub async fn register_device_login(
         Err(e) => return detail(400, e),
     };
     let entry = json!({"type": "internal", "id": format!("device-{}-{}", flow.provider.to_lowercase(), flow.id), "credential": credential});
+    let account_id = store::account_id_for_entry(&entry);
     let result = register(&state, entry, "").await;
     device_login::discard(&id);
     match result {
@@ -1074,6 +1075,15 @@ pub async fn register_device_login(
                 o.remove("type");
             }
             v["provider"] = json!(flow.provider);
+            let signed_out = if flow.provider == "BuilderId" {
+                Vec::new()
+            } else {
+                state.pool.probe_social_sessions(&account_id).await
+            };
+            v["signedOut"] = json!(signed_out
+                .iter()
+                .map(|id| account_label(id))
+                .collect::<Vec<_>>());
             json_response(200, v)
         }
         Err(r) => r,

@@ -143,7 +143,7 @@ export const dashboardApi = {
     }),
   pollDeviceLogin: (flowId: string) => request<DeviceLoginFlow>(`/api/dashboard/accounts/device-login/${flowId}`),
   registerDeviceLogin: (flowId: string) =>
-    request<{ accountId: string; initialized: boolean; provider: string }>(
+    request<{ accountId: string; initialized: boolean; provider: string; signedOut: string[] }>(
       `/api/dashboard/accounts/device-login/${flowId}/register`,
       { method: "POST" },
     ),

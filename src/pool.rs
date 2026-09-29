@@ -1308,6 +1308,49 @@ impl AccountManager {
         true
     }
 
+    /// Kiro's social auth host revokes the refresh token of a previously
+    /// approved Google/GitHub user when a different user is approved (#91).
+    /// Refreshing the other social accounts right after a social login flags a
+    /// revoked one now instead of on its next refresh, and returns the ids of
+    /// the accounts that login signed out.
+    pub async fn probe_social_sessions(&self, except: &str) -> Vec<String> {
+        self.probe_social_sessions_with(except, |auth| async move {
+            auth.force_refresh().await.map(drop)
+        })
+        .await
+    }
+
+    pub async fn probe_social_sessions_with<F, Fut>(&self, except: &str, refresh: F) -> Vec<String>
+    where
+        F: Fn(Arc<KiroAuth>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), AuthError>>,
+    {
+        let now = store::now_f64();
+        let probes = self
+            .accounts()
+            .into_iter()
+            .filter(|a| a.id != except && a.state.lock().auth_dead_until <= now)
+            .filter_map(|a| {
+                let auth = a
+                    .auth()
+                    .filter(|auth| auth.auth_type() == AuthType::KiroDesktop)?;
+                let probe = refresh(auth);
+                Some(async move {
+                    match probe.await {
+                        Err(AuthError::CredentialDead { status, .. }) => self
+                            .commit_credential_dead(&a, status)
+                            .then(|| a.id.clone()),
+                        _ => None,
+                    }
+                })
+            });
+        futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     pub fn set_quota(
         &self,
         id: &str,
