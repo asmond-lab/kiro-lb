@@ -1,6 +1,7 @@
 use kiro_lb::auth::{KiroAuth, Source};
 use kiro_lb::store;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const SHARED_SOCIAL_PROFILE: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
@@ -20,8 +21,8 @@ fn social(refresh: &str, legacy_marker: bool) -> serde_json::Value {
     c
 }
 
-#[test]
-fn social_logins_sharing_a_profile_arn_keep_separate_identities() {
+#[tokio::test]
+async fn social_logins_sharing_a_profile_arn_keep_separate_identities() {
     let dir =
         std::env::temp_dir().join(format!("kirolb-identity-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -35,11 +36,15 @@ fn social_logins_sharing_a_profile_arn_keep_separate_identities() {
     ];
     store::with(|c| store::replace_account_sources(c, &entries, true)).unwrap();
     store::with(|c| {
-        c.execute(
-            "UPDATE account_sources SET login_identity = ?1 WHERE account_id LIKE '%legacy%'",
-            [LEGACY],
-        )
-        .map(|_| ())
+        for entry in &entries[2..] {
+            let refresh = entry["credential"]["refreshToken"].as_str().unwrap();
+            let fingerprint = format!("source:{}", hex::encode(Sha256::digest(refresh)));
+            c.execute(
+                "UPDATE account_sources SET login_identity = ?1, source_fingerprint = ?2 WHERE account_id = ?3",
+                rusqlite::params![LEGACY, fingerprint, entry["id"].as_str().unwrap()],
+            )?;
+        }
+        Ok(())
     })
     .unwrap();
 
@@ -61,7 +66,6 @@ fn social_logins_sharing_a_profile_arn_keep_separate_identities() {
         .iter()
         .map(|id| KiroAuth::bind_source_login(&Source::Internal((*id).into())).unwrap())
         .collect();
-    let _ = std::fs::remove_dir_all(&dir);
 
     let unique: std::collections::HashSet<&String> = identities.iter().collect();
     assert_eq!(unique.len(), ids.len(), "{identities:?}");
@@ -76,4 +80,54 @@ fn social_logins_sharing_a_profile_arn_keep_separate_identities() {
         identities, again,
         "a lineage must be stable across restarts"
     );
+
+    let http = reqwest::Client::new();
+    for (index, id) in ids.iter().enumerate() {
+        let auth = KiroAuth::new(
+            Source::Internal((*id).into()),
+            "us-east-1",
+            None,
+            http.clone(),
+        )
+        .unwrap();
+        assert!(
+            auth.is_current_login(),
+            "migrated login must remain usable: {id}"
+        );
+        assert_eq!(
+            auth.access_token().await.unwrap(),
+            entries[index]["credential"]["accessToken"]
+                .as_str()
+                .unwrap()
+        );
+    }
+
+    for (index, id) in ids.iter().enumerate() {
+        let auth = KiroAuth::new(
+            Source::Internal((*id).into()),
+            "us-east-1",
+            None,
+            http.clone(),
+        )
+        .unwrap();
+        // Replacing a source with the same profile and legacy marker must not
+        // let the old auth instance serve or overwrite the replacement login.
+        store::save_internal_credential(id, &social(&format!("replacement-{index}"), true))
+            .unwrap();
+        assert!(!auth.is_current_login());
+        assert!(auth.access_token().await.is_err());
+        let replacement = KiroAuth::new(
+            Source::Internal((*id).into()),
+            "us-east-1",
+            None,
+            http.clone(),
+        )
+        .unwrap();
+        assert_ne!(replacement.login_identity(), auth.login_identity());
+        assert_eq!(
+            replacement.access_token().await.unwrap(),
+            format!("access-replacement-{index}")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
