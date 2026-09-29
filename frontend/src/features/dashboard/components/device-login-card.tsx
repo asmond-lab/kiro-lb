@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ComponentType } from "react";
-import { Check, Copy, ExternalLink, X } from "lucide-react";
+import { Check, Copy, ExternalLink, TriangleAlert, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { dashboardApi } from "../api";
 import { copyCodeAriaLabel, copyUserCode } from "../copy-user-code";
+import { registrationMessage } from "../device-login-result";
 import type { DeviceLoginFlow, DeviceLoginProvider } from "../types";
 import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
 import { translate, usePreferences } from "../preferences";
@@ -23,7 +24,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   const [flow, setFlow] = useState<DeviceLoginFlow>();
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [message, setMessage] = useState<{ tone: "ok" | "error"; text: string }>();
+  const [message, setMessage] = useState<{ tone: "ok" | "warn" | "error"; text: string }>();
   const registering = useRef(false);
   const copiedTimer = useRef<number | undefined>(undefined);
 
@@ -64,12 +65,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
       registering.current = true;
       try {
         const result = await dashboardApi.registerDeviceLogin(flowId);
-        setMessage({
-          tone: "ok",
-          text: result.initialized
-            ? translate(language, "accounts.login.added", { id: result.accountId })
-            : translate(language, "accounts.login.addedNotInit", { id: result.accountId }),
-        });
+        setMessage(registrationMessage(language, result));
         setFlow(undefined);
         await onRegistered();
       } catch (cause) {
@@ -168,30 +164,34 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
             </div>
           </div>
         ) : (
-          <div className="grid gap-2 sm:grid-cols-3">
-            {PROVIDERS.map(({ id, label, mark: Mark }) => (
-              <Button
-                key={id}
-                variant="outline"
-                disabled={busy}
-                onClick={() => void start(id)}
-                className="h-11 justify-center gap-2.5 font-medium"
-              >
-                <Mark />
-                {t("accounts.login.continueWith", { provider: label })}
-              </Button>
-            ))}
+          <div className="space-y-2">
+            <div className="grid gap-2 sm:grid-cols-3">
+              {PROVIDERS.map(({ id, label, mark: Mark }) => (
+                <Button
+                  key={id}
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void start(id)}
+                  className="h-11 justify-center gap-2.5 font-medium"
+                >
+                  <Mark />
+                  {t("accounts.login.continueWith", { provider: label })}
+                </Button>
+              ))}
+            </div>
+            <p className="text-xs text-muted-foreground">{t("accounts.login.socialNote")}</p>
           </div>
         )}
 
         {message ? (
           <p
-            role={message.tone === "error" ? "alert" : "status"}
+            role={message.tone === "ok" ? "status" : "alert"}
             className={`flex items-center gap-1.5 text-sm ${
-              message.tone === "error" ? "text-destructive" : "text-success"
+              message.tone === "error" ? "text-destructive" : message.tone === "warn" ? "text-warning" : "text-success"
             }`}
           >
             {message.tone === "ok" && <Check size={14} />}
+            {message.tone === "warn" && <TriangleAlert size={14} aria-hidden className="shrink-0" />}
             {message.text}
           </p>
         ) : null}
