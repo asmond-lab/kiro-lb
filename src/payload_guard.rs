@@ -50,6 +50,9 @@ pub fn measure(payload: &Value) -> (usize, usize) {
     (tokens + image_tokens, bytes)
 }
 
+/// Thinking signatures are opaque base64 attestations, not model context:
+/// contextUsagePercentage reported ~19% for a session whose signatures alone
+/// measured 794k cl100k tokens (#93). They are blanked like image data.
 fn without_image_data(v: &Value, image_tokens: &mut usize) -> Value {
     match v {
         Value::Object(o) => Value::Object(
@@ -59,6 +62,7 @@ fn without_image_data(v: &Value, image_tokens: &mut usize) -> Value {
                         ("images", Value::Array(items)) => Value::Array(
                             items.iter().map(|i| blank_image(i, image_tokens)).collect(),
                         ),
+                        ("signature", Value::String(_)) => Value::String(String::new()),
                         _ => without_image_data(x, image_tokens),
                     };
                     (k.clone(), x)

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/minpeter/kiro-lb/compare/v0.2.5...v0.2.6) - 2026-09-30
+
+### Fixed
+
+- stop counting thinking signatures as prompt tokens in the payload guard (#93)
+- keep mid-conversation system messages in place so the prompt prefix stays stable and Kiro's prompt cache is reused
+- keep idle upstream connections open for 30 minutes with HTTP/2 keepalive pings
+
 ## [0.2.5](https://github.com/minpeter/kiro-lb/compare/v0.2.4...v0.2.5) - 2026-09-29
 
 ### Fixed

@@ -268,13 +268,18 @@ pub fn anthropic_to_kiro(
     let mut conversation = Vec::with_capacity(messages.len());
     let mut inline_system = Vec::new();
     for m in messages {
-        if m.get("role").and_then(Value::as_str) == Some("system") {
-            let text = extract_system_prompt(m.get("content").unwrap_or(&Value::Null));
-            if !text.is_empty() {
-                inline_system.push(text);
-            }
-        } else {
+        if m.get("role").and_then(Value::as_str) != Some("system") {
             conversation.push(m.clone());
+            continue;
+        }
+        let text = extract_system_prompt(m.get("content").unwrap_or(&Value::Null));
+        if text.is_empty() {
+            continue;
+        }
+        if conversation.is_empty() {
+            inline_system.push(text);
+        } else {
+            conversation.push(crate::convert_core::in_place_system_message(&text));
         }
     }
     let unified = convert_messages(&conversation);

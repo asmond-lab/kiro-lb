@@ -219,13 +219,31 @@ fn proxy_attempt_order() -> Vec<String> {
     })
 }
 
+/// A person reads a reply for longer than 90s, so the old idle timeout closed
+/// the connection before almost every prompt and each one paid a fresh TLS
+/// handshake to Kiro (~340ms). Idle connections are kept for 30 minutes and
+/// an HTTP/2 PING every 20s stops Kiro from closing them first (it drops
+/// silent connections after 200–400s).
+pub const POOL_IDLE_SECONDS: u64 = 30 * 60;
+pub const HTTP2_PING_SECONDS: u64 = 20;
+pub const HTTP2_PING_TIMEOUT_SECONDS: u64 = 10;
+
 pub fn build_client(proxy: Option<&str>) -> reqwest::Client {
+    upstream_builder(proxy).build().expect("http client")
+}
+
+/// The upstream client settings, exposed so tests can build the same client
+/// against a local server.
+pub fn upstream_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
     let mut b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs_f64(
             config::get().streaming_read_timeout.max(1.0),
         ))
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECONDS))
+        .http2_keep_alive_interval(Duration::from_secs(HTTP2_PING_SECONDS))
+        .http2_keep_alive_timeout(Duration::from_secs(HTTP2_PING_TIMEOUT_SECONDS))
+        .http2_keep_alive_while_idle(true)
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(30))
@@ -246,7 +264,7 @@ pub fn build_client(proxy: Option<&str>) -> reqwest::Client {
             b = b.proxy(px);
         }
     }
-    b.build().expect("http client")
+    b
 }
 
 fn client_for_proxy(url: &str) -> reqwest::Client {

@@ -113,6 +113,18 @@ kiro-lb/
   1M fail, 2026-08-23). Image base64 is not part of it: the guard blanks
   `images[].source.bytes` and adds ceil(w*h/750) per image (capped at 1600),
   because upstream only enforces its own 5 MiB per-image cap (2026-09-27).
+  Thinking `signature` strings are blanked the same way: they are opaque
+  attestations, and one session's signatures measured 794k tokens while
+  contextUsage reported ~19% (#93).
+- Hoisting a mid-conversation `system`/`developer` message into the system
+  prompt. The system prompt is prepended to the first history turn, so a
+  message that changes every turn (Claude Code's `<total_tokens>`) changed the
+  prompt prefix and defeated Kiro's per-account prompt cache. Only leading
+  system messages become the system prompt; later ones stay in place as
+  `<system-reminder>` user text.
+- Closing idle upstream connections early. Each new TLS connection to Kiro
+  costs ~340ms and a reader idles longer than 90s between prompts; the pool
+  keeps connections 30 min with an HTTP/2 PING every 20s.
 - Trusting the advertised context window. `claude-opus-4.7`, `-4.8`, `-5`,
   `-5.5` and `claude-sonnet-5` report 1000000 but charge against 666667.
 - Rejecting unknown model names, or suggesting a model from another family.
