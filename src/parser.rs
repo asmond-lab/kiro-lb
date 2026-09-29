@@ -56,8 +56,8 @@ impl ParsedEvent {
     }
 }
 
-/// A validated Kiro `meteringEvent` payload. Metering values are snapshots for
-/// one upstream generation, not increments for every frame.
+/// A validated Kiro `meteringEvent` payload. Credit values contribute additively
+/// to usage totals, following the official Kiro CLI's aggregation policy.
 #[derive(Debug, Clone)]
 pub struct MeteringEvent {
     unit: String,

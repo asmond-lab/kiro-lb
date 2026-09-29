@@ -249,7 +249,9 @@ async fn search_followup_adds_its_physical_generation_credits() {
         let request = followup_request.clone();
         Box::pin(async move {
             let stream = Box::pin(futures_util::stream::iter(vec![
-                Ok(metering(0.02)),
+                Ok(metering(0.25)),
+                Ok(metering(0.0625)),
+                Ok(metering(0.0)),
                 Ok(KiroEvent::Content("answer".into())),
                 Ok(KiroEvent::StopReason("end_turn".into())),
             ]));
@@ -259,14 +261,16 @@ async fn search_followup_adds_its_physical_generation_credits() {
     let mut context = ctx(followup).await;
     context.request = request.clone();
     let first = Box::pin(futures_util::stream::iter(vec![
-        Ok(metering(0.03)),
+        Ok(metering(0.125)),
+        Ok(metering(0.03125)),
+        Ok(metering(0.0)),
         Ok(search_call()),
     ]));
     let first = stream_core::meter_generation(first, &request);
 
     stream_anthropic::collect(first, context).await.unwrap();
 
-    assert_eq!(request.usage.lock().credits, Some(0.05));
+    assert_eq!(request.usage.lock().credits, Some(0.46875));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -277,7 +281,9 @@ async fn streaming_search_drains_trailing_metering_before_the_followup() {
         let request = followup_request.clone();
         Box::pin(async move {
             let stream = Box::pin(futures_util::stream::iter(vec![
-                Ok(metering(0.02)),
+                Ok(metering(0.25)),
+                Ok(metering(0.0625)),
+                Ok(metering(0.0)),
                 Ok(KiroEvent::Content("answer".into())),
                 Ok(KiroEvent::StopReason("end_turn".into())),
             ]));
@@ -288,7 +294,9 @@ async fn streaming_search_drains_trailing_metering_before_the_followup() {
     context.request = request.clone();
     let first = Box::pin(futures_util::stream::iter(vec![
         Ok(search_call()),
-        Ok(metering(0.03)),
+        Ok(metering(0.125)),
+        Ok(metering(0.03125)),
+        Ok(metering(0.0)),
     ]));
     let first = stream_core::meter_generation(first, &request);
 
@@ -298,7 +306,7 @@ async fn streaming_search_drains_trailing_metering_before_the_followup() {
         .await;
 
     assert!(chunks.concat().contains("message_stop"));
-    assert_eq!(request.usage.lock().credits, Some(0.05));
+    assert_eq!(request.usage.lock().credits, Some(0.46875));
 }
 
 #[tokio::test(flavor = "multi_thread")]
