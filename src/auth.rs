@@ -84,16 +84,15 @@ fn fingerprint(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+/// A profile ARN names the Kiro profile a login routes through, not the user:
+/// social (GitHub/Google) logins all receive the same shared Kiro profile, so
+/// it cannot tell two users apart. The lineage is minted per credential source
+/// (see `bind_login_identity`) and marked in the stored credential.
 fn stable_login_identity(c: &Creds) -> Option<String> {
-    if let Some(identity) = c.bound_identity.as_deref() {
-        return Some(identity.to_owned());
-    }
-    let descriptor = c
-        .profile_arn
+    c.bound_identity
         .as_deref()
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| format!("profile:{}", v.trim()))?;
-    Some(format!("login:{}", fingerprint(&descriptor)))
+        .filter(|identity| !store::is_legacy_profile_identity(identity))
+        .map(str::to_owned)
 }
 
 fn source_fingerprint(c: &Creds) -> Option<String> {
@@ -686,21 +685,9 @@ impl KiroAuth {
         if bound.as_deref() != self.login_identity.as_deref() {
             return false;
         }
-        match &self.source {
-            Source::Internal(id) => {
-                let marker = store::load_internal_credential(id).and_then(|d| {
-                    d.get("_kiroLbLoginIdentity")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-                marker.as_deref() == self.login_identity.as_deref()
-                    || (marker.is_none()
-                        && source_fingerprint(&current) == *self.source_fingerprint.lock())
-            }
-            Source::File(_) | Source::Sqlite(_) => {
-                source_fingerprint(&current) == *self.source_fingerprint.lock()
-            }
-        }
+        // Missing and legacy markers both fall back to the source fingerprint
+        // until a successful refresh persists the new lineage marker.
+        source_fingerprint(&current) == *self.source_fingerprint.lock()
     }
 
     fn creds_match_login(&self, creds: &Creds) -> bool {

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/minpeter/kiro-lb/compare/v0.2.3...v0.2.4) - 2026-09-28
+
+### Fixed
+
+- keep each device-login account's credential separate: login identity no longer derives from the shared profile ARN (#86)
+- group banned accounts below paused accounts
+
+### Other
+
+- extract account grouping for direct tests
+
 ## [0.2.3](https://github.com/minpeter/kiro-lb/compare/v0.2.2...v0.2.3) - 2026-09-28
 
 ### Added

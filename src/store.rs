@@ -627,6 +627,14 @@ pub fn save_internal_credential(account_id: &str, document: &Value) -> rusqlite:
     })
 }
 
+/// `login:<sha256>` identities were derived from the profile ARN alone, which
+/// every social login shares, so they collided across users (issue #86).
+pub fn is_legacy_profile_identity(identity: &str) -> bool {
+    identity
+        .strip_prefix("login:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Bind a source location to one login lineage. When account-owned metadata is
 /// unavailable, the source fingerprint only detects replacement; the durable
 /// identity is random and does not rotate with tokens refreshed by the gateway.
@@ -663,6 +671,7 @@ pub fn bind_login_identity(
                     && fingerprint.as_deref() == source_fingerprint);
             return Ok(matches.then_some(identity).flatten());
         }
+        let identity = identity.filter(|id| !is_legacy_profile_identity(id));
         let selected = if let Some(stable) = stable_identity {
             stable.to_owned()
         } else if source_fingerprint.is_some() && fingerprint.as_deref() == source_fingerprint {
