@@ -130,3 +130,107 @@ fn thinking_signatures_are_not_measured_as_prompt_tokens() {
         Some(400_000)
     );
 }
+
+#[test]
+fn tool_arguments_named_signature_are_still_measured() {
+    let payload = json!({"conversationState": {"history": [
+        {"assistantResponseMessage": {"content": "", "toolUses": [{
+            "name": "document_function", "toolUseId": "call-a",
+            "input": {
+                "signature": "pub fn process(value: &str) -> Result<String, Error>;".repeat(64),
+                "reasoningContent": {"reasoningText": {"signature": "ordinary tool data"}}
+            }
+        }]}}
+    ]}});
+    assert_eq!(
+        payload_guard::measure(&payload),
+        payload_guard::measure_text(&payload_guard::compact_json(&payload))
+    );
+}
+
+#[test]
+fn reminders_do_not_orphan_tool_results_on_either_protocol() {
+    for position in 0..=2 {
+        let mut anthropic_messages = vec![
+            json!({"role": "user", "content": "inspect both files"}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call-a", "name": "read_file", "input": {"path": "a.rs"}},
+                {"type": "tool_use", "id": "call-b", "name": "read_file", "input": {"path": "b.rs"}}
+            ]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-a", "content": "first file"}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-b", "content": "second file"}]}),
+        ];
+        let mut openai_messages = vec![
+            json!({"role": "user", "content": "inspect both files"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "call-a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "call-b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call-a", "content": "first file"}),
+            json!({"role": "tool", "tool_call_id": "call-b", "content": "second file"}),
+        ];
+        anthropic_messages.insert(
+            2 + position,
+            json!({"role": "system", "content": "budget reminder"}),
+        );
+        openai_messages.insert(
+            2 + position,
+            json!({"role": "developer", "content": "budget reminder"}),
+        );
+        let anthropic = anthropic_to_kiro(
+            &json!({
+                "model": "claude-opus-5.5", "max_tokens": 64,
+                "tools": [{"name": "read_file", "input_schema": {"type": "object"}}],
+                "messages": anthropic_messages
+            }),
+            "c",
+            "",
+        )
+        .unwrap()
+        .payload;
+        let openai = openai_to_kiro(&json!({
+            "model": "claude-opus-5.5",
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+            "messages": openai_messages
+        }), "c", "").unwrap().payload;
+        for payload in [anthropic, openai] {
+            let current = &payload["conversationState"]["currentMessage"]["userInputMessage"];
+            assert_eq!(
+                current["userInputMessageContext"]["toolResults"],
+                json!([
+                    {"toolUseId": "call-a", "content": [{"text": "first file"}], "status": "success"},
+                    {"toolUseId": "call-b", "content": [{"text": "second file"}], "status": "success"}
+                ]),
+                "reminder position {position}: {payload}"
+            );
+            let text = current["content"].as_str().unwrap();
+            assert!(text.contains("<system-reminder>\nbudget reminder\n</system-reminder>"));
+            assert!(!text.contains("[Tool Result"));
+            assert!(!first_history_text(&payload).contains("budget reminder"));
+        }
+    }
+}
+
+#[test]
+fn reminders_do_not_make_unmatched_tool_results_valid() {
+    let payload = openai_to_kiro(&json!({
+        "model": "claude-opus-5.5",
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+        "messages": [
+            {"role": "user", "content": "inspect a file"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "call-a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+            ]},
+            {"role": "system", "content": "budget reminder"},
+            {"role": "tool", "tool_call_id": "unknown-call", "content": "orphan content"}
+        ]
+    }), "c", "").unwrap().payload;
+    let current = &payload["conversationState"]["currentMessage"]["userInputMessage"];
+    assert!(current["userInputMessageContext"]
+        .get("toolResults")
+        .is_none());
+    assert!(current["content"]
+        .as_str()
+        .unwrap()
+        .contains("[Tool Result (unknown-call)]\norphan content"));
+}

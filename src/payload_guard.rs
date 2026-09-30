@@ -45,14 +45,25 @@ pub fn measure_text(serialized: &str) -> (usize, usize) {
 /// measurement and each image adds its vision estimate instead.
 pub fn measure(payload: &Value) -> (usize, usize) {
     let mut image_tokens = 0;
-    let text = without_image_data(payload, &mut image_tokens);
+    let mut text = without_image_data(payload, &mut image_tokens);
+    // Thinking signatures are opaque attestations, not model context. Only
+    // blank the protocol field; tool arguments named `signature` still count.
+    if let Some(history) = text
+        .pointer_mut("/conversationState/history")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in history {
+            if let Some(signature @ Value::String(_)) = entry
+                .pointer_mut("/assistantResponseMessage/reasoningContent/reasoningText/signature")
+            {
+                *signature = Value::String(String::new());
+            }
+        }
+    }
     let (tokens, bytes) = measure_text(&compact_json(&text));
     (tokens + image_tokens, bytes)
 }
 
-/// Thinking signatures are opaque base64 attestations, not model context:
-/// contextUsagePercentage reported ~19% for a session whose signatures alone
-/// measured 794k cl100k tokens (#93). They are blanked like image data.
 fn without_image_data(v: &Value, image_tokens: &mut usize) -> Value {
     match v {
         Value::Object(o) => Value::Object(
@@ -62,7 +73,6 @@ fn without_image_data(v: &Value, image_tokens: &mut usize) -> Value {
                         ("images", Value::Array(items)) => Value::Array(
                             items.iter().map(|i| blank_image(i, image_tokens)).collect(),
                         ),
-                        ("signature", Value::String(_)) => Value::String(String::new()),
                         _ => without_image_data(x, image_tokens),
                     };
                     (k.clone(), x)

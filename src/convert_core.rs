@@ -715,11 +715,16 @@ pub fn build_kiro_payload(
     };
 
     let prepared = if has_tools {
-        ensure_assistant_before_tool_results(messages)
+        messages
     } else {
         strip_all_tool_content(messages)
     };
     let mut merged = merge_adjacent_messages(prepared);
+    if has_tools {
+        // Reminders and tool results are parts of the same user turn. Merge
+        // them before checking their preceding assistant's tool-call IDs.
+        merged = ensure_assistant_before_tool_results(merged);
+    }
     if merged.first().is_some_and(|m| m.role != "user") {
         merged.insert(0, UnifiedMessage::text("user", ""));
     }
