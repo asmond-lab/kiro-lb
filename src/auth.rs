@@ -674,6 +674,10 @@ impl KiroAuth {
         self.login_identity.as_deref()
     }
 
+    pub fn machine_id(&self) -> String {
+        crate::utils::account_machine_id(&self.lease_account_id().unwrap_or_default())
+    }
+
     pub fn is_current_login(&self) -> bool {
         let Some(current) = Self::read_source(&self.source) else {
             return false;
@@ -987,7 +991,7 @@ impl KiroAuth {
             .clone()
             .ok_or_else(|| AuthError::Other("Refresh token is not set".into()))?;
         tracing::info!("Refreshing Kiro token via Kiro Desktop Auth...");
-        let ua = format!("KiroIDE-0.7.45-{}", crate::utils::machine_fingerprint());
+        let ua = crate::utils::refresh_user_agent(&self.machine_id());
         let response = self
             .post(
                 &self.refresh_url,

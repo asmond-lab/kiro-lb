@@ -158,9 +158,6 @@ pub fn sanitize_json_schema(schema: Option<&Value>) -> Value {
         if k == "required" && v.as_array().is_some_and(Vec::is_empty) {
             continue;
         }
-        if k == "additionalProperties" {
-            continue;
-        }
         let value = if k == "properties" && v.is_object() {
             Value::Object(
                 v.as_object()
@@ -803,7 +800,12 @@ pub fn build_kiro_payload(
     let mut payload = Map::new();
     let task_type = settings::agent_mode();
     if !task_type.is_empty() {
-        state.insert("agentTaskType".into(), json!(task_type));
+        let state_type = if task_type == "spec" {
+            "vibe"
+        } else {
+            task_type.as_str()
+        };
+        state.insert("agentTaskType".into(), json!(state_type));
     }
     state.insert(
         "agentContinuationId".into(),

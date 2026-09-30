@@ -28,7 +28,7 @@ impl KiroEndpoint {
             .replace("{region}", crate::config::validate_region(region)?))
     }
 
-    pub fn header_overrides(&self) -> Vec<(&'static str, String)> {
+    pub fn header_overrides(&self, machine_id: &str) -> Vec<(&'static str, String)> {
         let mut out = vec![("Content-Type", self.content_type.to_owned())];
         if let Some(t) = self.amz_target {
             out.push(("x-amz-target", t.to_owned()));
@@ -37,8 +37,8 @@ impl KiroEndpoint {
             out.push(("x-amzn-kiro-client-attribution", a.to_owned()));
         }
         if let Some(label) = self.api_label {
-            out.push(("User-Agent", ide_user_agent(label)));
-            out.push(("x-amz-user-agent", ide_short_user_agent()));
+            out.push(("User-Agent", ide_user_agent(label, machine_id)));
+            out.push(("x-amz-user-agent", ide_short_user_agent(label, machine_id)));
         }
         out
     }
@@ -51,7 +51,7 @@ pub static ENDPOINTS: [KiroEndpoint; 3] = [
         url_template: "https://runtime.{region}.kiro.dev/",
         amz_target: Some(RUNTIME_GENERATE_TARGET),
         content_type: "application/x-amz-json-1.0",
-        api_label: Some("kiroruntime"),
+        api_label: Some(crate::utils::RUNTIME_API),
         client_attribution: Some("kiro-ide"),
     },
     KiroEndpoint {

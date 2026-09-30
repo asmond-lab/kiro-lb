@@ -473,7 +473,7 @@ impl Transport {
                 .await
                 .map_err(|e| Err(TransportError::Auth(e)))?;
             let mut req = client.request(method.clone(), url);
-            let mut headers = utils::kiro_headers(&token);
+            let mut headers = utils::kiro_headers(&token, &auth.machine_id());
             for (k, v) in overrides {
                 if let Some(h) = headers
                     .iter_mut()
@@ -739,7 +739,7 @@ impl Transport {
                         &[],
                         stream,
                         retry_rate_limits,
-                        &ep.header_overrides(),
+                        &ep.header_overrides(&auth.machine_id()),
                     )
                     .await
                 {
