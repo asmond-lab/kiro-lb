@@ -52,18 +52,25 @@ fn assistant_tool_calls(msg: &Value) -> Vec<Value> {
 
 pub fn convert_messages(messages: &[Value]) -> (String, Vec<UnifiedMessage>) {
     let mut system = String::new();
-    let mut rest = Vec::new();
+    let mut ordered: Vec<Value> = Vec::new();
     for m in messages {
         match str_field(m, "role") {
-            Some("system") | Some("developer") => {
+            Some("system") | Some("developer") if ordered.is_empty() => {
                 system.push_str(&extract_text_content(
                     m.get("content").unwrap_or(&Value::Null),
                 ));
                 system.push('\n');
             }
-            _ => rest.push(m),
+            Some("system") | Some("developer") => {
+                let text = extract_text_content(m.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    ordered.push(crate::convert_core::in_place_system_message(&text));
+                }
+            }
+            _ => ordered.push(m.clone()),
         }
     }
+    let rest: Vec<&Value> = ordered.iter().collect();
     let system = system.trim().to_owned();
     let mut processed = Vec::new();
     let mut pending_results: Vec<Value> = Vec::new();

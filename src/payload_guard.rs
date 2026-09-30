@@ -45,7 +45,21 @@ pub fn measure_text(serialized: &str) -> (usize, usize) {
 /// measurement and each image adds its vision estimate instead.
 pub fn measure(payload: &Value) -> (usize, usize) {
     let mut image_tokens = 0;
-    let text = without_image_data(payload, &mut image_tokens);
+    let mut text = without_image_data(payload, &mut image_tokens);
+    // Thinking signatures are opaque attestations, not model context. Only
+    // blank the protocol field; tool arguments named `signature` still count.
+    if let Some(history) = text
+        .pointer_mut("/conversationState/history")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in history {
+            if let Some(signature @ Value::String(_)) = entry
+                .pointer_mut("/assistantResponseMessage/reasoningContent/reasoningText/signature")
+            {
+                *signature = Value::String(String::new());
+            }
+        }
+    }
     let (tokens, bytes) = measure_text(&compact_json(&text));
     (tokens + image_tokens, bytes)
 }

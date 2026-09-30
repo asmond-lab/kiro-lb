@@ -569,6 +569,15 @@ fn images_of(msg: &UnifiedMessage) -> Vec<Value> {
     }
 }
 
+/// A system message that arrives after the conversation has started (Claude
+/// Code sends `<total_tokens>` and reminders after tool rounds) stays where the
+/// client put it, as user text. Hoisting it into the system prompt, which is
+/// prepended to the first history turn, changed the prompt prefix on every
+/// turn and defeated Kiro's per-account prompt cache.
+pub fn in_place_system_message(text: &str) -> Value {
+    json!({"role": "user", "content": format!("<system-reminder>\n{text}\n</system-reminder>")})
+}
+
 fn merge_adjacent_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
     let mut merged: Vec<UnifiedMessage> = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -706,11 +715,16 @@ pub fn build_kiro_payload(
     };
 
     let prepared = if has_tools {
-        ensure_assistant_before_tool_results(messages)
+        messages
     } else {
         strip_all_tool_content(messages)
     };
     let mut merged = merge_adjacent_messages(prepared);
+    if has_tools {
+        // Reminders and tool results are parts of the same user turn. Merge
+        // them before checking their preceding assistant's tool-call IDs.
+        merged = ensure_assistant_before_tool_results(merged);
+    }
     if merged.first().is_some_and(|m| m.role != "user") {
         merged.insert(0, UnifiedMessage::text("user", ""));
     }
