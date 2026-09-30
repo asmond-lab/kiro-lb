@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/minpeter/kiro-lb/compare/v0.2.6...v0.2.7) - 2026-09-30
+
+### Fixed
+
+- give every account its own stable machine id instead of one id shared by all accounts
+- present the current Kiro IDE client (1.1.70) in every user agent, without the CLI marker
+- send management calls (model list, usage limits) with the same shape and headers as the Kiro IDE
+- send Claude reasoning effort without the extra thinking block, as the Kiro IDE does
+- keep `agentTaskType: vibe` in spec mode, as the Kiro IDE does
+- keep `additionalProperties` in tool schemas
+
 ## [0.2.6](https://github.com/minpeter/kiro-lb/compare/v0.2.5...v0.2.6) - 2026-09-30
 
 ### Fixed

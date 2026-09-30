@@ -120,6 +120,6 @@ pub fn apply_native_thinking(payload: &mut Value, model_id: &str, effort: Option
         let Some(e) = normalize_effort(effort) else {
             return;
         };
-        payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
+        payload["additionalModelRequestFields"] = json!({"output_config": {"effort": e}});
     }
 }

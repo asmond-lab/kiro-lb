@@ -129,6 +129,9 @@ kiro-lb/
   `-5.5` and `claude-sonnet-5` report 1000000 but charge against 666667.
 - Rejecting unknown model names, or suggesting a model from another family.
 - Labelling a Prometheus series with a raw model name.
+- Sharing one machine id across accounts, or mixing CLI markers into the IDE
+  user agent. Headers mirror a captured Kiro IDE (`src/utils.rs`), and each
+  account's machine id derives from its login lineage (`KiroAuth::machine_id`).
 - Sending Builder ID generation to `q.{region}.amazonaws.com`. Keep the
   request-scoped fallback profile out of persisted credentials.
 - Weighting selection by absolute remaining quota, or letting a weight exclude

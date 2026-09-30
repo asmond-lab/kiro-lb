@@ -1,12 +1,12 @@
 //! Account model catalogue and quota usage, both served by the management host
-//! as AWS JSON calls, the same way the official Kiro CLI reads them.
+//! with the same calls and headers the Kiro IDE uses.
 
 use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::auth::{region_from_arn, KiroAuth};
 use crate::config;
-use crate::utils::{ide_user_agent, kiro_headers};
+use crate::utils::{management_headers, CODEWHISPERER_API, CONTROL_PLANE_API};
 
 fn region(auth: &KiroAuth) -> Result<String, String> {
     let arn = auth.profile_arn().unwrap_or_default();
@@ -21,43 +21,48 @@ fn region(auth: &KiroAuth) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+enum ManagementCall<'a> {
+    Json {
+        target: &'a str,
+    },
+    Get {
+        path: &'a str,
+        query: &'a [(&'a str, &'a str)],
+    },
+}
+
 async fn management_call(
     auth: &KiroAuth,
     http: &reqwest::Client,
-    target: &str,
+    call: ManagementCall<'_>,
     label: &str,
-    mut body: Value,
-    extra: &[(&str, &str)],
 ) -> Result<Value, String> {
     let region = region(auth)?;
     let token = auth.access_token().await.map_err(|e| e.to_string())?;
     let arn = auth.request_profile_arn().or_else(|| auth.profile_arn());
-    let mut params: Vec<(String, String)> = vec![("origin".into(), "AI_EDITOR".into())];
-    for (k, v) in extra {
-        params.push(((*k).into(), (*v).into()));
-    }
-    if let Some(a) = &arn {
-        params.push(("profileArn".into(), a.clone()));
-        body["profileArn"] = json!(a);
-    }
-    let mut req = http
-        .post(format!("https://management.{region}.kiro.dev/"))
-        .timeout(Duration::from_secs(20))
-        .query(&params)
-        .json(&body);
-    for (k, v) in kiro_headers(&token) {
-        let v = match k {
-            "x-amz-target" => target.to_owned(),
-            "User-Agent" => ide_user_agent(label),
-            _ => v,
-        };
+    let base = format!("https://management.{region}.kiro.dev/");
+    let (mut req, target) = match call {
+        ManagementCall::Json { target } => {
+            let mut body = json!({"origin": "AI_EDITOR"});
+            if let Some(a) = &arn {
+                body["profileArn"] = json!(a);
+            }
+            (http.post(base).json(&body), Some(target))
+        }
+        ManagementCall::Get { path, query } => {
+            let mut params: Vec<(&str, String)> = vec![("origin", "AI_EDITOR".into())];
+            if let Some(a) = &arn {
+                params.push(("profileArn", a.clone()));
+            }
+            params.extend(query.iter().map(|(k, v)| (*k, (*v).to_owned())));
+            (http.get(format!("{base}{path}")).query(&params), None)
+        }
+    };
+    req = req.timeout(Duration::from_secs(20));
+    for (k, v) in management_headers(&token, target, label, &auth.machine_id()) {
         req = req.header(k, v);
     }
-    let resp = req
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("management host answered {}", status.as_u16()));
@@ -69,10 +74,10 @@ pub async fn fetch_available_models(auth: &KiroAuth, http: &reqwest::Client) -> 
     match management_call(
         auth,
         http,
-        "KiroControlPlaneBearerService.ListAvailableModels",
-        "kirocontrolplanebearer",
-        json!({"origin": "AI_EDITOR"}),
-        &[],
+        ManagementCall::Json {
+            target: "KiroControlPlaneBearerService.ListAvailableModels",
+        },
+        CONTROL_PLANE_API,
     )
     .await
     {
@@ -111,10 +116,14 @@ pub async fn fetch_account_usage(
     let payload = management_call(
         auth,
         http,
-        "AmazonCodeWhispererService.GetUsageLimits",
-        "codewhispererruntime",
-        json!({"origin": "AI_EDITOR", "isEmailRequired": true}),
-        &[("isEmailRequired", "true")],
+        ManagementCall::Get {
+            path: "getUsageLimits",
+            query: &[
+                ("resourceType", "AGENTIC_REQUEST"),
+                ("isEmailRequired", "true"),
+            ],
+        },
+        CODEWHISPERER_API,
     )
     .await?;
     let breakdowns = payload
@@ -183,9 +192,14 @@ mod tests {
         .unwrap();
         auth.api_region = "us-east-1/path".into();
 
-        let error = management_call(&auth, &http, "unused", "unused", json!({}), &[])
-            .await
-            .unwrap_err();
+        let error = management_call(
+            &auth,
+            &http,
+            ManagementCall::Json { target: "unused" },
+            "unused",
+        )
+        .await
+        .unwrap_err();
 
         assert!(error.starts_with("invalid region:"));
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);

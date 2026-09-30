@@ -50,8 +50,9 @@ async fn once(
         .post(url)
         .timeout(Duration::from_secs(45))
         .json(&body);
-    let mut headers = kiro_headers(&token);
-    for (k, v) in ep.header_overrides() {
+    let machine_id = auth.machine_id();
+    let mut headers = kiro_headers(&token, &machine_id);
+    for (k, v) in ep.header_overrides(&machine_id) {
         headers.retain(|(h, _)| !h.eq_ignore_ascii_case(k));
         headers.push((k, v));
     }

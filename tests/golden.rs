@@ -48,12 +48,24 @@ fn normalize_model_name() {
     report("normalize_model_name", cases.len(), &failures, 1.0);
 }
 
+fn drop_additional_properties(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            o.remove("additionalProperties");
+            o.values_mut().for_each(drop_additional_properties);
+        }
+        Value::Array(a) => a.iter_mut().for_each(drop_additional_properties),
+        _ => {}
+    }
+}
+
 #[test]
 fn sanitize_json_schema() {
     let cases = corpus("sanitize_json_schema");
     let mut failures = vec![];
     for c in &cases {
-        let got = kiro_lb::convert_core::sanitize_json_schema(Some(&c["schema"]));
+        let mut got = kiro_lb::convert_core::sanitize_json_schema(Some(&c["schema"]));
+        drop_additional_properties(&mut got);
         if got != c["output"] {
             failures.push(format!("{} -> {} vs {}", c["schema"], c["output"], got));
         }
@@ -137,6 +149,19 @@ fn strip_volatile(v: &mut Value) {
     }
 }
 
+fn drop_adaptive_thinking(v: &mut Value) {
+    if let Some(fields) = v
+        .pointer_mut("/additionalModelRequestFields")
+        .and_then(Value::as_object_mut)
+    {
+        if fields.get("thinking")
+            == Some(&serde_json::json!({"type": "adaptive", "display": "summarized"}))
+        {
+            fields.remove("thinking");
+        }
+    }
+}
+
 #[test]
 fn anthropic_to_kiro() {
     let cases = corpus("anthropic_to_kiro");
@@ -154,6 +179,8 @@ fn anthropic_to_kiro() {
                 let (mut got, mut want) = (r.payload, want.clone());
                 strip_volatile(&mut got);
                 strip_volatile(&mut want);
+                drop_additional_properties(&mut got);
+                drop_adaptive_thinking(&mut want);
                 if got != want {
                     failures.push(format!(
                         "{}\n      want {}\n      got  {}",
@@ -180,6 +207,8 @@ fn openai_to_kiro() {
                 let (mut got, mut want) = (r.payload, want.clone());
                 strip_volatile(&mut got);
                 strip_volatile(&mut want);
+                drop_additional_properties(&mut got);
+                drop_adaptive_thinking(&mut want);
                 if got != want {
                     failures.push(format!(
                         "{}\n      want {}\n      got  {}",

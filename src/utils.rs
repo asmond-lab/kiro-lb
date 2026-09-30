@@ -1,37 +1,47 @@
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
 
-pub const IDE_BUILD: &str =
-    "KiroIDE-1.0.437-ea11196bc54380ef285f87b7040026830a864d2a50bb872ea19a5bbbe732b407-KAS/0.54.0";
-pub const IDE_EXEC_ENV: &str = "exec-env/AmazonQ-For-CLI-Version/2.21.1-acp-client/kiro-tui";
+pub const IDE_VERSION: &str = "1.1.70";
+pub const KAS_VERSION: &str = "0.66.7";
+const IDE_PLATFORM: &str = "ua/2.1 os/win32#10.0.26200 lang/js md/nodejs#24.18.0";
+pub const RUNTIME_API: &str = "kiroruntime";
+pub const CONTROL_PLANE_API: &str = "kirocontrolplanebearer";
+pub const CODEWHISPERER_API: &str = "codewhispererruntime";
 
-pub fn ide_short_user_agent() -> String {
-    format!("aws-sdk-js/1.0.0 {IDE_BUILD}")
+pub fn account_machine_id(account_key: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("kiro-lb-machine-id\0{account_key}").as_bytes(),
+    ))
 }
 
-pub fn ide_user_agent(api_label: &str) -> String {
+fn ide_build(api_label: &str, machine_id: &str) -> String {
+    if api_label == CODEWHISPERER_API {
+        format!("KiroIDE-{IDE_VERSION}-{machine_id}")
+    } else {
+        format!("KiroIDE-{IDE_VERSION}-{machine_id}-KAS/{KAS_VERSION}")
+    }
+}
+
+pub fn ide_short_user_agent(api_label: &str, machine_id: &str) -> String {
+    format!("aws-sdk-js/1.0.0 {}", ide_build(api_label, machine_id))
+}
+
+pub fn ide_user_agent(api_label: &str, machine_id: &str) -> String {
+    let features = if api_label == RUNTIME_API {
+        "m/N"
+    } else {
+        "m/N,E"
+    };
     format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.26200 lang/js md/nodejs#22.22.0 api/{api_label}#1.0.0 {IDE_EXEC_ENV} m/N {IDE_BUILD}"
+        "aws-sdk-js/1.0.0 {IDE_PLATFORM} api/{api_label}#1.0.0 {features} {}",
+        ide_build(api_label, machine_id)
     )
 }
 
-pub fn machine_fingerprint() -> &'static str {
-    static F: OnceLock<String> = OnceLock::new();
-    F.get_or_init(|| {
-        let host = hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_default();
-        if host.is_empty() && user.is_empty() {
-            return hex::encode(Sha256::digest(b"default-kiro-lb"));
-        }
-        hex::encode(Sha256::digest(format!("{host}-{user}-kiro-lb").as_bytes()))
-    })
+pub fn refresh_user_agent(machine_id: &str) -> String {
+    format!("KiroIDE-{IDE_VERSION}-{machine_id}")
 }
 
-pub fn kiro_headers(token: &str) -> Vec<(&'static str, String)> {
+pub fn kiro_headers(token: &str, machine_id: &str) -> Vec<(&'static str, String)> {
     vec![
         ("Authorization", format!("Bearer {token}")),
         ("Content-Type", "application/x-amz-json-1.0".into()),
@@ -40,13 +50,37 @@ pub fn kiro_headers(token: &str) -> Vec<(&'static str, String)> {
             "KiroRuntimeService.GenerateAssistantResponse".into(),
         ),
         ("x-amzn-kiro-client-attribution", "kiro-ide".into()),
-        ("User-Agent", ide_user_agent("kiroruntime")),
-        ("x-amz-user-agent", ide_short_user_agent()),
+        ("User-Agent", ide_user_agent(RUNTIME_API, machine_id)),
+        (
+            "x-amz-user-agent",
+            ide_short_user_agent(RUNTIME_API, machine_id),
+        ),
         ("x-amzn-codewhisperer-optout", "true".into()),
         ("x-kiro-attempt", "1;max=3".into()),
         ("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string()),
         ("amz-sdk-request", "attempt=1; max=3".into()),
     ]
+}
+
+pub fn management_headers(
+    token: &str,
+    target: Option<&str>,
+    api_label: &str,
+    machine_id: &str,
+) -> Vec<(&'static str, String)> {
+    let mut out = vec![("Authorization", format!("Bearer {token}"))];
+    if let Some(t) = target {
+        out.push(("Content-Type", "application/x-amz-json-1.0".into()));
+        out.push(("x-amz-target", t.to_owned()));
+    }
+    out.push(("User-Agent", ide_user_agent(api_label, machine_id)));
+    out.push((
+        "x-amz-user-agent",
+        ide_short_user_agent(api_label, machine_id),
+    ));
+    out.push(("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string()));
+    out.push(("amz-sdk-request", "attempt=1; max=3".into()));
+    out
 }
 
 pub fn completion_id() -> String {
