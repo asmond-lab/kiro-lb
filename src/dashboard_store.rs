@@ -25,17 +25,19 @@ pub struct RequestRecord {
     pub credits: Option<f64>,
     pub generation_ms: Option<i64>,
     pub ttft_ms: Option<i64>,
+    pub effort: Option<String>,
+    pub upstream_cut: Option<String>,
 }
 
 pub fn record_request(r: RequestRecord) {
     let _ = store::with(|c| {
         c.execute(
-            "INSERT INTO request_logs(created_at, route, model, status_code, latency_ms, client_ip, user_agent, credits, input_tokens, output_tokens, generation_ms, ttft_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO request_logs(created_at, route, model, status_code, latency_ms, client_ip, user_agent, credits, input_tokens, output_tokens, generation_ms, ttft_ms, effort, upstream_cut)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 store::now_i64(), r.route, r.model, r.status, r.latency_ms, r.client_ip,
                 r.user_agent.filter(|u| !u.is_empty()).map(|u| u.chars().take(200).collect::<String>()),
-                r.credits, r.input_tokens, r.output_tokens, r.generation_ms, r.ttft_ms
+                r.credits, r.input_tokens, r.output_tokens, r.generation_ms, r.ttft_ms, r.effort, r.upstream_cut
             ],
         )
     });
@@ -461,4 +463,27 @@ pub fn normalized_model_filter(model: &str) -> Vec<String> {
         v.push(n);
     }
     v
+}
+
+pub fn spellings_of(model: &str, known: &[String]) -> Vec<String> {
+    let target = crate::model_resolver::get_model_id_for_kiro(model);
+    let mut v = normalized_model_filter(model);
+    for k in known {
+        if crate::model_resolver::get_model_id_for_kiro(k) == target && !v.contains(k) {
+            v.push(k.clone());
+        }
+    }
+    v
+}
+
+pub fn grouped_models(known: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = known
+        .iter()
+        .map(|m| {
+            crate::model_resolver::public_model_id(&crate::model_resolver::get_model_id_for_kiro(m))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }

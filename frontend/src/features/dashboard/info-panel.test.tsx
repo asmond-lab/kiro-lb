@@ -17,7 +17,6 @@ function render(version?: Overview["version"], isCheckingUpdates = false, update
         models: 0,
       }}
       accounts={[]}
-      isLive
       isCheckingUpdates={isCheckingUpdates}
       onCheckUpdates={() => {}}
       isInstallingUpdate={false}

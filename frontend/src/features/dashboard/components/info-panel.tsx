@@ -14,7 +14,6 @@ export type InfoPanelProps = {
   accounts: Account[];
   routableAccounts?: number;
   lastUpdatedAt?: number;
-  isLive: boolean;
   isCheckingUpdates: boolean;
   onCheckUpdates: () => void;
   isInstallingUpdate: boolean;
@@ -40,7 +39,7 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-export function InfoPanel({ overview, accounts, routableAccounts, lastUpdatedAt, isLive, isCheckingUpdates, onCheckUpdates, isInstallingUpdate, onInstallUpdate }: InfoPanelProps) {
+export function InfoPanel({ overview, accounts, routableAccounts, lastUpdatedAt, isCheckingUpdates, onCheckUpdates, isInstallingUpdate, onInstallUpdate }: InfoPanelProps) {
   const { t } = usePreferences();
   const [confirmVersion, setConfirmVersion] = useState<string | null>(null);
   const enabled = accounts.filter((account) => account.enabled !== false);
@@ -140,7 +139,6 @@ export function InfoPanel({ overview, accounts, routableAccounts, lastUpdatedAt,
                 label={t("info.averageLatency")}
                 value={overview ? `${Math.round(overview.averageLatencyMs)} ms` : "—"}
               />
-              <Row label={t("info.liveUpdates")} value={isLive ? t("info.on") : t("info.paused")} />
               <Row label={t("info.lastUpdate")} value={formatTimestamp(lastUpdatedAt ? lastUpdatedAt / 1000 : undefined)} />
             </TableBody>
           </Table>

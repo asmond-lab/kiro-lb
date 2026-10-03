@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use crate::model_resolver::normalize_model_name;
+use crate::model_resolver::get_model_id_for_kiro;
 
 pub const BASELINE_MODEL: &str = "auto";
 const GPT_LONG: u64 = 272_000;
@@ -32,7 +32,7 @@ const fn two(multiplier: f64, long: f64) -> ModelCost {
     }
 }
 
-pub static MODEL_COSTS: [(&str, ModelCost); 20] = [
+pub static MODEL_COSTS: [(&str, ModelCost); 21] = [
     ("gpt-5.6-sol", two(4.4, 8.8)),
     ("gpt-5.6-terra", two(2.2, 4.4)),
     ("gpt-5.6-luna", two(1.1, 2.2)),
@@ -42,6 +42,7 @@ pub static MODEL_COSTS: [(&str, ModelCost); 20] = [
     ("claude-opus-4.7", c(2.2, 1_000_000)),
     ("claude-opus-4.6", c(2.2, 1_000_000)),
     ("claude-opus-4.5", c(2.2, 200_000)),
+    ("claude-sonnet-5.5", c(1.3, 1_000_000)),
     ("claude-sonnet-5", c(1.3, 1_000_000)),
     ("claude-sonnet-4.6", c(1.3, 1_000_000)),
     ("claude-sonnet-4.5", c(1.3, 200_000)),
@@ -61,7 +62,7 @@ pub fn cost_for(model: Option<&str>) -> Option<&'static ModelCost> {
         return None;
     }
     let find = |k: &str| MODEL_COSTS.iter().find(|(n, _)| *n == k).map(|(_, c)| c);
-    find(&m).or_else(|| find(&normalize_model_name(model?).trim().to_lowercase()))
+    find(&m).or_else(|| find(&get_model_id_for_kiro(model?).trim().to_lowercase()))
 }
 
 pub fn multiplier_for(model: Option<&str>, input_tokens: Option<i64>) -> Option<f64> {

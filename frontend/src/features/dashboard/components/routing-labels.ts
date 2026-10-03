@@ -1,5 +1,5 @@
 import { translate } from "../preferences";
-import type { ToolShortenStats } from "../types";
+import type { EndpointLatency, ToolShortenStats } from "../types";
 
 type Translator = (key: string, vars?: Record<string, string | number>) => string;
 
@@ -13,6 +13,23 @@ export function loadBalancingLabel(option: string, t: Translator = english): str
 
 export function loadBalancingHelp(option: string | undefined, t: Translator = english): string {
   return option && OPTIONS.has(option) ? t(`settings.lbHelp.${option}`) : "";
+}
+
+export function describeLatency(
+  latency: EndpointLatency | null | undefined,
+  region: string | undefined,
+  t: Translator = english,
+): string {
+  const entries = Object.entries(latency?.medians ?? {}).sort((a, b) => a[1] - b[1]);
+  if (!latency || entries.length === 0) {
+    return t("settings.latencyNone", { region: region ?? "" });
+  }
+  return t("settings.latencySummary", {
+    region: region ?? "",
+    leader: latency.leader ?? "—",
+    model: latency.model ?? "—",
+    medians: entries.map(([key, ms]) => `${key} ${Math.round(ms)} ms`).join(", "),
+  });
 }
 
 export function describeShortenStats(

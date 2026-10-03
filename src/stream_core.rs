@@ -60,7 +60,80 @@ pub const BAD_ORDER: &str = "Invalid assistant content event order";
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<KiroEvent, StreamError>> + Send>>;
 
-fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
+#[derive(Default)]
+struct CutTracker {
+    produced: bool,
+    tools: bool,
+    cut: bool,
+    pending_tool: Option<String>,
+    discard_pending: bool,
+    request: Option<RequestCtx>,
+}
+
+impl CutTracker {
+    fn tool(&mut self, t: Value) -> Result<Option<KiroEvent>, StreamError> {
+        if t.get("_parse_error").is_none_or(Value::is_null) {
+            self.produced = true;
+            self.tools = true;
+            return Ok(Some(KiroEvent::ToolUse(t)));
+        }
+        if t.get("_truncation_detected") != Some(&Value::Bool(true)) {
+            return Err(StreamError::MalformedToolInput);
+        }
+        let name = t
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        tracing::warn!(
+            "Dropped tool call '{name}' cut off by Kiro; the client is told the turn hit its output limit instead of retrying it"
+        );
+        self.mark(&name);
+        Ok(None)
+    }
+
+    fn mark(&mut self, what: &str) {
+        self.cut = true;
+        if let Some(request) = &self.request {
+            request.note_upstream_cut(what);
+        }
+    }
+
+    fn upstream_error(
+        &mut self,
+        reason: String,
+        message: String,
+    ) -> Result<Option<KiroEvent>, StreamError> {
+        if let Some(name) = self.pending_tool.clone() {
+            tracing::warn!(
+                "Kiro cut the response with {reason} inside tool call '{name}': {message}; dropping it and ending the turn as max_tokens"
+            );
+            self.discard_pending = true;
+            self.mark(&name);
+            return Ok(None);
+        }
+        if !self.produced {
+            tracing::warn!("Kiro reported {reason} before any output: {message}");
+            return Err(StreamError::Upstream(format!("Kiro reported {reason}")));
+        }
+        tracing::warn!(
+            "Kiro cut the response with {reason}: {message}; ending the turn as max_tokens"
+        );
+        self.mark(&reason);
+        Ok(None)
+    }
+}
+
+fn convert(e: ParsedEvent, cut: &mut CutTracker) -> Result<Option<KiroEvent>, StreamError> {
+    let produced = match &e {
+        ParsedEvent::Content(c) => !c.is_empty(),
+        ParsedEvent::Thinking { text, .. } => !text.is_empty(),
+        ParsedEvent::ThinkingSignature(s) => !s.is_empty(),
+        _ => false,
+    };
+    if produced {
+        cut.produced = true;
+    }
     Ok(Some(match e {
         ParsedEvent::Content(c) => KiroEvent::Content(c),
         ParsedEvent::Usage(u) => KiroEvent::Usage(u),
@@ -74,11 +147,9 @@ fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
             KiroEvent::Thinking { text, is_first }
         }
         ParsedEvent::ThinkingSignature(s) => KiroEvent::ThinkingSignature(s),
-        ParsedEvent::ToolUse(t) => {
-            if t.get("_parse_error").is_some_and(|v| !v.is_null()) {
-                return Err(StreamError::MalformedToolInput);
-            }
-            KiroEvent::ToolUse(t)
+        ParsedEvent::ToolUse(t) => return cut.tool(t),
+        ParsedEvent::UpstreamError { reason, message } => {
+            return cut.upstream_error(reason, message)
         }
     }))
 }
@@ -86,6 +157,7 @@ fn convert(e: ParsedEvent) -> Result<Option<KiroEvent>, StreamError> {
 fn convert_batch(
     events: Vec<ParsedEvent>,
     meter: &mut Option<GenerationCredits>,
+    cut: &mut CutTracker,
 ) -> Result<Vec<KiroEvent>, StreamError> {
     if let Some(meter) = meter {
         for event in &events {
@@ -96,9 +168,24 @@ fn convert_batch(
     }
     let mut converted = Vec::with_capacity(events.len());
     for event in events {
-        if let Some(event) = convert(event)? {
+        if let Some(event) = convert(event, cut)? {
             converted.push(event);
         }
+    }
+    Ok(converted)
+}
+
+fn feed(
+    parser: &mut AwsEventStreamParser,
+    chunk: &[u8],
+    meter: &mut Option<GenerationCredits>,
+    cut: &mut CutTracker,
+) -> Result<Vec<KiroEvent>, StreamError> {
+    let events = parser.feed(chunk);
+    cut.pending_tool = parser.pending_tool_name();
+    let converted = convert_batch(events, meter, cut)?;
+    if std::mem::take(&mut cut.discard_pending) {
+        parser.discard_pending_tool();
     }
     Ok(converted)
 }
@@ -108,9 +195,11 @@ fn parse_kiro_stream_inner(
     first_token_timeout: f64,
     read_timeout: f64,
     mut meter: Option<GenerationCredits>,
+    request: Option<RequestCtx>,
 ) -> EventStream {
     Box::pin(async_stream::try_stream! {
         let mut parser = AwsEventStreamParser::new();
+        let mut cut = CutTracker { request, ..CutTracker::default() };
         let mut received = false;
         let first = match tokio::time::timeout(Duration::from_secs_f64(first_token_timeout), body.next()).await {
             Err(_) => Err(StreamError::FirstTokenTimeout(first_token_timeout))?,
@@ -118,7 +207,7 @@ fn parse_kiro_stream_inner(
             Ok(Some(Err(e))) => Err(StreamError::Upstream(e.to_string()))?,
             Ok(Some(Ok(b))) => b,
         };
-        let events = convert_batch(parser.feed(&first), &mut meter)?;
+        let events = feed(&mut parser, &first, &mut meter, &mut cut)?;
         received |= !events.is_empty();
         for event in events {
             yield event;
@@ -130,21 +219,23 @@ fn parse_kiro_stream_inner(
             };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| StreamError::Upstream(e.to_string()))?;
-            let events = convert_batch(parser.feed(&chunk), &mut meter)?;
+            let events = feed(&mut parser, &chunk, &mut meter, &mut cut)?;
             received |= !events.is_empty();
             for event in events {
                 yield event;
             }
         }
         for tc in parser.get_unemitted_tool_calls() {
-            if tc.get("_parse_error").is_some_and(|v| !v.is_null()) {
-                Err(StreamError::MalformedToolInput)?;
-            }
             received = true;
-            yield KiroEvent::ToolUse(tc);
+            if let Some(event) = cut.tool(tc)? {
+                yield event;
+            }
         }
-        if !received {
+        if !received && !cut.cut {
             Err(StreamError::Protocol(NO_EVENTS))?;
+        }
+        if cut.cut && !cut.tools {
+            yield KiroEvent::StopReason("MAX_TOKENS".into());
         }
     })
 }
@@ -154,7 +245,7 @@ pub fn parse_kiro_stream(
     first_token_timeout: f64,
     read_timeout: f64,
 ) -> EventStream {
-    parse_kiro_stream_inner(body, first_token_timeout, read_timeout, None)
+    parse_kiro_stream_inner(body, first_token_timeout, read_timeout, None, None)
 }
 
 pub fn parse_kiro_stream_metered(
@@ -168,6 +259,7 @@ pub fn parse_kiro_stream_metered(
         first_token_timeout,
         read_timeout,
         Some(request.begin_generation()),
+        Some(request.clone()),
     )
 }
 

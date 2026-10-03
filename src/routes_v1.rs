@@ -119,6 +119,49 @@ fn error_for(protocol: Protocol, status: u16, message: impl Into<String>) -> Res
     }
 }
 
+/// A pool that cannot serve `model` until something outside the request
+/// changes answers with a status clients do not retry, so a spent quota or a
+/// missing model ends the turn instead of looping on 503.
+fn unavailable_response(state: &Shared, protocol: Protocol, model: &str) -> Option<Response> {
+    let reason = state.pool.unavailability(model);
+    if reason == pool::Unavailable::Temporary {
+        return None;
+    }
+    tracing::warn!(
+        "No account can serve {model}: {reason:?}; answering with a non-retryable error"
+    );
+    Some(match (reason, protocol) {
+        (pool::Unavailable::Temporary, _) => return None,
+        (pool::Unavailable::Model, Protocol::Anthropic) => anthropic_error(
+            404,
+            "not_found_error",
+            format!("model: {model} is not available on any Kiro account in this gateway; the subscription may not include it."),
+        ),
+        (pool::Unavailable::Model, Protocol::OpenAI) => json_response(
+            404,
+            json!({"error": {"message": format!("The model `{model}` is not available on any Kiro account in this gateway; the subscription may not include it."), "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}),
+        ),
+        (pool::Unavailable::Quota { resets_in }, Protocol::Anthropic) => anthropic_error(
+            402,
+            "billing_error",
+            format!("Your credit balance is too low: every Kiro account that serves {model} has used its monthly quota. The first one resets in {}.", pool::format_duration(resets_in)),
+        ),
+        (pool::Unavailable::Quota { resets_in }, Protocol::OpenAI) => json_response(
+            402,
+            json!({"error": {"message": format!("You exceeded your current quota: every Kiro account that serves {model} has used its monthly quota. The first one resets in {}.", pool::format_duration(resets_in)), "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}),
+        ),
+        (pool::Unavailable::Accounts, Protocol::Anthropic) => anthropic_error(
+            403,
+            "permission_error",
+            format!("No Kiro account in this gateway can serve {model}: every account that has it is suspended or signed out."),
+        ),
+        (pool::Unavailable::Accounts, Protocol::OpenAI) => json_response(
+            403,
+            json!({"error": {"message": format!("No Kiro account in this gateway can serve {model}: every account that has it is suspended or signed out."), "type": "permission_error", "param": null, "code": "account_unavailable"}}),
+        ),
+    })
+}
+
 fn session_for(req: &Value, protocol: Protocol) -> Option<u64> {
     let messages = req.get("messages").and_then(Value::as_array)?;
     let mut system = match protocol {
@@ -180,6 +223,13 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
     let (cid, arn2) = (conversation_id.clone(), arn.clone());
     let built = match tokio::task::spawn_blocking(move || build(&p, &cid, &arn2)).await {
         Ok(Ok(b)) => b,
+        Ok(Err(BuildError::TooLarge(e))) if e.unit == "tokens" => {
+            return Attempt::Done(crate::app::context_overflow_error(
+                plan.protocol == Protocol::Anthropic,
+                e.size as u64,
+                e.limit as u64,
+            ))
+        }
         Ok(Err(e)) => return Attempt::Done(error_for(plan.protocol, 400, e.to_string())),
         Err(_) => return Attempt::Done(error_for(plan.protocol, 500, "Internal server error")),
     };
@@ -190,6 +240,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
         .unwrap_or("")
         .to_owned();
     plan.ctx.capture(|c| c.kiro_request(&built.payload));
+    plan.ctx.note_effort(&built.payload);
     let body = Bytes::from(built.serialized.clone());
     let result = state
         .transport
@@ -260,6 +311,17 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             reason.as_deref(),
             Some(&upstream_message),
         );
+        if reason.as_deref() == Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+            let limit = account
+                .models
+                .max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&plan.model));
+            tracing::warn!("Context overflow reported by Kiro for {}", plan.model);
+            return Attempt::Done(crate::app::context_overflow_error(
+                plan.protocol == Protocol::Anthropic,
+                built.input_tokens as u64,
+                limit,
+            ));
+        }
         if kind == ErrorType::Fatal {
             tracing::warn!(
                 "HTTP {status} - {}",
@@ -302,6 +364,8 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
         });
         f
     });
+    plan.ctx.set_input_estimate(plan.session, input_tokens);
+    let input_tokens = crate::input_calibration::calibrate(plan.session, &plan.model, input_tokens);
     let sctx = StreamCtx {
         model: plan.model.clone(),
         models: account.models.clone(),
@@ -629,6 +693,9 @@ async fn run(state: Shared, plan: Plan) -> Response {
             .next_account(&plan.model, &tried, plan.session)
             .await
         else {
+            if let Some(r) = unavailable_response(&state, plan.protocol, &plan.model) {
+                return r;
+            }
             if single {
                 return error_for(
                     plan.protocol,
@@ -650,6 +717,9 @@ async fn run(state: Shared, plan: Plan) -> Response {
                 }
             }
         }
+    }
+    if let Some(r) = unavailable_response(&state, plan.protocol, &plan.model) {
+        return r;
     }
     if single {
         return error_for(
@@ -856,6 +926,7 @@ pub async fn count_tokens(
         .unwrap_or("")
         .to_owned();
     ctx.note_model(&model);
+    let counted_model = model.clone();
     let tokens = tokio::task::spawn_blocking(move || {
         let messages = req["messages"].as_array().cloned().unwrap_or_default();
         let tools = req["tools"].as_array().cloned().unwrap_or_default();
@@ -869,6 +940,7 @@ pub async fn count_tokens(
     })
     .await
     .unwrap_or(0);
+    let tokens = crate::input_calibration::calibrate_count(&counted_model, tokens as i64);
     json_response(200, json!({"input_tokens": tokens}))
 }
 
@@ -991,13 +1063,17 @@ fn model_views(state: &Shared) -> Vec<Value> {
     let created = crate::store::now_i64();
     let created_at = crate::auth::iso_from_epoch(created as f64).replace("+00:00", "Z");
     ids.iter()
+        .filter(|id| crate::settings::is_listed(id))
         .map(|id| {
-            let info = accounts.iter().find_map(|a| a.models.get(id));
+            let kiro_id = crate::model_resolver::get_model_id_for_kiro(id);
+            let info = accounts.iter().find_map(|a| a.models.get(&kiro_id));
             let (max_in, max_out) = info
                 .as_ref()
                 .map(|i| (i.pointer("/tokenLimits/maxInputTokens").cloned().unwrap_or(Value::Null), i.pointer("/tokenLimits/maxOutputTokens").cloned().unwrap_or(Value::Null)))
                 .unwrap_or((Value::Null, Value::Null));
-            let friendly = accounts.iter().find_map(|a| a.models.get(id).and_then(|m| m.get("modelName").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)));
+            let friendly = accounts.iter().find_map(|a| a.models.get(&kiro_id).and_then(|m| m.get("modelName").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)));
+            let id = crate::model_resolver::public_model_id(id);
+            let id = id.as_str();
             json!({
                 "id": id, "object": "model", "created": created, "owned_by": model_owner(id),
                 "description": friendly.clone().unwrap_or_else(|| format!("{id} via Kiro API")),
@@ -1056,10 +1132,15 @@ pub async fn model(
     if let Some(r) = catalog_unavailable(&state, Protocol::OpenAI).await {
         return r;
     }
-    match model_views(&state)
-        .into_iter()
-        .find(|m| m["id"] == id.as_str())
-    {
+    let wanted = crate::model_resolver::get_model_id_for_kiro(&id);
+    match model_views(&state).into_iter().find(|m| {
+        m["id"] == id.as_str()
+            || m["id"]
+                .as_str()
+                .map(crate::model_resolver::get_model_id_for_kiro)
+                .as_deref()
+                == Some(wanted.as_str())
+    }) {
         Some(m) => json_response(200, m),
         None => openai_error(404, format!("Model '{id}' not found")),
     }

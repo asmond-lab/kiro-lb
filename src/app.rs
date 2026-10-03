@@ -88,6 +88,26 @@ pub fn openai_error(status: u16, message: impl Into<String>) -> Response {
     )
 }
 
+pub fn context_overflow_error(anthropic: bool, tokens: u64, limit: u64) -> Response {
+    let tokens = tokens.max(limit + 1);
+    if anthropic {
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            format!("prompt is too long: {tokens} tokens > {limit} maximum"),
+        );
+    }
+    json_response(
+        400,
+        json!({"error": {
+            "message": format!("This model's maximum context length is {limit} tokens. However, your messages resulted in {tokens} tokens. Please reduce the length of the messages."),
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "context_length_exceeded",
+        }}),
+    )
+}
+
 pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
     headers
         .get("x-forwarded-for")
@@ -100,6 +120,21 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String
 
 /// Records every /v1 request once its body finishes, off the runtime, and
 /// gates new work while a blue/green handoff drains the slot.
+/// Only `/v1` answers any origin, so browser clients can call it with a key.
+/// The control plane, handoff and internal routes are served to the gateway's
+/// own pages: a wildcard there would let any page the operator opens read them.
+pub async fn cors_headers(req: Request<Body>, next: Next) -> Response {
+    let data_plane = req.uri().path().starts_with("/v1/") || req.uri().path() == "/v1";
+    let mut r = next.run(req).await;
+    if data_plane {
+        r.headers_mut().insert(
+            "access-control-allow-origin",
+            axum::http::HeaderValue::from_static("*"),
+        );
+    }
+    r
+}
+
 pub async fn data_plane_middleware(
     State(state): State<Shared>,
     req: Request<Body>,
@@ -137,6 +172,7 @@ pub async fn data_plane_middleware(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let mut ctx = RequestCtx::new(None);
+    ctx.received = Some(std::time::Instant::now());
     let capture = CAPTURED_ROUTES
         .contains(&path.as_str())
         .then(crate::debug::Capture::new)
@@ -196,7 +232,8 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Generation routes whose request, upstream frames and client output are
 /// captured for `kirolb replay` when DEBUG_MODE is on, as in Python.
-const CAPTURED_ROUTES: [&str; 3] = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
+pub const GENERATION_ROUTES: [&str; 3] = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
+const CAPTURED_ROUTES: [&str; 3] = GENERATION_ROUTES;
 
 /// Writes exactly one request-log row when it drops: after the body is fully
 /// delivered, or when the handler or relay is cancelled by a disconnect. A
@@ -243,6 +280,8 @@ impl Drop for RequestLogGuard {
             credits: u.credits,
             generation_ms: u.generation_ms,
             ttft_ms: u.ttft_ms,
+            effort: u.effort,
+            upstream_cut: u.upstream_cut,
         };
         let failed_stream = self.stream_failed();
         let capture = self.ctx.capture.take();

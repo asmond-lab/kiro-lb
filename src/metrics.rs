@@ -154,7 +154,7 @@ fn line(name: &str, labels: &[(&str, String)], v: f64) -> String {
 
 fn protocol(route: &str) -> &'static str {
     match route {
-        "/v1/chat/completions" | "/v1/models" => "openai",
+        "/v1/chat/completions" | "/v1/responses" | "/v1/models" => "openai",
         "/v1/messages" | "/v1/messages/count_tokens" => "anthropic",
         _ => "other",
     }
@@ -234,6 +234,7 @@ pub fn render(state: &Shared) -> String {
                 ))
             })?
             .flatten()
+            .filter(|r| crate::app::GENERATION_ROUTES.contains(&r.0.as_str()))
         {
             *counted
                 .entry((
@@ -263,6 +264,7 @@ pub fn render(state: &Shared) -> String {
                 ))
             })?
             .flatten()
+            .filter(|r| crate::app::GENERATION_ROUTES.contains(&r.0.as_str()))
         {
             let e = timed
                 .entry((model(Some(&r.1), &known), protocol(&r.0).into()))

@@ -3,8 +3,10 @@
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
+use crate::config;
 use crate::payload_guard::{self, PayloadTooLarge};
-use crate::{config, settings};
+
+const AGENT_TASK_TYPE: &str = "vibe";
 
 #[derive(Clone, Debug, Default)]
 pub struct UnifiedMessage {
@@ -798,15 +800,7 @@ pub fn build_kiro_payload(
         json!({"userInputMessage": user_input}),
     );
     let mut payload = Map::new();
-    let task_type = settings::agent_mode();
-    if !task_type.is_empty() {
-        let state_type = if task_type == "spec" {
-            "vibe"
-        } else {
-            task_type.as_str()
-        };
-        state.insert("agentTaskType".into(), json!(state_type));
-    }
+    state.insert("agentTaskType".into(), json!(AGENT_TASK_TYPE));
     state.insert(
         "agentContinuationId".into(),
         json!(uuid::Uuid::new_v4().to_string()),
@@ -816,9 +810,7 @@ pub fn build_kiro_payload(
         state.insert("history".into(), Value::Array(history));
     }
     payload.insert("conversationState".into(), Value::Object(state));
-    if !task_type.is_empty() {
-        payload.insert("agentMode".into(), json!(task_type));
-    }
+    payload.insert("agentMode".into(), json!(AGENT_TASK_TYPE));
     if !profile_arn.is_empty() {
         payload.insert("profileArn".into(), json!(profile_arn));
     }

@@ -1,7 +1,7 @@
 import type {
+  DashboardModels,
   Account,
   AccountTokenUsage,
-  AgentModeSettings,
   ApiKey,
   DataOverview,
   DeviceLoginFlow,
@@ -55,6 +55,16 @@ export const dashboardApi = {
   checkForUpdates: () => request<NonNullable<Overview["version"]>>("/api/dashboard/updates/check", { method: "POST" }),
   installUpdate: (version: string) => request<NonNullable<Overview["update"]>>("/api/dashboard/updates/install", { method: "POST", body: JSON.stringify({ version }) }),
   endpoints: () => request<EndpointsResponse>("/api/dashboard/endpoints"),
+  dashboardModels: () => request<DashboardModels>("/api/dashboard/models"),
+  saveListedModels: (hidden: string[]) =>
+    request<{ hidden: string[] }>("/api/dashboard/models", {
+      method: "PUT",
+      body: JSON.stringify({ hidden }),
+    }),
+  refreshModels: () =>
+    request<{ refreshed: number; failed: string[]; models: number }>("/api/dashboard/models/refresh", {
+      method: "POST",
+    }),
   saveEndpoints: (settings: EndpointSettings) =>
     request<{ settings: EndpointSettings }>("/api/dashboard/endpoints", {
       method: "PUT",
@@ -71,13 +81,7 @@ export const dashboardApi = {
       body: JSON.stringify(only ? { reps, only } : { reps }),
     }),
   promptFilter: () => request<PromptFilterSettings>("/api/dashboard/prompt-filter"),
-  agentMode: () => request<AgentModeSettings>("/api/dashboard/agent-mode"),
-  saveAgentMode: (mode: string) =>
-    request<{ mode: string }>("/api/dashboard/agent-mode", {
-      method: "PUT",
-      body: JSON.stringify({ mode }),
-    }),
-  savePromptFilter: (patch: { enabled?: boolean; shortenTools?: boolean }) =>
+  savePromptFilter: (patch: { shortenTools?: boolean; writeHint?: boolean }) =>
     request<PromptFilterSettings>("/api/dashboard/prompt-filter", {
       method: "PUT",
       body: JSON.stringify(patch),

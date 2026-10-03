@@ -13,8 +13,14 @@ import type {
 
 const DEFAULT_PAGE_SIZE = 25;
 const EMPTY_LOGS: RequestLogPage = { logs: [], total: 0, limit: DEFAULT_PAGE_SIZE, offset: 0, hasMore: false };
-const RATE_WINDOW_SECONDS = 900;
-const RATE_BUCKET_SECONDS = 5;
+export const RATE_WINDOWS = [
+  { seconds: 900, bucket: 5, label: "15m" },
+  { seconds: 3600, bucket: 20, label: "1h" },
+  { seconds: 21600, bucket: 120, label: "6h" },
+] as const;
+export type RateWindowSeconds = (typeof RATE_WINDOWS)[number]["seconds"];
+
+const rateBucket = (seconds: RateWindowSeconds) => RATE_WINDOWS.find((w) => w.seconds === seconds)?.bucket ?? 5;
 /** Live refresh cadence. Each poll costs ~2ms of server work, all of it local. */
 export const REFRESH_INTERVAL_MS = 1000;
 /** Ceiling for the failure backoff so a long outage still recovers within seconds. */
@@ -28,6 +34,8 @@ export type DashboardState = {
   accountTokenUsage: AccountTokenUsage;
   logs: RequestLogPage;
   rate?: RequestRate;
+  rateWindow: RateWindowSeconds;
+  setRateWindow: (seconds: RateWindowSeconds) => void;
   /** True only for the initial load, so refreshes do not flash skeletons. */
   isLoading: boolean;
   isLogsLoading: boolean;
@@ -88,6 +96,8 @@ export function useDashboard(): DashboardState {
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
   const [isRequestingInstall, setIsRequestingInstall] = useState(false);
+  const [rateWindow, setRateWindowState] = useState<RateWindowSeconds>(900);
+  const rateWindowRef = useRef<RateWindowSeconds>(900);
   const installingRef = useRef(false);
   const checkingUpdatesRef = useRef(false);
   // The server stamps the document before any API request can observe a restart.
@@ -160,11 +170,12 @@ export function useDashboard(): DashboardState {
   const reload = useCallback(async () => {
     const requestId = ++dashboardRequestId.current;
     try {
+      const window = rateWindowRef.current;
       const [nextOverview, nextAccounts, nextKeys, nextRate, nextKeyUsage, nextAccountUsage] = await Promise.all([
         dashboardApi.overview(),
         dashboardApi.accounts(),
         dashboardApi.apiKeys(),
-        dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
+        dashboardApi.requestRate(window, rateBucket(window)),
         dashboardApi.keyUsage(),
         dashboardApi.accountTokenUsage(),
       ]);
@@ -172,7 +183,7 @@ export function useDashboard(): DashboardState {
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
       setApiKeys(nextKeys.apiKeys);
-      setRate(nextRate);
+      if (window === rateWindowRef.current) setRate(nextRate);
       setKeyUsage(nextKeyUsage.usage);
       setAccountTokenUsage(nextAccountUsage.usage);
       noteSuccess();
@@ -191,17 +202,18 @@ export function useDashboard(): DashboardState {
   const refreshLive = useCallback(async () => {
     const requestId = ++dashboardRequestId.current;
     try {
+      const window = rateWindowRef.current;
       const [nextOverview, nextAccounts, nextRate, nextKeyUsage, nextAccountUsage] = await Promise.all([
         dashboardApi.overview(),
         dashboardApi.accounts(),
-        dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
+        dashboardApi.requestRate(window, rateBucket(window)),
         dashboardApi.keyUsage(),
         dashboardApi.accountTokenUsage(),
       ]);
       if (requestId !== dashboardRequestId.current) return;
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
-      setRate(nextRate);
+      if (window === rateWindowRef.current) setRate(nextRate);
       setKeyUsage(nextKeyUsage.usage);
       setAccountTokenUsage(nextAccountUsage.usage);
       noteSuccess();
@@ -213,6 +225,19 @@ export function useDashboard(): DashboardState {
       if (requestId === dashboardRequestId.current) handleFailure(cause);
     }
   }, [handleFailure, limit, loadLogs, noteSuccess, offset]);
+
+  const setRateWindow = useCallback((seconds: RateWindowSeconds) => {
+    rateWindowRef.current = seconds;
+    setRateWindowState(seconds);
+    void dashboardApi
+      .requestRate(seconds, rateBucket(seconds))
+      .then((next) => {
+        if (rateWindowRef.current === seconds) setRate(next);
+      })
+      .catch((cause) => {
+        if (rateWindowRef.current === seconds) handleFailure(cause);
+      });
+  }, [handleFailure]);
 
   useEffect(() => {
     void reload();
@@ -321,6 +346,7 @@ export function useDashboard(): DashboardState {
 
   const signIn = useCallback(
     async (password: string) => {
+      setError("");
       try {
         await dashboardApi.login(password);
         setError("");
@@ -352,6 +378,8 @@ export function useDashboard(): DashboardState {
     accountTokenUsage,
     logs,
     rate,
+    rateWindow,
+    setRateWindow,
     isLoading,
     isLogsLoading,
     isAuthenticated,

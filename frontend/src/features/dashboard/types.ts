@@ -123,6 +123,9 @@ export type RequestLog = {
    * always arrives.
    */
   modelMultiplier?: number | null;
+  tokens_per_second?: number | null;
+  effort?: string | null;
+  upstream_cut?: string | null;
 };
 
 export type RequestLogOrder = "newest" | "oldest";
@@ -143,6 +146,8 @@ export type RequestLogDetail = {
   generationMs?: number | null;
   tokensPerSecond?: number | null;
   ttftMs?: number | null;
+  effort?: string | null;
+  upstreamCut?: string | null;
 };
 
 export type DataOverview = {
@@ -253,10 +258,34 @@ export interface EndpointOption {
   url: string;
 }
 
+export type EndpointStrategy = "ordered" | "fastest";
+
+export interface DashboardModel {
+  id: string;
+  listedAs?: string;
+  key?: string;
+  listed?: boolean;
+}
+
+export interface DashboardModels {
+  models: DashboardModel[];
+  hidden?: string[];
+}
+
 export interface EndpointSettings {
   rotation: boolean;
   order: string[];
   cooldownSeconds: number;
+  strategy?: EndpointStrategy;
+  probeModel?: string;
+  probeIntervalMinutes?: number;
+}
+
+export interface EndpointLatency {
+  medians: Record<string, number>;
+  leader: string | null;
+  measured_at: number;
+  model: string | null;
 }
 
 export interface EndpointsResponse {
@@ -264,6 +293,10 @@ export interface EndpointsResponse {
   settings: EndpointSettings;
   pingRepsMax: number;
   pingRepsDefault: number;
+  latency?: EndpointLatency | null;
+  region?: string;
+  cooldowns?: Record<string, number>;
+  probeIntervalRange?: [number, number];
 }
 
 export interface EndpointTestResult {
@@ -311,17 +344,10 @@ export interface ToolShortenStats {
 }
 
 export interface PromptFilterSettings {
-  enabled: boolean;
-  shortenTools?: boolean;
-  shortenThreshold?: number;
-  identity: string;
-  preservedNote: string;
-  shortenNote?: string;
-  droppedSections: string[];
+  shortenTools: boolean;
+  writeHint?: boolean;
+  shortenThreshold: number;
+  shortenNote: string;
   lastShorten?: ToolShortenStats | null;
 }
 
-export interface AgentModeSettings {
-  mode: string;
-  allowed: string[];
-}

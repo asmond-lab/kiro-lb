@@ -81,6 +81,22 @@ pub fn get_model_id_for_kiro(model_name: &str) -> String {
         .unwrap_or(normalized)
 }
 
+pub fn public_model_id(kiro_id: &str) -> String {
+    static DOTTED: OnceLock<Regex> = OnceLock::new();
+    static VERSION_FIRST: OnceLock<Regex> = OnceLock::new();
+    let re =
+        DOTTED.get_or_init(|| Regex::new(r"^(claude-(?:haiku|sonnet|opus)-\d+)\.(\d+)$").unwrap());
+    if let Some(c) = re.captures(kiro_id) {
+        return format!("{}-{}", &c[1], &c[2]);
+    }
+    let first = VERSION_FIRST
+        .get_or_init(|| Regex::new(r"^claude-(\d+)\.(\d+)-(haiku|sonnet|opus)$").unwrap());
+    match first.captures(kiro_id) {
+        Some(c) => format!("claude-{}-{}-{}", &c[1], &c[2], &c[3]),
+        None => kiro_id.to_owned(),
+    }
+}
+
 pub fn extract_model_family(model_name: &str) -> Option<String> {
     patterns()
         .family
@@ -238,16 +254,12 @@ impl ModelInfoCache {
         state.rejected.insert(id, revision);
     }
 
-    /// The window contextUsagePercentage is a percentage of. Five models advertise
-    /// 1000000 but charge against 666667 (measured), so the measured value wins.
     pub fn max_input_tokens(&self, id: &str) -> u64 {
-        if let Some(f) = config::fallback_limits(id).filter(|f| f.max_input_tokens == 666_667) {
-            return f.max_input_tokens;
-        }
+        let id = get_model_id_for_kiro(id);
         self.inner
             .read()
             .models
-            .get(id)
+            .get(&id)
             .and_then(|m| m.pointer("/tokenLimits/maxInputTokens"))
             .and_then(Value::as_u64)
             .filter(|v| *v > 0)

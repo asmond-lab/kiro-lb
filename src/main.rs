@@ -152,14 +152,14 @@ fn router(state: app::Shared) -> Router {
         )
         .route("/api/dashboard/model-costs", get(d::model_costs_view))
         .route(
-            "/api/dashboard/agent-mode",
-            get(d::get_agent_mode).put(d::put_agent_mode),
-        )
-        .route(
             "/api/dashboard/prompt-filter",
             get(d::get_prompt_filter).put(d::put_prompt_filter),
         )
-        .route("/api/dashboard/models", get(d::dashboard_models))
+        .route(
+            "/api/dashboard/models",
+            get(d::dashboard_models).put(d::put_dashboard_models),
+        )
+        .route("/api/dashboard/models/refresh", post(d::refresh_models))
         .route("/_internal/handoff/quiesce", post(d::handoff_quiesce))
         .route("/_internal/handoff/activate", post(d::handoff_activate))
         .route("/_internal/handoff/ready", get(d::handoff_ready))
@@ -175,13 +175,7 @@ fn router(state: app::Shared) -> Router {
             state.clone(),
             app::data_plane_middleware,
         ))
-        .layer(axum::middleware::map_response(
-            |mut r: Response| async move {
-                r.headers_mut()
-                    .insert("access-control-allow-origin", "*".parse().unwrap());
-                r
-            },
-        ))
+        .layer(axum::middleware::from_fn(app::cors_headers))
         .with_state(state)
 }
 
@@ -215,6 +209,30 @@ fn spawn_background(state: app::Shared) {
         loop {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             let _ = tokio::task::spawn_blocking(dashboard_store::prune_request_logs).await;
+        }
+    });
+    let s = state.clone();
+    tokio::spawn(async move {
+        kiro_lb::probe::startup_probe(&s).await;
+        let mut last_generations = kiro_lb::upstream::endpoints::generations();
+        let mut last_run = kiro_lb::store::now_f64();
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let now = kiro_lb::store::now_f64();
+            if s.quiesced.load(std::sync::atomic::Ordering::SeqCst)
+                || !kiro_lb::probe::scheduled_probe_due(last_generations, last_run, now)
+            {
+                continue;
+            }
+            last_generations = kiro_lb::upstream::endpoints::generations();
+            last_run = now;
+            match kiro_lb::probe::ping(&s, 3, None, None).await {
+                Ok(v) => tracing::info!(
+                    "[Endpoints] Scheduled latency probe: {}",
+                    v["verdict"].as_str().unwrap_or("")
+                ),
+                Err((_, e)) => tracing::warn!("[Endpoints] Scheduled latency probe skipped: {e}"),
+            }
         }
     });
     let s = state;
@@ -324,6 +342,17 @@ fn main() {
 
 async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::InstalledUpdate> {
     let cfg = config::get();
+    if !cfg.dashboard_auth {
+        let local = ["127.0.0.1", "localhost", "::1"].contains(&host.as_str());
+        tracing::warn!(
+            "DASHBOARD_AUTH=false: the dashboard at / opens without a password{}. /v1 still requires an API key.",
+            if local {
+                ""
+            } else {
+                " and this gateway listens beyond loopback; publish it only on 127.0.0.1 (Docker: -p 127.0.0.1:8000:8000)"
+            }
+        );
+    }
     if cfg.first_token_timeout >= cfg.streaming_read_timeout {
         tracing::warn!(
             "FIRST_TOKEN_TIMEOUT ({}s) >= STREAMING_READ_TIMEOUT ({}s); the first should be lower",

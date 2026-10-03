@@ -61,9 +61,6 @@ const fn fm(
     }
 }
 
-// Five entries deliberately carry 666667 rather than the advertised 1000000:
-// the runtime charges contextUsagePercentage against two thirds of the
-// advertised window (measured slopes 1.4963-1.5018 on English text).
 pub const FALLBACK_MODELS: &[FallbackModel] = &[
     fm("auto", 1_000_000, 64_000),
     fm("claude-sonnet-4", 200_000, 64_000),
@@ -72,11 +69,12 @@ pub const FALLBACK_MODELS: &[FallbackModel] = &[
     fm("claude-haiku-4.5", 200_000, 64_000),
     fm("claude-opus-4.5", 200_000, 64_000),
     fm("claude-opus-4.6", 1_000_000, 64_000),
-    fm("claude-opus-4.7", 666_667, 128_000),
-    fm("claude-opus-4.8", 666_667, 128_000),
-    fm("claude-opus-5", 666_667, 128_000),
-    fm("claude-opus-5.5", 666_667, 128_000),
-    fm("claude-sonnet-5", 666_667, 64_000),
+    fm("claude-opus-4.7", 1_000_000, 128_000),
+    fm("claude-opus-4.8", 1_000_000, 128_000),
+    fm("claude-opus-5", 1_000_000, 128_000),
+    fm("claude-opus-5.5", 1_000_000, 128_000),
+    fm("claude-sonnet-5", 1_000_000, 64_000),
+    fm("claude-sonnet-5.5", 1_000_000, 128_000),
     fm("deepseek-3.2", 164_000, 64_000),
     fm("glm-5", 200_000, 64_000),
     fm("minimax-m2.1", 196_000, 64_000),
@@ -108,10 +106,9 @@ pub struct Config {
     pub endpoint_rotation: bool,
     pub endpoint_order: Vec<String>,
     pub endpoint_cooldown_seconds: f64,
-    pub condense_claude_prompt: bool,
     pub shorten_claude_tools: bool,
+    pub claude_write_hint: bool,
     pub shorten_tool_threshold: usize,
-    pub agent_task_type: String,
     pub debug_mode: DebugMode,
     pub debug_dir: String,
     pub debug_capture_content: bool,
@@ -144,6 +141,7 @@ pub struct Config {
     pub session_affinity_ttl_seconds: u64,
     pub session_affinity_capacity: usize,
     pub dashboard_password: String,
+    pub dashboard_auth: bool,
     pub dashboard_secure_cookie: Option<bool>,
     pub data_dir: String,
     pub kiro_slot: String,
@@ -162,23 +160,22 @@ impl Config {
             server_port: env_parse("SERVER_PORT", 8000),
             proxy_api_key: env_str("PROXY_API_KEY", ""),
             vpn_proxy_url: env_str("VPN_PROXY_URL", ""),
-            token_refresh_threshold: env_parse("TOKEN_REFRESH_THRESHOLD", 600),
+            token_refresh_threshold: env_parse("TOKEN_REFRESH_THRESHOLD", 960),
             tool_description_max_length: env_parse("TOOL_DESCRIPTION_MAX_LENGTH", 10_000),
             log_level: env_str("LOG_LEVEL", "INFO").to_ascii_uppercase(),
             first_token_timeout: env_parse("FIRST_TOKEN_TIMEOUT", 15.0),
             streaming_read_timeout: env_parse("STREAMING_READ_TIMEOUT", 300.0),
             first_token_max_retries: env_parse("FIRST_TOKEN_MAX_RETRIES", 3),
-            endpoint_rotation: env_bool("KIRO_ENDPOINT_ROTATION", false),
+            endpoint_rotation: env_bool("KIRO_ENDPOINT_ROTATION", true),
             endpoint_order: env_str("KIRO_ENDPOINT_ORDER", "runtime,codewhisperer,amazonq")
                 .split(',')
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect(),
             endpoint_cooldown_seconds: env_parse("KIRO_ENDPOINT_COOLDOWN_SECONDS", 30.0),
-            condense_claude_prompt: env_bool("CONDENSE_CLAUDE_PROMPT", false),
-            shorten_claude_tools: env_bool("SHORTEN_CLAUDE_TOOLS", false),
+            shorten_claude_tools: env_bool("SHORTEN_CLAUDE_TOOLS", true),
+            claude_write_hint: env_bool("CLAUDE_WRITE_HINT", true),
             shorten_tool_threshold: env_parse("SHORTEN_TOOL_THRESHOLD", 1200),
-            agent_task_type: env_str("KIRO_AGENT_TASK_TYPE", "vibe").trim().to_owned(),
             debug_mode,
             debug_dir: env_str("DEBUG_DIR", "debug_logs"),
             debug_capture_content: env_str("DEBUG_CAPTURE_CONTENT", "false")
@@ -221,6 +218,7 @@ impl Config {
             session_affinity_ttl_seconds: env_parse("SESSION_AFFINITY_TTL_SECONDS", 7200),
             session_affinity_capacity: env_parse("SESSION_AFFINITY_CAPACITY", 10_000),
             dashboard_password: env_str("DASHBOARD_PASSWORD", ""),
+            dashboard_auth: env_bool("DASHBOARD_AUTH", true),
             dashboard_secure_cookie: std::env::var("DASHBOARD_SECURE_COOKIE")
                 .ok()
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
@@ -309,7 +307,8 @@ pub fn kiro_q_host(region: &str, is_builder_id: bool) -> Result<String, InvalidR
 }
 
 pub fn fallback_limits(model: &str) -> Option<&'static FallbackModel> {
-    FALLBACK_MODELS.iter().find(|m| m.model_id == model)
+    let id = crate::model_resolver::get_model_id_for_kiro(model);
+    FALLBACK_MODELS.iter().find(|m| m.model_id == id)
 }
 
 #[cfg(test)]

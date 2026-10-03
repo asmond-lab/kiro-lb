@@ -32,3 +32,17 @@ const UNROUTABLE_STATES: ReadonlySet<string> = new Set([
 export function isUnroutable(state: AccountRoutingState | null): boolean {
   return state !== null && UNROUTABLE_STATES.has(state);
 }
+
+const RATE_GUIDE_REASONS: Record<string, string> = {
+  "no rate rejection observed yet": "rate.reasonNoRejection",
+  "rejections seen only below the rate this account serves cleanly": "rate.reasonBelowServed",
+};
+
+export function rateGuideReason(
+  reason: string | null | undefined,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): string {
+  if (!reason) return "";
+  const key = RATE_GUIDE_REASONS[reason];
+  return key ? t(key) : reason;
+}

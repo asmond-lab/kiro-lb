@@ -1,7 +1,7 @@
 export type ModelFamily = "auto" | "claude" | "gpt" | "glm" | "deepseek" | "minimax" | "qwen" | "other";
 
 const PATTERNS: [ModelFamily, RegExp][] = [
-  ["auto", /^auto$/],
+  ["auto", /^auto(-kiro)?$/],
   ["claude", /claude/],
   ["gpt", /(^|[^a-z])(gpt|o[134])([^a-z]|$)|openai/],
   ["glm", /glm|zhipu/],

@@ -26,7 +26,7 @@ const TAIL_COLOR: DitherColor = "grey";
 /** Traffic at or above this share of the observed limit is drawn as a warning. */
 const WARN_FRACTION = 0.8;
 
-function formatClock(unixSeconds: number): string {
+export function formatClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 

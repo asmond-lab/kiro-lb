@@ -12,6 +12,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { API_KEY_NAME_MAX, normalizeKeyName } from "../api-key-display";
+import { localizeError } from "../error-text";
 import { usePreferences } from "../preferences";
 
 export type CreateKeyDialogProps = {
@@ -27,7 +28,7 @@ export type CreateKeyDialogProps = {
  * only supplies the create action.
  */
 export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialogProps) {
-  const { t } = usePreferences();
+  const { t, language } = usePreferences();
   const [name, setName] = useState("");
   const [isPending, setIsPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,7 +68,7 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
       setCreatedKey(await onCreate(normalized));
     } catch (err) {
       // Keep the entered name so a retry is one click.
-      setError(err instanceof Error ? err.message : t("keys.create.failed"));
+      setError(err instanceof Error ? localizeError(language, err.message) : t("keys.create.failed"));
     } finally {
       setIsPending(false);
     }

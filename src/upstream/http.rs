@@ -701,6 +701,7 @@ impl Transport {
         retry_rate_limits: bool,
     ) -> Result<UpstreamResponse, TransportError> {
         let permits = concurrency_slot(account_id).await?;
+        endpoints::note_generation();
         let s = settings::endpoint_settings();
         let result = if !s.rotation {
             self.through_proxies(
@@ -720,7 +721,21 @@ impl Transport {
             let mut last_response = None;
             let mut last_error = None;
             let mut out = None;
-            for (i, ep) in endpoints::attempt_order(&affinity, model, &s.order)
+            let fastest = s.strategy == endpoints::FASTEST;
+            let order = if fastest {
+                endpoints::fastest_order(&region, &s.order)
+            } else {
+                s.order.clone()
+            };
+            let fail = |key: &'static str| {
+                if fastest {
+                    endpoints::record_failure_backoff(key, s.cooldown_seconds);
+                } else {
+                    endpoints::record_failure(key, s.cooldown_seconds);
+                }
+            };
+            let preferred = (!fastest).then_some((affinity.as_str(), model));
+            for (i, ep) in endpoints::attempt_order(preferred, &order)
                 .into_iter()
                 .enumerate()
             {
@@ -744,7 +759,7 @@ impl Transport {
                     .await
                 {
                     Err(Ok(e)) => {
-                        endpoints::record_failure(ep.key, s.cooldown_seconds);
+                        fail(ep.key);
                         tracing::warn!("[Endpoints] {} transport failure", ep.name);
                         last_error = Some(e);
                     }
@@ -754,7 +769,7 @@ impl Transport {
                         break;
                     }
                     Ok(r) if (500..600).contains(&r.status) => {
-                        endpoints::record_failure(ep.key, s.cooldown_seconds);
+                        fail(ep.key);
                         tracing::warn!("[Endpoints] {} returned {}", ep.name, r.status);
                         last_response = Some(r);
                     }

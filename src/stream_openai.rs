@@ -34,7 +34,7 @@ pub fn stream(
     opts: OpenAIOptions,
 ) -> Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>> {
     Box::pin(async_stream::try_stream! {
-        let mut timer = GenerationTimer::start();
+        let mut timer = GenerationTimer::start_at(ctx.request.received);
         let mut v = OpenAIValidator::default();
         let id = utils::completion_id();
         let created = crate::store::now_i64();
@@ -132,7 +132,13 @@ pub fn stream(
         } else {
             mapped.unwrap_or("stop")
         };
-        let output_text = format!("{full}{thinking}");
+        let tool_text = crate::usage_tracking::tool_call_text(all.iter().filter(|t| t.get("_bracket").is_none()).map(|t| {
+            (
+                t.pointer("/function/name").and_then(Value::as_str).unwrap_or(""),
+                t.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("").to_owned(),
+            )
+        }));
+        let output_text = format!("{full}{thinking}{tool_text}");
         let model = ctx.model.clone();
         let completion = if output_text.len() >= 8192 {
             tokio::task::spawn_blocking(move || count_tokens(&output_text, true, Some(&model))).await.unwrap_or(0)
@@ -141,7 +147,7 @@ pub fn stream(
         } as i64;
         let (mut prompt, mut total) = (0i64, completion);
         match stream_core::tokens_from_context_usage(context_usage, completion, ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model))) {
-            Some((p, t)) => { prompt = p; total = t; }
+            Some((p, t)) => { prompt = p; total = t; ctx.request.observe_reported_input(&ctx.model, p); }
             None if ctx.input_tokens > 0 => {
                 prompt = ctx.input_tokens;
                 total = prompt + completion;

@@ -65,11 +65,40 @@ fn authenticated(headers: &HeaderMap) -> bool {
 }
 
 fn require(headers: &HeaderMap) -> Result<(), Response> {
-    if authenticated(headers) {
-        Ok(())
-    } else {
-        Err(detail(401, "Dashboard authentication required"))
+    if config::get().dashboard_auth {
+        return if authenticated(headers) {
+            Ok(())
+        } else {
+            Err(detail(401, "Dashboard authentication required"))
+        };
     }
+    if is_cross_site(headers) {
+        return Err(detail(403, "Cross-site dashboard request rejected"));
+    }
+    Ok(())
+}
+
+/// Without a password the browser's own origin checks are the only guard, so
+/// a request another site makes on the operator's behalf is refused even
+/// when it would not need to read the reply (a form post that deletes keys).
+fn is_cross_site(headers: &HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // Browsers set Sec-Fetch-Site themselves and pages cannot forge it, so it
+    // decides whenever present. It also survives a proxy that rewrites Host
+    // (Vite's dev server, a reverse proxy), where comparing Origin with Host
+    // would reject the dashboard's own requests.
+    if let Some(site) = header("sec-fetch-site") {
+        return matches!(site, "cross-site" | "same-site");
+    }
+    let (Some(origin), Some(host)) = (header("origin"), header("host")) else {
+        return false;
+    };
+    let host = header("x-forwarded-host").unwrap_or(host);
+    origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin)
+        != host
 }
 
 macro_rules! guard {
@@ -104,6 +133,9 @@ fn json_object(body: &Bytes) -> Result<serde_json::Map<String, Value>, Response>
 }
 
 pub async fn login(headers: HeaderMap, body: Bytes) -> Response {
+    if !config::get().dashboard_auth {
+        return json_response(200, json!({"ok": true, "authRequired": false}));
+    }
     let password = &config::get().dashboard_password;
     if password.is_empty() {
         return detail(503, "DASHBOARD_PASSWORD is not configured");
@@ -277,7 +309,7 @@ pub async fn overview(State(state): State<Shared>, headers: HeaderMap) -> Respon
     let (requests, successes, avg): (i64, i64, f64) = tokio::task::spawn_blocking(move || {
         store::with(|c| {
             c.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(status_code BETWEEN 200 AND 399), 0), COALESCE(AVG(latency_ms), 0) FROM request_logs WHERE created_at >= ?1",
+                "SELECT COUNT(*), COALESCE(SUM(status_code BETWEEN 200 AND 399), 0), COALESCE(AVG(latency_ms), 0) FROM request_logs WHERE created_at >= ?1 AND route IN ('/v1/chat/completions', '/v1/messages', '/v1/responses')",
                 [since],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -771,6 +803,7 @@ async fn register(state: &Shared, entry: Value, requested_type: &str) -> Result<
     if !initialized {
         tracing::warn!("Registered account {id} could not be initialized yet");
     }
+    state.pool.schedule_catalog_rereads(&id);
     state.pool.save_state();
     if let Some(a) = state.pool.get(&id).filter(|a| a.auth().is_some()) {
         refresh_account_usage(state, &a).await;
@@ -1134,7 +1167,13 @@ pub async fn get_endpoints(State(state): State<Shared>, headers: HeaderMap) -> R
         .collect();
     json_response(
         200,
-        json!({"available": available, "settings": settings::endpoint_settings().as_json(), "pingRepsMax": crate::probe::PING_REPS_MAX, "pingRepsDefault": crate::probe::PING_REPS_DEFAULT}),
+        json!({
+            "available": available, "settings": settings::endpoint_settings().as_json(),
+            "pingRepsMax": crate::probe::PING_REPS_MAX, "pingRepsDefault": crate::probe::PING_REPS_DEFAULT,
+            "latency": endpoints::latency_snapshot().get(&region).cloned(), "region": region,
+            "cooldowns": endpoints::ENDPOINTS.iter().map(|e| (e.key.to_owned(), json!(endpoints::cooldown_remaining(e.key).round() as i64))).collect::<serde_json::Map<_, _>>(),
+            "probeIntervalRange": [settings::PROBE_INTERVAL_MINUTES.0, settings::PROBE_INTERVAL_MINUTES.1],
+        }),
     )
 }
 
@@ -1151,7 +1190,21 @@ pub async fn put_endpoints(headers: HeaderMap, body: Bytes) -> Response {
         .get("cooldownSeconds")
         .cloned()
         .unwrap_or(json!(active.cooldown_seconds));
-    match settings::update_endpoints(&rotation, &order, &cooldown) {
+    let strategy = p.get("strategy").cloned().unwrap_or(json!(active.strategy));
+    let probe_model = p
+        .get("probeModel")
+        .cloned()
+        .unwrap_or(json!(active.probe_model));
+    let interval = p
+        .get("probeIntervalMinutes")
+        .cloned()
+        .unwrap_or(json!(active.probe_interval_minutes));
+    match settings::update_endpoints(
+        &rotation,
+        &order,
+        &cooldown,
+        (&strategy, &probe_model, &interval),
+    ) {
         Err(e) => detail(400, e.to_string()),
         Ok(Err(e)) => detail(500, format!("Could not persist settings: {e}")),
         Ok(Ok(s)) => json_response(200, json!({"settings": s.as_json()})),
@@ -1212,7 +1265,7 @@ pub async fn request_log_detail(headers: HeaderMap, Path(id): Path<i64>) -> Resp
     let row = tokio::task::spawn_blocking(move || {
         store::with(|c| {
             use rusqlite::OptionalExtension;
-            c.query_row("SELECT id, created_at, route, model, status_code, latency_ms, client_ip, user_agent, input_tokens, output_tokens, credits, generation_ms, ttft_ms FROM request_logs WHERE id = ?1", [id], |r| {
+            c.query_row("SELECT id, created_at, route, model, status_code, latency_ms, client_ip, user_agent, input_tokens, output_tokens, credits, generation_ms, ttft_ms, effort, upstream_cut FROM request_logs WHERE id = ?1", [id], |r| {
                 let model: Option<String> = r.get(3)?;
                 let input: Option<i64> = r.get(8)?;
                 let output: Option<i64> = r.get(9)?;
@@ -1228,6 +1281,8 @@ pub async fn request_log_detail(headers: HeaderMap, Path(id): Path<i64>) -> Resp
                     "userAgent": r.get::<_, Option<String>>(7)?, "inputTokens": input, "outputTokens": output,
                     "creditsSpent": r.get::<_, Option<f64>>(10)?, "modelMultiplier": model_costs::multiplier_for(model.as_deref(), input),
                     "generationMs": gen_ms, "tokensPerSecond": tps, "ttftMs": ttft_ms,
+                    "effort": r.get::<_, Option<String>>(13)?,
+                    "upstreamCut": r.get::<_, Option<String>>(14)?,
                 }))
             })
             .optional()
@@ -1257,35 +1312,38 @@ pub async fn request_logs(headers: HeaderMap, Query(q): Query<LogQuery>) -> Resp
     let limit = q.limit.unwrap_or(25).clamp(1, 250);
     let offset = q.offset.unwrap_or(0).max(0);
     let asc = q.order.as_deref() == Some("oldest");
-    let filter = q
-        .model
-        .filter(|m| !m.is_empty())
-        .map(|m| ds::normalized_model_filter(&m));
+    let wanted = q.model.filter(|m| !m.is_empty());
     let result = tokio::task::spawn_blocking(move || {
         store::with(|c| {
+            let mut ms = c.prepare("SELECT DISTINCT model FROM request_logs WHERE model IS NOT NULL ORDER BY model")?;
+            let known: Vec<String> = ms.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let filter = wanted.as_deref().map(|m| ds::spellings_of(m, &known));
             let (where_sql, params): (String, Vec<String>) = match &filter {
                 Some(f) => (format!(" WHERE model IN ({})", vec!["?"; f.len()].join(",")), f.clone()),
                 None => (String::new(), vec![]),
             };
             let total: i64 = c.query_row(&format!("SELECT COUNT(*) FROM request_logs{where_sql}"), rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
             let sql = format!(
-                "SELECT id, created_at, route, model, status_code, latency_ms, client_ip, credits FROM request_logs{where_sql} ORDER BY id {} LIMIT {limit} OFFSET {offset}",
+                "SELECT id, created_at, route, model, status_code, latency_ms, client_ip, credits, output_tokens, generation_ms, effort, upstream_cut FROM request_logs{where_sql} ORDER BY id {} LIMIT {limit} OFFSET {offset}",
                 if asc { "ASC" } else { "DESC" }
             );
             let mut stmt = c.prepare(&sql)?;
             let logs: Vec<Value> = stmt
                 .query_map(rusqlite::params_from_iter(params.iter()), |r| {
                     let model: Option<String> = r.get(3)?;
+                    let tps = match (r.get::<_, Option<i64>>(8)?, r.get::<_, Option<i64>>(9)?) {
+                        (Some(o), Some(g)) => crate::usage_tracking::tokens_per_second(o, g),
+                        _ => None,
+                    };
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?, "created_at": r.get::<_, i64>(1)?, "route": r.get::<_, String>(2)?, "model": model,
                         "status_code": r.get::<_, i64>(4)?, "latency_ms": r.get::<_, i64>(5)?, "client_ip": r.get::<_, Option<String>>(6)?,
-                        "credits": r.get::<_, Option<f64>>(7)?,
+                        "credits": r.get::<_, Option<f64>>(7)?, "tokens_per_second": tps, "effort": r.get::<_, Option<String>>(10)?,
+                        "upstream_cut": r.get::<_, Option<String>>(11)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
-            let mut ms = c.prepare("SELECT DISTINCT model FROM request_logs WHERE model IS NOT NULL ORDER BY model")?;
-            let models: Vec<String> = ms.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-            Ok((total, logs, models))
+            Ok((total, logs, ds::grouped_models(&known)))
         })
     })
     .await;
@@ -1428,40 +1486,13 @@ pub async fn model_costs_view(headers: HeaderMap) -> Response {
     )
 }
 
-pub async fn get_agent_mode(headers: HeaderMap) -> Response {
-    guard!(headers);
-    json_response(
-        200,
-        json!({"mode": settings::agent_mode(), "allowed": settings::AGENT_MODES}),
-    )
-}
-
-pub async fn put_agent_mode(headers: HeaderMap, body: Bytes) -> Response {
-    guard!(headers);
-    let p = match json_body(&body) {
-        Ok(Value::Object(m)) if m.contains_key("mode") => m,
-        Ok(_) => return detail(400, "Expected {\"mode\": \"vibe\"|\"spec\"|\"task\"|\"\"}"),
-        Err(r) => return r,
-    };
-    match settings::set_agent_mode(&p["mode"]) {
-        Err(e) => detail(400, e.to_string()),
-        Ok(Err(e)) => detail(500, format!("Could not persist the setting: {e}")),
-        Ok(Ok(m)) => json_response(200, json!({"mode": m})),
-    }
-}
-
 fn prompt_filter_view() -> Value {
     let flags = settings::prompt_flags();
-    let mut sections = prompt_filter::dropped_sections();
-    sections.sort();
     let mut v = json!({
-        "enabled": flags.condense,
         "shortenTools": flags.shorten_tools,
+        "writeHint": flags.write_hint,
         "shortenThreshold": config::get().shorten_tool_threshold,
-        "identity": prompt_filter::KIRO_IDENTITY,
-        "preservedNote": "Only Anthropic's generic sections are dropped. The memory path, environment, language, skills and anything you supplied are preserved.",
         "shortenNote": "Tool descriptions longer than the threshold keep their first paragraph and the lines naming a required parameter. No tool is removed and no schema is changed.",
-        "droppedSections": sections,
     });
     if let Value::Object(m) = prompt_filter::last_stats() {
         v.as_object_mut().unwrap().extend(m);
@@ -1477,18 +1508,18 @@ pub async fn get_prompt_filter(headers: HeaderMap) -> Response {
 pub async fn put_prompt_filter(headers: HeaderMap, body: Bytes) -> Response {
     guard!(headers);
     let p = match json_body(&body) {
-        Ok(Value::Object(m)) if m.contains_key("enabled") || m.contains_key("shortenTools") => m,
+        Ok(Value::Object(m)) if m.contains_key("shortenTools") || m.contains_key("writeHint") => m,
         Ok(_) => {
             return detail(
                 400,
-                "Expected {\"enabled\": true|false} and/or {\"shortenTools\": true|false}",
+                "Expected {\"shortenTools\": true|false, \"writeHint\": true|false}",
             )
         }
         Err(r) => return r,
     };
     for (field, key) in [
-        ("enabled", "condense_claude_prompt"),
         ("shortenTools", "shorten_claude_tools"),
+        ("writeHint", "claude_write_hint"),
     ] {
         let Some(v) = p.get(field) else { continue };
         let Some(b) = v.as_bool() else {
@@ -1499,6 +1530,34 @@ pub async fn put_prompt_filter(headers: HeaderMap, body: Bytes) -> Response {
         }
     }
     json_response(200, prompt_filter_view())
+}
+
+pub async fn refresh_models(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    guard!(headers);
+    let accounts: Vec<_> = state
+        .pool
+        .accounts()
+        .into_iter()
+        .filter(|a| a.auth().is_some())
+        .collect();
+    let results = futures_util::future::join_all(accounts.iter().map(|a| {
+        let pool = state.pool.clone();
+        async move { pool.force_refresh_models(a).await }
+    }))
+    .await;
+    let mut refreshed = 0;
+    let mut failed = Vec::new();
+    for (a, ok) in accounts.iter().zip(results) {
+        if ok {
+            refreshed += 1;
+        } else {
+            failed.push(account_label(&a.id));
+        }
+    }
+    json_response(
+        200,
+        json!({"refreshed": refreshed, "failed": failed, "models": state.pool.all_available_models().len()}),
+    )
 }
 
 pub async fn dashboard_models(State(state): State<Shared>, headers: HeaderMap) -> Response {
@@ -1512,8 +1571,27 @@ pub async fn dashboard_models(State(state): State<Shared>, headers: HeaderMap) -
     }
     json_response(
         200,
-        json!({"models": models.iter().map(|m| json!({"id": m})).collect::<Vec<_>>()}),
+        json!({
+            "models": models.iter().map(|m| json!({"id": m, "listedAs": crate::model_resolver::public_model_id(m), "key": settings::listing_key(m), "listed": settings::is_listed(m)})).collect::<Vec<_>>(),
+            "hidden": settings::unlisted_models(),
+        }),
     )
+}
+
+pub async fn put_dashboard_models(headers: HeaderMap, body: Bytes) -> Response {
+    guard!(headers);
+    let p = match json_object(&body) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let Some(hidden) = p.get("hidden") else {
+        return detail(400, "Expected {\"hidden\": [model ids]}");
+    };
+    match settings::set_unlisted_models(hidden) {
+        Err(e) => detail(400, e.to_string()),
+        Ok(Err(e)) => detail(500, format!("Could not persist the setting: {e}")),
+        Ok(Ok(v)) => json_response(200, json!({"hidden": v})),
+    }
 }
 
 pub async fn metrics(State(state): State<Shared>, headers: HeaderMap) -> Response {

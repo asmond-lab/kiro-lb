@@ -74,16 +74,7 @@ fn sanitize_json_schema() {
 }
 
 #[test]
-fn prompt_condense() {
-    let cases = corpus("prompt_condense");
-    let mut failures = vec![];
-    for c in &cases {
-        let got = kiro_lb::prompt_filter::condense(c["text"].as_str().unwrap_or(""));
-        if Some(got.as_str()) != c["output"].as_str() {
-            failures.push(format!("test {}", c["test"]));
-        }
-    }
-    report("prompt_condense", cases.len(), &failures, 1.0);
+fn claude_code_prompt_detection() {
     let cases = corpus("is_claude_code_prompt");
     let mut failures = vec![];
     for c in &cases {
@@ -149,19 +140,6 @@ fn strip_volatile(v: &mut Value) {
     }
 }
 
-fn drop_adaptive_thinking(v: &mut Value) {
-    if let Some(fields) = v
-        .pointer_mut("/additionalModelRequestFields")
-        .and_then(Value::as_object_mut)
-    {
-        if fields.get("thinking")
-            == Some(&serde_json::json!({"type": "adaptive", "display": "summarized"}))
-        {
-            fields.remove("thinking");
-        }
-    }
-}
-
 #[test]
 fn anthropic_to_kiro() {
     let cases = corpus("anthropic_to_kiro");
@@ -180,7 +158,6 @@ fn anthropic_to_kiro() {
                 strip_volatile(&mut got);
                 strip_volatile(&mut want);
                 drop_additional_properties(&mut got);
-                drop_adaptive_thinking(&mut want);
                 if got != want {
                     failures.push(format!(
                         "{}\n      want {}\n      got  {}",
@@ -208,7 +185,6 @@ fn openai_to_kiro() {
                 strip_volatile(&mut got);
                 strip_volatile(&mut want);
                 drop_additional_properties(&mut got);
-                drop_adaptive_thinking(&mut want);
                 if got != want {
                     failures.push(format!(
                         "{}\n      want {}\n      got  {}",

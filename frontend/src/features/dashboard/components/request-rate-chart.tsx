@@ -6,16 +6,12 @@ import { ReferenceLine } from "@/components/dither-kit/reference-line";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
-import { accountRateSeries } from "../dither-series";
-import { isUnroutable } from "../routing-state";
+import { accountRateSeries, formatClock } from "../dither-series";
+import { isUnroutable, rateGuideReason } from "../routing-state";
 import type { AccountRateSeries } from "../types";
 import type { RequestRate } from "../types";
 import { ChartSkeleton } from "./skeletons";
 import { usePreferences } from "../preferences";
-
-function formatClock(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
 
 
 
@@ -89,7 +85,7 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
       <p className="text-xs text-muted-foreground">
         {series.limitRpm === null ? (
           <>
-            {t("rate.noGuide", { reason: series.limitUnknownReason ?? "" })}
+            {t("rate.noGuide", { reason: rateGuideReason(series.limitUnknownReason, t) })}
             {series.safeRpm > 0 && t("rate.servedSafe", { n: series.safeRpm })}
           </>
         ) : view.nearLimit ? (
@@ -132,9 +128,11 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t("rate.perAccountTitle")}</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <Activity size={16} aria-hidden /> {t("rate.perAccountTitle")}
+        </CardTitle>
         <CardDescription>
-          {rate
+          {rate && rate.bucketStarts.length > 0
             ? t("rate.perAccountDescWindow", {
                 s: rate.bucketSeconds,
                 from: formatClock(rate.bucketStarts[0]),

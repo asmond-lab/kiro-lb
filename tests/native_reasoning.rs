@@ -98,7 +98,10 @@ fn claude_keeps_its_native_fields_for_every_ingress_and_mode() {
             let payload = upstream_payload(facade, "claude-opus-4.8", Some(json!("high")), stream);
             assert_eq!(
                 native_fields(&payload),
-                Some(&json!({"output_config": {"effort": "high"}})),
+                Some(&json!({
+                    "thinking": {"type": "adaptive", "display": "summarized"},
+                    "output_config": {"effort": "high"}
+                })),
                 "{facade:?}, stream={stream}"
             );
         }

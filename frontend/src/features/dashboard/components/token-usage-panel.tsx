@@ -153,12 +153,12 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
-        <CardTitle>{t("tokens.byModel")}</CardTitle>
-        <CardDescription>
-          {t("tokens.byModelDescription")}
-        </CardDescription>
+        <CardTitle className="flex items-center gap-2">
+          <Coins size={16} aria-hidden /> {t("tokens.byModel")}
+        </CardTitle>
+        <CardDescription>{t("tokens.byModelShort")}</CardDescription>
       </CardHeader>
-      <CardContent className="flex-1">
+      <CardContent className="flex flex-1 flex-col">
         {isLoading ? (
           <ChartSkeleton rows={1} />
         ) : totals.totalTokens === 0 ? (
@@ -168,7 +168,7 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
             description={t("tokens.emptyDescription")}
           />
         ) : (
-          <div className="space-y-4">
+          <div className="flex flex-1 flex-col gap-4">
             {/* The donut and legend sit side by side once the card is wide enough,
                 and stack below that. Keyed to the container, not the viewport,
                 because this panel is half-width on a large screen. */}
@@ -189,7 +189,7 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
               <Legend slices={slices} config={config} focused={focused} onFocus={setFocused} />
             </div>
 
-            <dl className="grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">
+            <dl className="mt-auto grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">
               <div>
                 <dt className="text-xs text-muted-foreground">{t("tokens.input")}</dt>
                 <dd className="tabular-nums" title={exactTokens(totals.promptTokens)}>

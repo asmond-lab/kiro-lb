@@ -71,6 +71,11 @@ pub async fn openapi() -> Response {
             "Enable or disable account",
         ),
         ("/api/dashboard/request-rate", "get", "Request rate"),
+        (
+            "/api/dashboard/models/refresh",
+            "post",
+            "Re-read every account's model catalog",
+        ),
         ("/api/dashboard/endpoints", "get", "Get endpoints"),
         ("/api/dashboard/endpoints", "put", "Update endpoints"),
         ("/api/dashboard/endpoints/test", "post", "Test endpoints"),
@@ -89,8 +94,6 @@ pub async fn openapi() -> Response {
         ("/api/dashboard/tunables", "get", "Get tunables"),
         ("/api/dashboard/tunables", "put", "Update tunables"),
         ("/api/dashboard/model-costs", "get", "Model costs"),
-        ("/api/dashboard/agent-mode", "get", "Get agent mode"),
-        ("/api/dashboard/agent-mode", "put", "Update agent mode"),
         ("/api/dashboard/prompt-filter", "get", "Get prompt filter"),
         (
             "/api/dashboard/prompt-filter",
@@ -98,6 +101,11 @@ pub async fn openapi() -> Response {
             "Update prompt filter",
         ),
         ("/api/dashboard/models", "get", "Dashboard models"),
+        (
+            "/api/dashboard/models",
+            "put",
+            "Choose the models listed in /v1/models",
+        ),
     ];
     let mut spec = json!({
         "openapi": "3.0.3",
@@ -138,7 +146,12 @@ pub async fn openapi() -> Response {
         if !params.is_empty() {
             o["parameters"] = Value::Array(params);
         }
-        if matches!(*method, "post" | "put" | "patch") {
+        if *path == "/api/dashboard/models" && *method == "put" {
+            o["requestBody"] = json!({"required": true, "content": {"application/json": {
+                "schema": {"type": "object", "required": ["hidden"], "properties": {"hidden": {"type": "array", "items": {"type": "string"}, "description": "Model ids left out of /v1/models"}}},
+                "example": {"hidden": ["claude-opus-4-5"]},
+            }}});
+        } else if matches!(*method, "post" | "put" | "patch") {
             o["requestBody"] =
                 json!({"content": {"application/json": {"schema": {"type": "object"}}}});
         }

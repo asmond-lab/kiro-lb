@@ -1,16 +1,16 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Eye, ScrollText } from "lucide-react";
+import { Eye, ScrollText, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { dashboardApi, DashboardApiError } from "../api";
+import { dashboardApi } from "../api";
+import { pushError } from "../alerts";
 import {
   formatCredits,
-  formatCreditsLabel,
   formatLatency,
   formatMultiplier,
   formatRelativeTime,
@@ -48,7 +48,6 @@ export function RequestLogTable({
   const { t } = usePreferences();
   const isEmpty = !isLoading && page.total === 0;
   const [detail, setDetail] = useState<RequestLogDetail | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
   const [loadingDetail, setLoadingDetail] = useState<number | null>(null);
   // One shared "now" for every row, ticked coarsely so a long-lived tab does
   // not freeze at "just now"; the lazy initializer keeps the impure Date.now()
@@ -61,11 +60,10 @@ export function RequestLogTable({
 
   const openDetail = async (id: number) => {
     setLoadingDetail(id);
-    setDetailError(null);
     try {
       setDetail(await dashboardApi.requestLogDetail(id));
     } catch (error) {
-      setDetailError(error instanceof DashboardApiError ? error.message : t("logs.loadError"));
+      pushError(error);
     } finally {
       setLoadingDetail(null);
     }
@@ -74,11 +72,11 @@ export function RequestLogTable({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t("logs.title")}</CardTitle>
-        <CardDescription>{t("logs.description")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="flex flex-wrap items-center gap-2">
+        <CardTitle className="flex items-center gap-2">
+          <ScrollText size={16} aria-hidden /> {t("logs.title")}
+        </CardTitle>
+        <CardDescription>{t("logs.short")}</CardDescription>
+        <CardAction className="col-span-full col-start-1 row-span-1 row-start-3 flex flex-wrap items-center justify-start gap-2 justify-self-stretch sm:col-span-1 sm:col-start-2 sm:row-span-2 sm:row-start-1 sm:justify-end sm:justify-self-end">
           <Select value={model || ALL_MODELS} onValueChange={(value) => onModelChange(value === ALL_MODELS ? "" : value)}>
             <SelectTrigger className="w-56" aria-label={t("logs.filterModel")}>
               <SelectValue placeholder={t("logs.allModels")} />
@@ -102,13 +100,9 @@ export function RequestLogTable({
               <SelectItem value="oldest">{t("logs.oldest")}</SelectItem>
             </SelectContent>
           </Select>
-        </div>
-
-        {detailError && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            {detailError}
-          </div>
-        )}
+        </CardAction>
+      </CardHeader>
+      <CardContent className="space-y-4">
 
         {isLoading ? (
           <TableSkeleton rows={Math.min(page.limit, 5)} columns={6} />
@@ -128,11 +122,10 @@ export function RequestLogTable({
             </TableHeader>
             <TableBody>
               {page.logs.map((log, index) => {
-                const spendLabel = formatCreditsLabel(log.credits);
                 return (
                   <TableRow key={log.id ?? `${log.created_at}-${page.offset + index}`}>
                     <TableCell title={formatTimestamp(log.created_at)}>
-                      {formatRelativeTime(now, log.created_at)}
+                      {formatRelativeTime(now, log.created_at, t)}
                     </TableCell>
                     <TableCell className="max-w-[10rem] truncate font-mono text-xs md:max-w-none">{log.route}</TableCell>
                     <TableCell>
@@ -144,16 +137,6 @@ export function RequestLogTable({
                       ) : (
                         "—"
                       )}
-                      {spendLabel ? (
-                        <span className="ml-2 text-xs text-muted-foreground" title={t("logs.creditsSpent")}>
-                          {spendLabel}
-                        </span>
-                      ) : null}
-                      {log.modelMultiplier != null ? (
-                        <span className="ml-2 text-xs text-muted-foreground" title={t("logs.modelMultiplier")}>
-                          {formatMultiplier(log.modelMultiplier)}
-                        </span>
-                      ) : null}
                     </TableCell>
                     <TableCell>
                       {/* Status is the point of the table, so both states must read at a
@@ -164,6 +147,11 @@ export function RequestLogTable({
                       >
                         {log.status_code}
                       </Badge>
+                      {log.upstream_cut ? (
+                        <span className="ml-2 inline-flex align-middle text-warning" title={t("logs.upstreamCutTitle", { what: log.upstream_cut })}>
+                          <TriangleAlert size={14} aria-label={t("logs.upstreamCutTitle", { what: log.upstream_cut })} />
+                        </span>
+                      ) : null}
                     </TableCell>
                     <TableCell className="hidden text-right tabular-nums md:table-cell">
                       {formatLatency(log.latency_ms)}
@@ -252,6 +240,8 @@ export function RequestLogDetailFields({ detail }: { detail: RequestLogDetail })
           }
         />
         <Field label={t("logs.ttft")} value={detail.ttftMs != null ? formatLatency(detail.ttftMs) : "—"} />
+        <Field label={t("logs.effort")} value={detail.effort ?? "—"} />
+        {detail.upstreamCut ? <Field label={t("logs.upstreamCut")} value={detail.upstreamCut} /> : null}
         {detail.creditsSpent != null ? (
           <Field label={t("logs.creditsSpent")} value={formatCredits(detail.creditsSpent)} />
         ) : null}

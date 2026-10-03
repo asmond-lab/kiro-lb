@@ -1,1 +1,3 @@
 static/assets/*.js -whitespace
+static/index.html text eol=lf
+frontend/index.html text eol=lf

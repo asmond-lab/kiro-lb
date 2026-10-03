@@ -99,7 +99,7 @@ impl TunableKey {
 
     fn coerce(&self, raw: &Value) -> Result<Value, InvalidSetting> {
         Ok(match self {
-            TunableKey::TokenRefreshSeconds => json!(bounded_int(raw, 60, 3600)?),
+            TunableKey::TokenRefreshSeconds => json!(bounded_int(raw, 60, 1800)?),
             TunableKey::MaxConcurrency => json!(bounded_int(raw, 0, 512)?),
             TunableKey::MaxAccountConcurrency => json!(bounded_int(raw, 0, 128)?),
             TunableKey::QueueTimeoutSeconds => json!(bounded_int(raw, 1, 600)?),
@@ -187,77 +187,12 @@ pub fn tunables_snapshot() -> Value {
     })
 }
 
-// ----- agent task mode --------------------------------------------------------------------
-
-pub const AGENT_MODES: [&str; 4] = ["", "vibe", "spec", "task"];
-static AGENT_MODE: RwLock<Option<String>> = RwLock::new(None);
-
-fn agent_env_default() -> String {
-    let candidate = config::get().agent_task_type.trim().to_owned();
-    if !AGENT_MODES.contains(&candidate.as_str()) {
-        tracing::warn!(
-            "[AgentMode] Ignoring unknown KIRO_AGENT_TASK_TYPE={candidate:?}; omitting the field"
-        );
-        return String::new();
-    }
-    candidate
-}
-
-pub fn agent_mode() -> String {
-    if let Some(m) = AGENT_MODE.read().as_ref() {
-        return m.clone();
-    }
-    AGENT_MODE
-        .write()
-        .get_or_insert_with(agent_env_default)
-        .clone()
-}
-
-pub fn validate_agent_mode(value: &Value) -> Result<String, InvalidSetting> {
-    match value {
-        Value::Null => Ok(String::new()),
-        Value::String(s) => {
-            let candidate = s.trim();
-            if AGENT_MODES.contains(&candidate) {
-                Ok(candidate.to_owned())
-            } else {
-                let known: Vec<String> = AGENT_MODES.iter().map(|m| format!("'{m}'")).collect();
-                Err(InvalidSetting(format!(
-                    "unknown mode '{candidate}'; allowed values are {}",
-                    known.join(", ")
-                )))
-            }
-        }
-        _ => Err(InvalidSetting("mode must be a string".into())),
-    }
-}
-
-pub fn load_agent_mode() {
-    let mut resolved = agent_env_default();
-    if let Some(stored) = store::load_setting("agent_task_type") {
-        match validate_agent_mode(&stored) {
-            Ok(m) => resolved = m,
-            Err(e) => tracing::warn!("[AgentMode] Ignoring persisted mode: {e}"),
-        }
-    }
-    *AGENT_MODE.write() = Some(resolved);
-}
-
-pub fn set_agent_mode(value: &Value) -> Result<Result<String, String>, InvalidSetting> {
-    let mode = validate_agent_mode(value)?;
-    if let Err(e) = store::save_setting("agent_task_type", &json!(mode)) {
-        return Ok(Err(e.to_string()));
-    }
-    *AGENT_MODE.write() = Some(mode.clone());
-    Ok(Ok(mode))
-}
-
 // ----- prompt filter flags ----------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub struct PromptFilterFlags {
-    pub condense: bool,
     pub shorten_tools: bool,
+    pub write_hint: bool,
 }
 
 static PROMPT_FLAGS: RwLock<Option<PromptFilterFlags>> = RwLock::new(None);
@@ -265,8 +200,8 @@ static PROMPT_FLAGS: RwLock<Option<PromptFilterFlags>> = RwLock::new(None);
 fn prompt_defaults() -> PromptFilterFlags {
     let cfg = config::get();
     PromptFilterFlags {
-        condense: cfg.condense_claude_prompt,
         shorten_tools: cfg.shorten_claude_tools,
+        write_hint: cfg.claude_write_hint,
     }
 }
 
@@ -279,11 +214,11 @@ pub fn prompt_flags() -> PromptFilterFlags {
 
 pub fn load_prompt_flags() {
     let mut flags = prompt_defaults();
-    if let Some(Value::Bool(b)) = store::load_setting("condense_claude_prompt") {
-        flags.condense = b;
-    }
     if let Some(Value::Bool(b)) = store::load_setting("shorten_claude_tools") {
         flags.shorten_tools = b;
+    }
+    if let Some(Value::Bool(b)) = store::load_setting("claude_write_hint") {
+        flags.write_hint = b;
     }
     *PROMPT_FLAGS.write() = Some(flags);
 }
@@ -293,8 +228,8 @@ pub fn set_prompt_flag(key: &str, value: bool) -> Result<(), String> {
     let mut guard = PROMPT_FLAGS.write();
     let flags = guard.get_or_insert_with(prompt_defaults);
     match key {
-        "condense_claude_prompt" => flags.condense = value,
         "shorten_claude_tools" => flags.shorten_tools = value,
+        "claude_write_hint" => flags.write_hint = value,
         _ => {}
     }
     tracing::info!("[PromptFilter] {key} = {value}");
@@ -308,12 +243,60 @@ pub struct EndpointSettings {
     pub rotation: bool,
     pub order: Vec<String>,
     pub cooldown_seconds: f64,
+    pub strategy: String,
+    pub probe_model: String,
+    pub probe_interval_minutes: i64,
 }
 
 impl EndpointSettings {
     pub fn as_json(&self) -> Value {
-        json!({"rotation": self.rotation, "order": self.order, "cooldownSeconds": self.cooldown_seconds})
+        json!({
+            "rotation": self.rotation, "order": self.order, "cooldownSeconds": self.cooldown_seconds,
+            "strategy": self.strategy, "probeModel": self.probe_model, "probeIntervalMinutes": self.probe_interval_minutes,
+        })
     }
+}
+
+pub const PROBE_INTERVAL_MINUTES: (i64, i64) = (5, 1440);
+
+pub fn validate_endpoint_extras(
+    base: EndpointSettings,
+    strategy: &Value,
+    probe_model: &Value,
+    interval: &Value,
+) -> Result<EndpointSettings, InvalidSetting> {
+    let strategy = strategy
+        .as_str()
+        .map(str::trim)
+        .filter(|s| {
+            [
+                crate::upstream::endpoints::ORDERED,
+                crate::upstream::endpoints::FASTEST,
+            ]
+            .contains(s)
+        })
+        .ok_or_else(|| InvalidSetting("strategy must be 'ordered' or 'fastest'".into()))?
+        .to_owned();
+    let probe_model = match probe_model {
+        Value::Null => String::new(),
+        Value::String(s) => s.trim().to_owned(),
+        _ => return Err(InvalidSetting("probeModel must be a string".into())),
+    };
+    let interval = interval
+        .as_i64()
+        .ok_or_else(|| InvalidSetting("probeIntervalMinutes must be an integer".into()))?;
+    if interval != 0 && !(PROBE_INTERVAL_MINUTES.0..=PROBE_INTERVAL_MINUTES.1).contains(&interval) {
+        return Err(InvalidSetting(format!(
+            "probeIntervalMinutes must be 0 (off) or between {} and {}",
+            PROBE_INTERVAL_MINUTES.0, PROBE_INTERVAL_MINUTES.1
+        )));
+    }
+    Ok(EndpointSettings {
+        strategy,
+        probe_model,
+        probe_interval_minutes: interval,
+        ..base
+    })
 }
 
 fn known_keys(keys: &[String]) -> Vec<String> {
@@ -343,6 +326,9 @@ fn endpoint_env_defaults() -> EndpointSettings {
         rotation: cfg.endpoint_rotation,
         order,
         cooldown_seconds: cfg.endpoint_cooldown_seconds,
+        strategy: crate::upstream::endpoints::FASTEST.into(),
+        probe_model: String::new(),
+        probe_interval_minutes: 0,
     }
 }
 
@@ -402,6 +388,9 @@ pub fn validate_endpoints(
         rotation,
         order: resolved,
         cooldown_seconds: cooldown,
+        strategy: crate::upstream::endpoints::ORDERED.into(),
+        probe_model: String::new(),
+        probe_interval_minutes: 0,
     })
 }
 
@@ -430,20 +419,37 @@ pub fn load_endpoint_settings() {
             .get("cooldownSeconds")
             .cloned()
             .unwrap_or(json!(defaults.cooldown_seconds));
-        match validate_endpoints(&rotation, &order, &cooldown) {
+        let strategy = p
+            .get("strategy")
+            .cloned()
+            .unwrap_or(json!(defaults.strategy));
+        let probe_model = p
+            .get("probeModel")
+            .cloned()
+            .unwrap_or(json!(defaults.probe_model));
+        let interval = p
+            .get("probeIntervalMinutes")
+            .cloned()
+            .unwrap_or(json!(defaults.probe_interval_minutes));
+        match validate_endpoints(&rotation, &order, &cooldown)
+            .and_then(|s| validate_endpoint_extras(s, &strategy, &probe_model, &interval))
+        {
             Ok(s) => settings = s,
             Err(e) => tracing::warn!("[Endpoints] Ignoring persisted settings: {e}"),
         }
     }
     *ENDPOINTS.write() = Some(settings);
+    crate::upstream::endpoints::load_latency();
 }
 
 pub fn update_endpoints(
     rotation: &Value,
     order: &Value,
     cooldown: &Value,
+    extras: (&Value, &Value, &Value),
 ) -> Result<Result<EndpointSettings, String>, InvalidSetting> {
-    let settings = validate_endpoints(rotation, order, cooldown)?;
+    let settings = validate_endpoints(rotation, order, cooldown)
+        .and_then(|s| validate_endpoint_extras(s, extras.0, extras.1, extras.2))?;
     if let Err(e) = store::save_setting("endpoints", &settings.as_json()) {
         return Ok(Err(e.to_string()));
     }
@@ -451,16 +457,129 @@ pub fn update_endpoints(
     Ok(Ok(settings))
 }
 
+static UNLISTED_MODELS: RwLock<Option<Vec<String>>> = RwLock::new(None);
+
+pub fn listing_key(model: &str) -> String {
+    crate::model_resolver::get_model_id_for_kiro(model)
+}
+
+pub fn load_unlisted_models() {
+    let saved = store::load_setting("unlisted_models")
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default();
+    *UNLISTED_MODELS.write() = Some(saved);
+}
+
+pub fn unlisted_models() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in UNLISTED_MODELS
+        .read()
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| listing_key(m))
+    {
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+pub fn is_listed(model: &str) -> bool {
+    let key = listing_key(model);
+    !UNLISTED_MODELS
+        .read()
+        .as_ref()
+        .is_some_and(|v| v.iter().any(|h| listing_key(h) == key))
+}
+
+pub fn set_unlisted_models(value: &Value) -> Result<Result<Vec<String>, String>, InvalidSetting> {
+    let list = value
+        .as_array()
+        .ok_or_else(|| InvalidSetting("hidden must be a list of model ids".into()))?;
+    let mut out: Vec<String> = Vec::new();
+    for v in list {
+        let id = v
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| InvalidSetting("hidden must be a list of model ids".into()))?;
+        let key = listing_key(id);
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out.sort();
+    if let Err(e) = store::save_setting("unlisted_models", &json!(out)) {
+        return Ok(Err(e.to_string()));
+    }
+    *UNLISTED_MODELS.write() = Some(out.clone());
+    Ok(Ok(out))
+}
+
+const RELEASE_DEFAULTS: &str = "0.2.8";
+
+/// Turns on this release's recommended settings once, on the first start after
+/// the update: tool shortening, the Write/Edit hint and the `fastest` endpoint
+/// order. A value pinned by an environment variable is left alone, and later
+/// dashboard changes stick because the marker stops this from running again.
+fn apply_release_defaults() {
+    if store::load_setting("release_defaults").and_then(|v| v.as_str().map(str::to_owned))
+        == Some(RELEASE_DEFAULTS.to_owned())
+    {
+        return;
+    }
+    let mut written = Ok(());
+    for (env, key) in [
+        ("SHORTEN_CLAUDE_TOOLS", "shorten_claude_tools"),
+        ("CLAUDE_WRITE_HINT", "claude_write_hint"),
+    ] {
+        if std::env::var_os(env).is_none() {
+            written = written.and(store::save_setting(key, &json!(true)));
+        }
+    }
+    let mut endpoints = match store::load_setting("endpoints") {
+        Some(Value::Object(m)) => m,
+        _ => endpoint_env_defaults()
+            .as_json()
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    if std::env::var_os("KIRO_ENDPOINT_ROTATION").is_none() {
+        endpoints.insert("rotation".into(), json!(true));
+    }
+    endpoints.insert(
+        "strategy".into(),
+        json!(crate::upstream::endpoints::FASTEST),
+    );
+    written = written.and(store::save_setting("endpoints", &Value::Object(endpoints)));
+    if let Err(e) = written {
+        tracing::warn!(
+            "[Settings] Could not apply the {RELEASE_DEFAULTS} defaults; retrying next start: {e}"
+        );
+        return;
+    }
+    match store::save_setting("release_defaults", &json!(RELEASE_DEFAULTS)) {
+        Ok(()) => tracing::info!(
+            "[Settings] Applied {RELEASE_DEFAULTS} defaults: tool shortening, Write/Edit hint, fastest endpoint order"
+        ),
+        Err(e) => tracing::warn!("[Settings] Could not record the {RELEASE_DEFAULTS} defaults: {e}"),
+    }
+}
+
 pub fn load_all() {
+    apply_release_defaults();
+    load_unlisted_models();
     load_endpoint_settings();
     load_prompt_flags();
-    load_agent_mode();
     load_tunables();
 }
 
-pub fn set_prompt_flag_for_test(condense: bool, shorten_tools: bool) {
+pub fn set_prompt_flag_for_test(shorten_tools: bool) {
     *PROMPT_FLAGS.write() = Some(PromptFilterFlags {
-        condense,
         shorten_tools,
+        write_hint: false,
     });
 }
