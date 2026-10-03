@@ -58,6 +58,60 @@ pub struct AccountState {
     pub quota_overage_enabled: Option<bool>,
     pub stats: AccountStats,
     pub sessions: i64,
+    /// Effective subscription tier: the latest upstream `subscription_type`
+    /// when one is known, otherwise the tier the account was registered with.
+    pub tier: Option<String>,
+}
+
+fn registered_tier(config: &Value) -> Option<String> {
+    config
+        .get("tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+}
+
+/// The usage API reports "Unknown" when it has no subscription info; that is
+/// absence of evidence and must not override the registered tier.
+fn known_subscription_type(subscription_type: Option<&str>) -> Option<&str> {
+    subscription_type
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("unknown"))
+}
+
+fn is_free_tier(s: &AccountState, free_types: &[String]) -> bool {
+    s.tier
+        .as_deref()
+        .is_some_and(|tier| free_types.iter().any(|f| f.eq_ignore_ascii_case(tier)))
+}
+
+/// For a model listed in `FREE_ROUTING_MODELS`, keeps only free-tier accounts
+/// in their existing strategy order. With `fallback`, the other accounts follow
+/// them so the request is still served when no free account is eligible;
+/// without it they are dropped and the request sees no account. Other models
+/// are returned untouched. Weights are never changed here.
+fn free_routing_order(
+    accounts: Vec<Arc<Account>>,
+    model: &str,
+    routing_models: &[String],
+    free_types: &[String],
+    fallback: bool,
+) -> Vec<Arc<Account>> {
+    let normalized = normalize_model_name(model);
+    if !routing_models
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(&normalized))
+    {
+        return accounts;
+    }
+    let (mut free, rest): (Vec<_>, Vec<_>) = accounts
+        .into_iter()
+        .partition(|a| is_free_tier(&a.state.lock(), free_types));
+    if fallback {
+        free.extend(rest);
+    }
+    free
 }
 
 pub struct Account {
@@ -381,7 +435,10 @@ impl AccountManager {
                         config: entry.clone(),
                         auth: Mutex::new(None),
                         models: Arc::new(ModelInfoCache::new()),
-                        state: Mutex::new(AccountState::default()),
+                        state: Mutex::new(AccountState {
+                            tier: registered_tier(&entry),
+                            ..Default::default()
+                        }),
                         init: tokio::sync::Mutex::new(()),
                         init_retry_at: Mutex::new(None),
                         init_failures: 0.into(),
@@ -514,7 +571,19 @@ impl AccountManager {
         let headroom = store::load_quota_headroom();
         let period = store::load_quota_period();
         let observed = store::load_quota_observed_at();
+        let subscriptions = store::load_subscription_types();
         let inner = self.inner.lock();
+        for (id, subscription_type) in subscriptions {
+            let Some(known) = known_subscription_type(Some(&subscription_type)) else {
+                continue;
+            };
+            if let Some(a) = inner.accounts.get(&id) {
+                let mut state = a.state.lock();
+                if state.login_identity.as_deref() == store::login_identity(&id).as_deref() {
+                    state.tier = Some(known.to_owned());
+                }
+            }
+        }
         for (id, observed_at) in observed {
             if let Some(a) = inner.accounts.get(&id) {
                 let mut state = a.state.lock();
@@ -545,6 +614,7 @@ impl AccountManager {
     fn bind_login_state(&self, a: &Account, identity: Option<&str>) {
         let mut restored = AccountState {
             login_identity: identity.map(str::to_owned),
+            tier: registered_tier(&a.config),
             ..Default::default()
         };
         if let (Some(identity), Some(state)) = (identity, store::load_runtime_state()) {
@@ -1124,7 +1194,14 @@ impl AccountManager {
         if let Some(pinned) = pinned {
             accounts.insert(0, pinned);
         }
-        accounts
+        let cfg = config::get();
+        free_routing_order(
+            accounts,
+            model,
+            &cfg.free_routing_models,
+            &cfg.free_tier_subscription_types,
+            settings::tunables().free_routing_fallback,
+        )
     }
 
     pub async fn next_account(
@@ -1158,8 +1235,11 @@ impl AccountManager {
         session: Option<u64>,
         last_resort: bool,
     ) -> Option<Arc<Account>> {
+        // A one-account pool is tried even when unhealthy. Measured on the whole
+        // pool, not the candidate list, so free-tier routing narrowing the list
+        // to one account does not bypass its health checks.
+        let single = self.inner.lock().order.len() == 1;
         let candidates = self.candidate_order(model, session);
-        let single = candidates.len() == 1;
         let cfg = config::get();
         let mut unsupported = None;
         for a in candidates {
@@ -1631,6 +1711,25 @@ impl AccountManager {
         }
     }
 
+    /// Records the upstream subscription type from a usage poll so it outranks
+    /// the registered tier hint. Ignored for a replaced login or when upstream
+    /// reports no subscription info.
+    pub fn set_subscription_type(
+        &self,
+        id: &str,
+        login_identity: &str,
+        subscription_type: Option<&str>,
+    ) {
+        let Some(known) = known_subscription_type(subscription_type) else {
+            return;
+        };
+        let Some(a) = self.get(id) else { return };
+        let mut s = a.state.lock();
+        if s.login_identity.as_deref() == Some(login_identity) {
+            s.tier = Some(known.to_owned());
+        }
+    }
+
     pub fn drain_unsaved_observations(&self) -> Vec<RateObservation> {
         std::mem::take(&mut self.inner.lock().unsaved)
     }
@@ -1911,6 +2010,73 @@ mod tests {
         drop(state);
         assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
         assert!(pool.inner.lock().observations.is_empty());
+    }
+
+    fn tiered(id: &str, tier: Option<&str>) -> Arc<Account> {
+        let a = account(id);
+        a.state.lock().tier = tier.map(str::to_owned);
+        a
+    }
+
+    fn ids(accounts: &[Arc<Account>]) -> Vec<&str> {
+        accounts.iter().map(|a| a.id.as_str()).collect()
+    }
+
+    #[test]
+    fn free_routing_keeps_only_free_accounts_in_strategy_order() {
+        let models = vec!["claude-sonnet-4.5".to_owned()];
+        let free = vec!["Free".to_owned()];
+        let pool = vec![
+            tiered("pro-1", Some("Pro")),
+            tiered("free-1", Some("FREE")),
+            tiered("unknown", None),
+            tiered("free-2", Some("free")),
+        ];
+
+        for model in ["claude-sonnet-4.5", "claude-sonnet-4-5-20250929"] {
+            let only_free = free_routing_order(pool.clone(), model, &models, &free, false);
+            assert_eq!(ids(&only_free), ["free-1", "free-2"], "{model}");
+            let preferred = free_routing_order(pool.clone(), model, &models, &free, true);
+            assert_eq!(
+                ids(&preferred),
+                ["free-1", "free-2", "pro-1", "unknown"],
+                "{model}"
+            );
+        }
+
+        let other = free_routing_order(pool.clone(), "claude-opus-4.6", &models, &free, false);
+        assert_eq!(ids(&other), ["pro-1", "free-1", "unknown", "free-2"]);
+    }
+
+    #[test]
+    fn free_routing_without_free_accounts_falls_back_only_when_enabled() {
+        let models = vec!["claude-sonnet-4.5".to_owned()];
+        let free = vec!["Free".to_owned()];
+        let pool = vec![tiered("pro-1", Some("Pro")), tiered("unknown", None)];
+
+        let fallback = free_routing_order(pool.clone(), "claude-sonnet-4.5", &models, &free, true);
+        assert_eq!(ids(&fallback), ["pro-1", "unknown"]);
+        let strict = free_routing_order(pool, "claude-sonnet-4.5", &models, &free, false);
+        assert!(strict.is_empty());
+    }
+
+    #[test]
+    fn upstream_subscription_type_overrides_the_registered_tier() {
+        let pool = AccountManager::new(reqwest::Client::new());
+        let a = tiered("a", Some("free"));
+        a.state.lock().login_identity = Some("login".into());
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("a".into());
+            inner.accounts.insert("a".into(), a.clone());
+        }
+
+        pool.set_subscription_type("a", "login", Some("Unknown"));
+        assert_eq!(a.state.lock().tier.as_deref(), Some("free"));
+        pool.set_subscription_type("a", "other-login", Some("Pro"));
+        assert_eq!(a.state.lock().tier.as_deref(), Some("free"));
+        pool.set_subscription_type("a", "login", Some("Pro"));
+        assert_eq!(a.state.lock().tier.as_deref(), Some("Pro"));
     }
 }
 

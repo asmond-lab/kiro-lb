@@ -18,6 +18,15 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn env_list(name: &str, default: &str) -> Vec<String> {
+    env_str(name, default)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn bounded_debug_int(name: &str, default: i64, min: i64, max: i64) -> i64 {
     match std::env::var(name)
         .ok()
@@ -146,6 +155,10 @@ pub struct Config {
     pub data_dir: String,
     pub kiro_slot: String,
     pub handoff_secret: String,
+    /// Normalized model names served only by free-tier accounts.
+    pub free_routing_models: Vec<String>,
+    /// Subscription types (case-insensitive) that count as free tier.
+    pub free_tier_subscription_types: Vec<String>,
 }
 
 impl Config {
@@ -225,6 +238,11 @@ impl Config {
             data_dir: env_str("DASHBOARD_DATA_DIR", "data"),
             kiro_slot: env_str("KIRO_SLOT", ""),
             handoff_secret: env_str("HANDOFF_SECRET", ""),
+            free_routing_models: env_list("FREE_ROUTING_MODELS", "claude-sonnet-4.5")
+                .iter()
+                .map(|m| crate::model_resolver::normalize_model_name(m))
+                .collect(),
+            free_tier_subscription_types: env_list("FREE_TIER_SUBSCRIPTION_TYPES", "Free"),
         }
     }
 }

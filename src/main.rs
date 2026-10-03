@@ -163,6 +163,10 @@ fn router(state: app::Shared) -> Router {
         .route("/_internal/handoff/quiesce", post(d::handoff_quiesce))
         .route("/_internal/handoff/activate", post(d::handoff_activate))
         .route("/_internal/handoff/ready", get(d::handoff_ready))
+        .route(
+            "/_internal/accounts/register",
+            post(d::internal_register_account),
+        )
         .fallback(|method: Method, uri: Uri| async move {
             if method == Method::GET || method == Method::HEAD {
                 static_file(uri).await

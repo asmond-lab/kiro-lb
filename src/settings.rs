@@ -40,6 +40,7 @@ pub struct Tunables {
     pub max_concurrency: i64,
     pub max_account_concurrency: i64,
     pub queue_timeout_seconds: i64,
+    pub free_routing_fallback: bool,
 }
 
 impl Tunables {
@@ -56,6 +57,7 @@ impl Tunables {
             max_concurrency: 0,
             max_account_concurrency: 0,
             queue_timeout_seconds: 30,
+            free_routing_fallback: true,
         }
     }
 }
@@ -66,15 +68,17 @@ pub enum TunableKey {
     MaxConcurrency,
     MaxAccountConcurrency,
     QueueTimeoutSeconds,
+    FreeRoutingFallback,
 }
 
 impl TunableKey {
-    pub const ALL: [TunableKey; 5] = [
+    pub const ALL: [TunableKey; 6] = [
         TunableKey::TokenRefreshSeconds,
         TunableKey::LoadBalancing,
         TunableKey::MaxConcurrency,
         TunableKey::MaxAccountConcurrency,
         TunableKey::QueueTimeoutSeconds,
+        TunableKey::FreeRoutingFallback,
     ];
 
     pub fn store_key(&self) -> &'static str {
@@ -84,6 +88,7 @@ impl TunableKey {
             TunableKey::MaxConcurrency => "max_concurrency",
             TunableKey::MaxAccountConcurrency => "max_account_concurrency",
             TunableKey::QueueTimeoutSeconds => "queue_timeout_seconds",
+            TunableKey::FreeRoutingFallback => "free_routing_fallback",
         }
     }
 
@@ -94,6 +99,7 @@ impl TunableKey {
             TunableKey::MaxConcurrency => "maxConcurrency",
             TunableKey::MaxAccountConcurrency => "maxAccountConcurrency",
             TunableKey::QueueTimeoutSeconds => "queueTimeoutSeconds",
+            TunableKey::FreeRoutingFallback => "freeRoutingFallback",
         }
     }
 
@@ -103,6 +109,9 @@ impl TunableKey {
             TunableKey::MaxConcurrency => json!(bounded_int(raw, 0, 512)?),
             TunableKey::MaxAccountConcurrency => json!(bounded_int(raw, 0, 128)?),
             TunableKey::QueueTimeoutSeconds => json!(bounded_int(raw, 1, 600)?),
+            TunableKey::FreeRoutingFallback => json!(raw
+                .as_bool()
+                .ok_or_else(|| InvalidSetting("expected a boolean".into()))?),
             TunableKey::LoadBalancing => {
                 let s = raw
                     .as_str()
@@ -136,6 +145,9 @@ impl TunableKey {
                 t.max_account_concurrency = v.as_i64().unwrap_or(0)
             }
             TunableKey::QueueTimeoutSeconds => t.queue_timeout_seconds = v.as_i64().unwrap_or(30),
+            TunableKey::FreeRoutingFallback => {
+                t.free_routing_fallback = v.as_bool().unwrap_or(t.free_routing_fallback)
+            }
         }
     }
 }
@@ -184,6 +196,7 @@ pub fn tunables_snapshot() -> Value {
         "maxConcurrency": t.max_concurrency,
         "maxAccountConcurrency": t.max_account_concurrency,
         "queueTimeoutSeconds": t.queue_timeout_seconds,
+        "freeRoutingFallback": t.free_routing_fallback,
     })
 }
 
