@@ -1,4 +1,8 @@
+import { translate } from "./preferences";
 import type { AccountUsage, KeyUsage } from "./types";
+
+type Translator = (key: string, vars?: Record<string, string | number>) => string;
+const english: Translator = (key, vars) => translate("en-US", key, vars);
 
 // Pinned to en-US like the token formatter below: operator tables read one
 // locale, and seconds add noise the eye never parses at a glance.
@@ -26,13 +30,13 @@ const WEEK = 7 * DAY;
  * time; past a week the absolute date is more useful than "14d ago". Future
  * deltas (clock skew) clamp to "just now" rather than rendering a negative.
  */
-export function formatRelativeTime(nowMs: number, value?: number | null): string {
+export function formatRelativeTime(nowMs: number, value?: number | null, t: Translator = english): string {
   if (value == null) return "—";
   const deltaSeconds = Math.floor((nowMs - value * 1000) / 1000);
-  if (deltaSeconds < MINUTE) return "just now";
-  if (deltaSeconds < HOUR) return `${Math.floor(deltaSeconds / MINUTE)}m ago`;
-  if (deltaSeconds < DAY) return `${Math.floor(deltaSeconds / HOUR)}h ago`;
-  if (deltaSeconds < WEEK) return `${Math.floor(deltaSeconds / DAY)}d ago`;
+  if (deltaSeconds < MINUTE) return t("time.justNow");
+  if (deltaSeconds < HOUR) return t("time.minutesAgo", { n: Math.floor(deltaSeconds / MINUTE) });
+  if (deltaSeconds < DAY) return t("time.hoursAgo", { n: Math.floor(deltaSeconds / HOUR) });
+  if (deltaSeconds < WEEK) return t("time.daysAgo", { n: Math.floor(deltaSeconds / DAY) });
   return formatTimestamp(value);
 }
 

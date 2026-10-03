@@ -114,7 +114,9 @@ export function AccountTokenPanel({
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
-        <CardTitle>{t("tokens.byAccount")}</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <Coins size={16} aria-hidden /> {t("tokens.byAccount")}
+        </CardTitle>
         <CardDescription>
           {t("tokens.byAccountDescription")}
         </CardDescription>

@@ -289,11 +289,16 @@ async fn account_changes_persist_credits_to_the_generation_origin() {
                 br#"{"name":"broken","toolUseId":"tool-1"}{"input":"{\"unterminated\":","toolUseId":"tool-1"}{"stop":true,"toolUseId":"tool-1"}{"unit":"credit","usage":0.07}"#,
             )),
         ]));
-    let mut malformed = stream_core::parse_kiro_stream_metered(malformed, 1.0, 1.0, &request);
-    assert!(matches!(
-        malformed.next().await,
-        Some(Err(StreamError::MalformedToolInput))
-    ));
+    let cut: Vec<_> = stream_core::parse_kiro_stream_metered(malformed, 1.0, 1.0, &request)
+        .collect()
+        .await;
+    assert!(
+        cut.iter().all(Result::is_ok),
+        "a tool call cut off mid-argument ends the turn instead of failing it"
+    );
+    assert!(cut
+        .iter()
+        .any(|e| matches!(e, Ok(KiroEvent::StopReason(s)) if s == "MAX_TOKENS")));
 
     let request_credits = request.usage.lock().credits.unwrap();
     assert!(

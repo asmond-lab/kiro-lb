@@ -65,6 +65,24 @@ pub fn is_credential_dead_status(status: u16) -> bool {
     matches!(status, 400 | 401 | 403)
 }
 
+pub const REFRESH_RETRY_SECONDS: f64 = 30.0;
+
+fn refresh_backoff_error() -> AuthError {
+    AuthError::Other(format!(
+        "Token refresh failed transiently; retrying within {REFRESH_RETRY_SECONDS}s"
+    ))
+}
+
+fn is_transient_refresh_error(e: &AuthError) -> bool {
+    match e {
+        AuthError::Http { status, .. } => *status >= 500 || *status == 429,
+        AuthError::Other(m) => m == REFRESH_NETWORK_ERROR,
+        AuthError::CredentialDead { .. } => false,
+    }
+}
+
+const REFRESH_NETWORK_ERROR: &str = "token refresh request failed";
+
 #[derive(Default, Clone)]
 struct Creds {
     refresh_token: Option<String>,
@@ -503,6 +521,7 @@ pub struct KiroAuth {
     login_identity: Option<String>,
     source_fingerprint: Mutex<Option<String>>,
     refresh_lock: tokio::sync::Mutex<()>,
+    refresh_retry_at: Mutex<f64>,
     auth_type: AuthType,
     refresh_url: String,
     pub api_region: String,
@@ -535,6 +554,7 @@ impl KiroAuth {
             login_identity,
             source_fingerprint: Mutex::new(source_fingerprint),
             refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_retry_at: Mutex::new(0.0),
             auth_type: AuthType::KiroDesktop,
             refresh_url: String::new(),
             api_region: String::new(),
@@ -749,6 +769,12 @@ impl KiroAuth {
         if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
             return Ok(t);
         }
+        if let Some(t) = self.token_during_refresh_backoff() {
+            return Ok(t);
+        }
+        if self.in_refresh_backoff() {
+            return Err(refresh_backoff_error());
+        }
         let _guard = self.refresh_lock.lock().await;
         if !self.is_current_login() {
             return Err(AuthError::Other(
@@ -757,6 +783,12 @@ impl KiroAuth {
         }
         if let Some(t) = self.cached_token().filter(|_| !self.expiring_soon()) {
             return Ok(t);
+        }
+        if let Some(t) = self.token_during_refresh_backoff() {
+            return Ok(t);
+        }
+        if self.in_refresh_backoff() {
+            return Err(refresh_backoff_error());
         }
         if matches!(self.source, Source::Sqlite(_)) {
             if !self.reload_raw_external() {
@@ -781,10 +813,32 @@ impl KiroAuth {
                 }
                 return Err(AuthError::Other("Token expired and refresh failed. Please run 'kiro-cli login' to refresh your credentials.".into()));
             }
+            Err(e) if is_transient_refresh_error(&e) => {
+                *self.refresh_retry_at.lock() = now() + REFRESH_RETRY_SECONDS;
+                if let Some(t) = self.cached_token().filter(|_| !self.expired()) {
+                    tracing::warn!(
+                        "Token refresh failed ({e}); using the current access token and retrying in {REFRESH_RETRY_SECONDS}s"
+                    );
+                    return Ok(t);
+                }
+                return Err(e);
+            }
             Err(e) => return Err(self.dead(e)),
         }
+        *self.refresh_retry_at.lock() = 0.0;
         self.cached_token()
             .ok_or_else(|| AuthError::Other("Failed to obtain access token".into()))
+    }
+
+    fn in_refresh_backoff(&self) -> bool {
+        *self.refresh_retry_at.lock() > now()
+    }
+
+    fn token_during_refresh_backoff(&self) -> Option<String> {
+        if *self.refresh_retry_at.lock() <= now() {
+            return None;
+        }
+        self.cached_token().filter(|_| !self.expired())
     }
 
     pub async fn force_refresh(&self) -> Result<String, AuthError> {
@@ -969,7 +1023,7 @@ impl KiroAuth {
         }
         let resp = req.send().await.map_err(|e| {
             tracing::error!("Token refresh request failed: {e}");
-            AuthError::Other("token refresh request failed".into())
+            AuthError::Other(REFRESH_NETWORK_ERROR.into())
         })?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();

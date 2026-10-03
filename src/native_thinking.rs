@@ -13,6 +13,8 @@ pub const NATIVE_THINKING_MODELS: &[&str] = &[
     "claude-opus-5",
     "claude-opus-5.5",
     "claude-sonnet-4.6",
+    "claude-sonnet-5",
+    "claude-sonnet-5.5",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -120,6 +122,6 @@ pub fn apply_native_thinking(payload: &mut Value, model_id: &str, effort: Option
         let Some(e) = normalize_effort(effort) else {
             return;
         };
-        payload["additionalModelRequestFields"] = json!({"output_config": {"effort": e}});
+        payload["additionalModelRequestFields"] = json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": e}});
     }
 }

@@ -47,13 +47,13 @@ kiro-lb/
 | Device login | `src/device_login.rs` | Social + Builder ID flows |
 | SQLite persistence | `src/store.rs`, `src/dashboard_store.rs` | WAL, additive migrations |
 | Dashboard API | `src/routes_dashboard.rs` | `/api/dashboard/*`, `/metrics`, handoff |
-| Runtime settings | `src/settings.rs` | Tunables, agent mode, prompt filter |
+| Runtime settings | `src/settings.rs` | Tunables, endpoint rotation, tool shortening |
 | Prometheus exposition | `src/metrics.rs` | Model labels clamped |
 | Token accounting | `src/usage_tracking.rs` | Per key, account, model; batched flush |
 | Token counting | `src/tokenizer.rs` | Per-family encoding + CJK-only correction |
 | Model names | `src/model_resolver.rs` | Never rejects; unknown names pass through |
 | Payload guard | `src/payload_guard.rs` | cl100k tokens of the compact JSON |
-| Claude Code prompt reduction | `src/prompt_filter.rs` | Condense + shorten tool descriptions |
+| Claude Code tool shortening | `src/prompt_filter.rs` | Shorten long tool descriptions and add the Write/Edit note (on by default) |
 | Debug capture / replay | `src/debug.rs` | `kirolb replay <capture>` |
 
 ## CONVENTIONS
@@ -125,8 +125,39 @@ kiro-lb/
 - Closing idle upstream connections early. Each new TLS connection to Kiro
   costs ~340ms and a reader idles longer than 90s between prompts; the pool
   keeps connections 30 min with an HTTP/2 PING every 20s.
-- Trusting the advertised context window. `claude-opus-4.7`, `-4.8`, `-5`,
-  `-5.5` and `claude-sonnet-5` report 1000000 but charge against 666667.
+- Shrinking the 1M window to 666667. `contextUsagePercentage` is a share of the
+  advertised window for every model; the newer Claude tokenizer spends more
+  tokens on Latin text (1.38x English vs Opus 4.6), while digits and Hangul
+  measure the same on both generations, which a smaller window would not.
+- Dropping the adaptive `thinking` block from Claude reasoning requests. Without
+  it `claude-sonnet-5` never streams reasoning and `claude-sonnet-5.5` skips it
+  at low effort (2026-10-02).
+- Listing dotted Claude ids in `/v1/models`. Anthropic clients key display
+  names, effort levels and the 1M badge on the hyphenated id
+  (`claude-opus-5-5`); both spellings resolve to the same Kiro id.
+- Moving a session pin on a transient failure. A burst limit or a full slot
+  lets another account answer that turn; the pin moves only when its account
+  is suspended, signed out, out of quota or lacks the model. Pins persist with
+  the runtime state and are dropped when expired or bound to another login.
+- Rewriting the Claude Code system prompt. The removed condenser also dropped
+  the security policy before the first heading and untitled user instructions.
+- Counting `count_tokens` or `/v1/models` as traffic. Clients send one
+  `count_tokens` per tool, skill and memory file after each turn; the overview
+  and `/metrics` traffic series count generation routes only.
+- Measuring time to first token from the upstream response. Kiro sends headers
+  only when the first token is ready, so it is measured from request arrival.
+- Returning an upstream context overflow as a generic error. It goes out in each
+  provider's shape (`prompt is too long: N tokens > M maximum`,
+  `context_length_exceeded`) so clients compact and retry.
+- Failing the stream on a tool call Kiro cut off. Kiro ends a response after a
+  few minutes or ~32k output tokens, thinking included, and sends a long tool
+  argument only when it is complete; a 500 made Claude Code resend the same
+  request in a loop. A cut call is dropped and the turn ends as `max_tokens`.
+- Sending `access-control-allow-origin: *` on `/api/dashboard`. Only `/v1`
+  answers any origin; with `DASHBOARD_AUTH=false` the dashboard also refuses
+  cross-site requests, since no cookie stands in the way.
+- Answering a spent pool with 503. Clients retry 5xx; a missing model, an
+  exhausted monthly quota or a suspended pool gets 404/402/403 instead.
 - Rejecting unknown model names, or suggesting a model from another family.
 - Labelling a Prometheus series with a raw model name.
 - Sharing one machine id across accounts, or mixing CLI markers into the IDE

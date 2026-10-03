@@ -3,12 +3,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 
 export function StatCardSkeleton() {
   return (
-    <Card>
-      <CardHeader className="gap-3 pb-2">
-        <Skeleton className="h-3.5 w-24" />
-        <Skeleton className="h-8 w-20" />
-      </CardHeader>
-    </Card>
+    <div className="flex items-center gap-3 bg-card px-4 py-3">
+      <Skeleton className="size-8 rounded-md" />
+      <div className="space-y-1.5">
+        <Skeleton className="h-3 w-20" />
+        <Skeleton className="h-5 w-16" />
+      </div>
+    </div>
   );
 }
 

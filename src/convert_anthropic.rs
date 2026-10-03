@@ -51,28 +51,11 @@ fn reasoning_signature(content: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn condense_texts(texts: Vec<String>) -> Vec<String> {
-    if !settings::prompt_flags().condense {
-        return texts;
-    }
-    let (filtered, stats) = prompt_filter::filter_blocks(&texts);
-    if stats.blocks_condensed > 0 {
-        tracing::debug!(
-            "[PromptFilter] Condensed {} block(s): {} -> {} chars",
-            stats.blocks_condensed,
-            stats.chars_before,
-            stats.chars_after
-        );
-    }
-    prompt_filter::record_condense(stats);
-    filtered
-}
-
 pub fn extract_system_prompt(system: &Value) -> String {
     match system {
         Value::Null => String::new(),
         Value::String(s) if s.is_empty() => String::new(),
-        Value::String(s) => condense_texts(vec![s.clone()]).remove(0),
+        Value::String(s) => s.clone(),
         Value::Array(items) => {
             let texts: Vec<String> = items
                 .iter()
@@ -84,7 +67,7 @@ pub fn extract_system_prompt(system: &Value) -> String {
                         .to_owned()
                 })
                 .collect();
-            condense_texts(texts).join("\n")
+            texts.join("\n")
         }
         other => other.to_string(),
     }
@@ -193,7 +176,9 @@ fn required_fields(schema: Option<&Value>) -> Vec<String> {
 
 pub fn convert_tools(tools: Option<&Value>, claude_code: bool) -> Option<Vec<UnifiedTool>> {
     let list = tools?.as_array().filter(|t| !t.is_empty())?;
-    let shorten = claude_code && settings::prompt_flags().shorten_tools;
+    let flags = settings::prompt_flags();
+    let shorten = claude_code && flags.shorten_tools;
+    let write_hint = claude_code && flags.write_hint;
     let limit = config::get().shorten_tool_threshold;
     let mut stats = prompt_filter::ShortenStats::default();
     let out: Vec<UnifiedTool> = list
@@ -216,12 +201,16 @@ pub fn convert_tools(tools: Option<&Value>, claude_code: bool) -> Option<Vec<Uni
                 }
                 stats.bytes_after += description.as_ref().map_or(0, String::len);
             }
+            let name = t
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if write_hint {
+                description = prompt_filter::with_write_hint(&name, description);
+            }
             UnifiedTool {
-                name: t
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
+                name,
                 description,
                 input_schema: schema,
             }

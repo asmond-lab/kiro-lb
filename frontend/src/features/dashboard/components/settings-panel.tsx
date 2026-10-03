@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import {
   Check,
   Coins,
@@ -12,7 +12,6 @@ import {
   TriangleAlert,
   Users,
   Waves,
-  Workflow,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,9 +20,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { dashboardApi, DashboardApiError } from "../api";
+import { dashboardApi } from "../api";
 import type {
-  AgentModeSettings,
+  EndpointStrategy,
   EndpointPingResult,
   EndpointTestResult,
   DataOverview,
@@ -39,18 +38,16 @@ import type {
 import { usePreferences } from "../preferences";
 import { compareModels } from "../model-family";
 import { ModelMark } from "./model-marks";
-import { describeShortenStats, loadBalancingHelp, loadBalancingLabel } from "./routing-labels";
+import { ModelListingCard } from "./model-listing-card";
+import { pushError } from "../alerts";
+import { describeLatency, describeShortenStats, loadBalancingHelp, loadBalancingLabel } from "./routing-labels";
 
-const UNEXPECTED = "unexpected-error";
-
-const describe = (error: unknown) => (error instanceof DashboardApiError ? error.message : UNEXPECTED);
 
 type BusyKind =
   | "save"
   | "test"
   | "ping"
   | "prompt"
-  | "mode"
   | "tunables"
   | "clear-text"
   | "clear-logs"
@@ -58,7 +55,6 @@ type BusyKind =
   | "proxies";
 
 // Radix Select reserves the empty string, so the "omit" choice needs a stand-in.
-const OMIT_VALUE = "__omit__";
 
 /** Moves a key to an absolute position, so the first row can be dragged down. */
 function reorder(order: string[], key: string, targetIndex: number): string[] {
@@ -73,29 +69,33 @@ function reorder(order: string[], key: string, targetIndex: number): string[] {
 export type SettingsPanelProps = {
   /** Raises a success message into the app-wide notice banner. */
   onNotice: (message: string) => void;
+  leading?: ReactNode;
 };
 
-export function SettingsPanel({ onNotice }: SettingsPanelProps) {
+const AUTO_PROBE_MODEL = "__auto__";
+
+export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
   const { t } = usePreferences();
   const [endpoints, setEndpoints] = useState<EndpointsResponse | null>(null);
   const [promptFilter, setPromptFilter] = useState<PromptFilterSettings | null>(null);
-  const [agentMode, setAgentMode] = useState<AgentModeSettings | null>(null);
   const [order, setOrder] = useState<string[]>([]);
   const [rotation, setRotation] = useState(false);
   const [cooldown, setCooldown] = useState(30);
+  const [strategy, setStrategy] = useState<EndpointStrategy>("ordered");
+  const [probeModel, setProbeModel] = useState("");
+  const [probeInterval, setProbeInterval] = useState(0);
+  const [modelIds, setModelIds] = useState<string[]>([]);
   const [busy, setBusy] = useState<BusyKind | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<EndpointTestResponse | null>(null);
   const [pingResult, setPingResult] = useState<EndpointPingResponse | null>(null);
   const [reps, setReps] = useState(1);
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const [tunables, setTunables] = useState<GatewayTunables | null>(null);
-  const [refreshSeconds, setRefreshSeconds] = useState(600);
+  const [refreshSeconds, setRefreshSeconds] = useState(960);
   const [data, setData] = useState<DataOverview | null>(null);
   const [costs, setCosts] = useState<ModelCostRow[]>([]);
   const sortedCosts = [...costs].sort((a, b) => compareModels(a.model, b.model));
-  const [costNote, setCostNote] = useState("");
   const [proxies, setProxies] = useState<ProxyChain | null>(null);
   const [proxyText, setProxyText] = useState("");
   const [maxConcurrency, setMaxConcurrency] = useState(0);
@@ -105,10 +105,9 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
 
   const load = useCallback(async () => {
     try {
-      const [endpointData, promptData, modeData, tunableData, dataData, costData, proxyData] = await Promise.all([
+      const [endpointData, promptData, tunableData, dataData, costData, proxyData] = await Promise.all([
         dashboardApi.endpoints(),
         dashboardApi.promptFilter(),
-        dashboardApi.agentMode(),
         dashboardApi.tunables(),
         dashboardApi.dataOverview(),
         dashboardApi.modelCosts(),
@@ -116,7 +115,6 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       ]);
       setEndpoints(endpointData);
       setPromptFilter(promptData);
-      setAgentMode(modeData);
       setTunables(tunableData);
       setRefreshSeconds(tunableData.tokenRefreshSeconds);
       setMaxConcurrency(tunableData.maxConcurrency);
@@ -124,7 +122,6 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       setQueueTimeout(tunableData.queueTimeoutSeconds);
       setData(dataData);
       setCosts(costData.models);
-      setCostNote(costData.note);
       setProxies(proxyData);
       // The stored chain is masked, so it is shown but not edited in place:
       // resubmitting a masked password would send literal asterisks upstream.
@@ -132,9 +129,16 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       setOrder(endpointData.settings.order);
       setRotation(endpointData.settings.rotation);
       setCooldown(endpointData.settings.cooldownSeconds);
+      setStrategy(endpointData.settings.strategy ?? "ordered");
+      setProbeModel(endpointData.settings.probeModel ?? "");
+      setProbeInterval(endpointData.settings.probeIntervalMinutes ?? 0);
+      dashboardApi
+        .dashboardModels()
+        .then((data) => setModelIds(data.models.map((m) => m.id)))
+        .catch(() => setModelIds([]));
       setReps(endpointData.pingRepsDefault);
     } catch (loadError) {
-      setError(describe(loadError));
+      pushError(loadError);
     }
   }, []);
 
@@ -144,11 +148,10 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
 
   const run = async (kind: BusyKind, action: () => Promise<void>) => {
     setBusy(kind);
-    setError(null);
     try {
       await action();
     } catch (actionError) {
-      setError(describe(actionError));
+      pushError(actionError);
     } finally {
       setBusy(null);
     }
@@ -156,8 +159,16 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
 
   const save = () =>
     run("save", async () => {
-      const saved = await dashboardApi.saveEndpoints({ rotation, order, cooldownSeconds: cooldown });
+      const saved = await dashboardApi.saveEndpoints({
+        rotation,
+        order,
+        cooldownSeconds: cooldown,
+        strategy,
+        probeModel,
+        probeIntervalMinutes: probeInterval,
+      });
       setOrder(saved.settings.order);
+      setEndpoints((previous) => (previous ? { ...previous, settings: saved.settings } : previous));
       onNotice(t("settings.savedNotice"));
     });
 
@@ -270,17 +281,34 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       );
     });
 
-  const saveMode = (next: string) =>
-    run("mode", async () => {
-      const saved = await dashboardApi.saveAgentMode(next);
-      setAgentMode((previous) => (previous ? { ...previous, mode: saved.mode } : previous));
-    });
-
-  const togglePrompt = (patch: { enabled?: boolean; shortenTools?: boolean }) =>
+  const togglePrompt = (patch: { shortenTools?: boolean; writeHint?: boolean }) =>
     run("prompt", async () => {
       const saved = await dashboardApi.savePromptFilter(patch);
       setPromptFilter((previous) => (previous ? { ...previous, ...saved } : saved));
     });
+
+  const savedEndpoints = endpoints?.settings;
+  const endpointsDirty =
+    !!savedEndpoints &&
+    (rotation !== savedEndpoints.rotation ||
+      order.join(",") !== savedEndpoints.order.join(",") ||
+      cooldown !== savedEndpoints.cooldownSeconds ||
+      strategy !== (savedEndpoints.strategy ?? "ordered") ||
+      probeModel !== (savedEndpoints.probeModel ?? "") ||
+      probeInterval !== (savedEndpoints.probeIntervalMinutes ?? 0));
+  const savedProxyText = (proxies?.proxies ?? []).map((entry) => entry.url).join("\n");
+  const proxiesDirty =
+    !!proxies &&
+    proxyText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join("\n") !== savedProxyText;
+  const limitsDirty =
+    !!tunables &&
+    (maxConcurrency !== tunables.maxConcurrency ||
+      maxAccountConcurrency !== tunables.maxAccountConcurrency ||
+      queueTimeout !== tunables.queueTimeoutSeconds);
 
   const available = endpoints?.available ?? [];
   const isBusy = busy !== null;
@@ -296,549 +324,548 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-          {error === UNEXPECTED ? t("settings.unexpectedError") : error}
-        </div>
-      )}
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <PlugZap size={16} aria-hidden /> {t("settings.providersTitle")}
-          </CardTitle>
-          <CardDescription>{t("settings.providersDescription")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={rotation}
-              disabled={isBusy}
-              onChange={(event) => setRotation(event.target.checked)}
-            />
-            {t("settings.rotate")}
-          </label>
-          {!rotation && (
-            <p className="text-xs text-muted-foreground">
-              {t("settings.rotationOff")}
-            </p>
-          )}
-
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{t("settings.provider")}</TableHead>
-                <TableHead>{t("settings.url")}</TableHead>
-                <TableHead className="text-right">{t("settings.enabled")}</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((endpoint) => {
-                const position = order.indexOf(endpoint.key);
-                const active = position >= 0;
-                const lastActive = active && order.length === 1;
-                const isDragging = dragKey === endpoint.key;
-                const isTarget = dropIndex === position && dragKey !== null && !isDragging;
-                return (
-                  <TableRow
-                    key={endpoint.key}
-                    draggable={active && !isBusy}
-                    aria-grabbed={isDragging || undefined}
-                    onDragStart={() => setDragKey(endpoint.key)}
-                    onDragEnd={() => {
-                      setDragKey(null);
-                      setDropIndex(null);
-                    }}
-                    onDragOver={(event) => {
-                      if (!active || dragKey === null) return;
-                      event.preventDefault();
-                      setDropIndex(position);
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      if (dragKey === null || !active) return;
-                      setOrder((previous) => reorder(previous, dragKey, position));
-                      setDragKey(null);
-                      setDropIndex(null);
-                    }}
-                    className={[
-                      active && !isBusy ? "cursor-grab" : "",
-                      isDragging ? "opacity-50" : "",
-                      isTarget ? "border-t-2 border-t-primary" : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" ")}
-                  >
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        {active ? (
-                          <span
-                            role="button"
-                            tabIndex={isBusy ? -1 : 0}
-                            aria-label={t("settings.reorderAria", { name: endpoint.name, position: position + 1, total: order.length })}
-                            title={t("settings.reorderTitle")}
-                            className="text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
-                            onKeyDown={(event) => {
-                              if (isBusy) return;
-                              const delta = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
-                              if (delta === 0) return;
-                              event.preventDefault();
-                              setOrder((previous) => reorder(previous, endpoint.key, position + delta));
-                            }}
-                          >
-                            <GripVertical size={14} aria-hidden />
-                          </span>
-                        ) : (
-                          <span className="w-[14px]" />
-                        )}
-                        <span className="font-medium">{endpoint.name}</span>
-                        {active && <Badge variant="secondary">#{position + 1}</Badge>}
-                      </div>
-                    </TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{endpoint.url}</TableCell>
-                    <TableCell className="text-right">
-                      <input
-                        type="checkbox"
-                        checked={active}
-                        disabled={isBusy || lastActive}
-                        aria-label={t("settings.enableAria", { name: endpoint.name })}
-                        title={lastActive ? t("settings.lastProvider") : undefined}
-                        onChange={(event) =>
-                          setOrder((previous) =>
-                            event.target.checked
-                              ? [...previous, endpoint.key]
-                              : previous.filter((key) => key !== endpoint.key),
-                          )
-                        }
-                      />
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-          <p className="text-xs text-muted-foreground">
-            {t("settings.dragHint")}
-          </p>
-
-          <div className="flex flex-wrap items-end gap-4">
-            <div className="space-y-1">
-              <Label htmlFor="cooldown">{t("settings.cooldown")}</Label>
-              <Input
-                id="cooldown"
-                type="number"
-                min={0}
-                max={3600}
-                value={cooldown}
+      <div className="grid gap-6 xl:grid-cols-2">
+        {leading}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <PlugZap size={16} aria-hidden /> {t("settings.providersTitle")}
+            </CardTitle>
+            <CardDescription>{t("settings.providersDescription")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={rotation}
                 disabled={isBusy}
-                className="w-32"
-                onChange={(event) => setCooldown(Number(event.target.value))}
+                onChange={(event) => setRotation(event.target.checked)}
               />
-            </div>
-            <Button onClick={save} disabled={isBusy || order.length === 0}>
-              {busy === "save" ? t("settings.saving") : t("settings.save")}
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+              {t("settings.rotate")}
+            </label>
+            {!rotation && (
+              <p className="text-xs text-muted-foreground">
+                {t("settings.rotationOff")}
+              </p>
+            )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Gauge size={16} aria-hidden /> {t("settings.connectivityTitle")}
-          </CardTitle>
-          <CardDescription className="flex items-start gap-2">
-            <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden />
-            <span>{t("settings.connectivityDescription", { n: pingCost })}</span>
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-end gap-4">
-            <Button variant="secondary" onClick={test} disabled={isBusy}>
-              {busy === "test" ? t("settings.testing") : t("settings.testAll")}
-            </Button>
-            <div className="space-y-1">
-              <Label htmlFor="reps">{t("settings.pingReps")}</Label>
-              <Input
-                id="reps"
-                type="number"
-                min={1}
-                max={endpoints?.pingRepsMax ?? 10}
-                value={reps}
-                disabled={isBusy}
-                className="w-24"
-                onChange={(event) => setReps(Number(event.target.value))}
-              />
-            </div>
-            <Button variant="secondary" onClick={ping} disabled={isBusy}>
-              {busy === "ping" ? t("settings.measuring") : t("settings.ping")}
-            </Button>
-          </div>
-
-          {(busy === "test" || busy === "ping") && (
-            <div className="space-y-1">
-              {available.map((endpoint) => {
-                const done =
-                  (testResult?.results ?? []).some((row) => row.key === endpoint.key) ||
-                  (pingResult?.results ?? []).some((row) => row.key === endpoint.key);
-                const active = checking === endpoint.key;
-                return (
-                  <div key={endpoint.key} className="flex items-center gap-2 text-sm">
-                    {active ? (
-                      <Loader2 size={14} className="animate-spin text-muted-foreground" aria-hidden />
-                    ) : done ? (
-                      <Check size={14} className="text-success" aria-hidden />
-                    ) : (
-                      <span className="inline-block size-[14px]" />
-                    )}
-                    <span className={active ? "font-medium" : done ? "" : "text-muted-foreground"}>
-                      {endpoint.name}
-                    </span>
-                    {active && <span className="text-xs text-muted-foreground">{t("settings.checking")}</span>}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {testResult && (
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>{t("settings.provider")}</TableHead>
-                  <TableHead>{t("settings.result")}</TableHead>
-                  <TableHead className="text-right">{t("settings.firstByte")}</TableHead>
+                  <TableHead>{t("settings.url")}</TableHead>
+                  <TableHead className="text-right">{t("settings.enabled")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {testResult.results.map((row) => (
-                  <TableRow key={row.key}>
-                    <TableCell className="font-medium">{row.name}</TableCell>
-                    <TableCell>
-                      {row.ok ? (
-                        <Badge variant="secondary">{t("settings.accepted")}</Badge>
-                      ) : (
-                        <span className="text-destructive">{row.error ?? t("settings.failed")}</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right">{row.ttfbMs === null ? "—" : `${row.ttfbMs} ms`}</TableCell>
-                  </TableRow>
-                ))}
+                {rows.map((endpoint) => {
+                  const position = order.indexOf(endpoint.key);
+                  const active = position >= 0;
+                  const lastActive = active && order.length === 1;
+                  const isDragging = dragKey === endpoint.key;
+                  const isTarget = dropIndex === position && dragKey !== null && !isDragging;
+                  return (
+                    <TableRow
+                      key={endpoint.key}
+                      draggable={active && !isBusy}
+                      aria-grabbed={isDragging || undefined}
+                      onDragStart={() => setDragKey(endpoint.key)}
+                      onDragEnd={() => {
+                        setDragKey(null);
+                        setDropIndex(null);
+                      }}
+                      onDragOver={(event) => {
+                        if (!active || dragKey === null) return;
+                        event.preventDefault();
+                        setDropIndex(position);
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        if (dragKey === null || !active) return;
+                        setOrder((previous) => reorder(previous, dragKey, position));
+                        setDragKey(null);
+                        setDropIndex(null);
+                      }}
+                      className={[
+                        active && !isBusy ? "cursor-grab" : "",
+                        isDragging ? "opacity-50" : "",
+                        isTarget ? "border-t-2 border-t-primary" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                    >
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          {active ? (
+                            <span
+                              role="button"
+                              tabIndex={isBusy ? -1 : 0}
+                              aria-label={t("settings.reorderAria", { name: endpoint.name, position: position + 1, total: order.length })}
+                              title={t("settings.reorderTitle")}
+                              className="text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
+                              onKeyDown={(event) => {
+                                if (isBusy) return;
+                                const delta = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+                                if (delta === 0) return;
+                                event.preventDefault();
+                                setOrder((previous) => reorder(previous, endpoint.key, position + delta));
+                              }}
+                            >
+                              <GripVertical size={14} aria-hidden />
+                            </span>
+                          ) : (
+                            <span className="w-[14px]" />
+                          )}
+                          <span className="font-medium">{endpoint.name}</span>
+                          {active && <Badge variant="secondary">#{position + 1}</Badge>}
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-muted-foreground">{endpoint.url}</TableCell>
+                      <TableCell className="text-right">
+                        <input
+                          type="checkbox"
+                          checked={active}
+                          disabled={isBusy || lastActive}
+                          aria-label={t("settings.enableAria", { name: endpoint.name })}
+                          title={lastActive ? t("settings.lastProvider") : undefined}
+                          onChange={(event) =>
+                            setOrder((previous) =>
+                              event.target.checked
+                                ? [...previous, endpoint.key]
+                                : previous.filter((key) => key !== endpoint.key),
+                            )
+                          }
+                        />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
-          )}
+            {strategy === "fastest" &&
+              (Object.keys(endpoints?.latency?.medians ?? {}).length === 0 ? (
+                <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+                  <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden />
+                  <span>{describeLatency(endpoints?.latency, endpoints?.region, t)}</span>
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">{describeLatency(endpoints?.latency, endpoints?.region, t)}</p>
+              ))}
 
-          {pingResult && (
-            <div className="space-y-3">
+            <div className="flex flex-wrap items-end gap-4">
+              <div className="inline-grid gap-1">
+                <Label htmlFor="cooldown" className="whitespace-nowrap">{t("settings.cooldown")}</Label>
+                <Input
+                  id="cooldown"
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={cooldown}
+                  disabled={isBusy}
+                  className="w-0 min-w-full"
+                  onChange={(event) => setCooldown(Number(event.target.value))}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="endpoint-strategy">{t("settings.endpointStrategy")}</Label>
+                <Select value={strategy} disabled={isBusy} onValueChange={(value) => setStrategy(value as EndpointStrategy)}>
+                  <SelectTrigger id="endpoint-strategy" className="w-44">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ordered">{t("settings.strategyOrdered")}</SelectItem>
+                    <SelectItem value="fastest">{t("settings.strategyFastest")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {strategy === "fastest" && (
+                <>
+                  <div className="space-y-1">
+                    <Label htmlFor="probe-model">{t("settings.probeModel")}</Label>
+                    <Select
+                      value={probeModel || AUTO_PROBE_MODEL}
+                      disabled={isBusy}
+                      onValueChange={(value) => setProbeModel(value === AUTO_PROBE_MODEL ? "" : value)}
+                    >
+                      <SelectTrigger id="probe-model" className="w-56">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={AUTO_PROBE_MODEL}>{t("settings.probeModelAuto")}</SelectItem>
+                        {modelIds.map((id) => (
+                          <SelectItem key={id} value={id}>
+                            {id}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="inline-grid gap-1">
+                    <Label htmlFor="probe-interval" className="whitespace-nowrap">{t("settings.probeInterval")}</Label>
+                    <Input
+                      id="probe-interval"
+                      type="number"
+                      min={0}
+                      max={endpoints?.probeIntervalRange?.[1] ?? 1440}
+                      value={probeInterval}
+                      disabled={isBusy}
+                      className="w-0 min-w-full"
+                      onChange={(event) => setProbeInterval(Number(event.target.value))}
+                    />
+                  </div>
+                </>
+              )}
+              <Button onClick={save} disabled={isBusy || order.length === 0 || !endpointsDirty}>
+                {busy === "save" ? t("settings.saving") : t("settings.save")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Gauge size={16} aria-hidden /> {t("settings.connectivityTitle")}
+            </CardTitle>
+            <CardDescription className="flex items-start gap-2">
+              <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden />
+              <span>{t("settings.connectivityDescription", { n: pingCost })}</span>
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-end gap-4">
+              <Button variant="secondary" onClick={test} disabled={isBusy}>
+                {busy === "test" ? t("settings.testing") : t("settings.testAll")}
+              </Button>
+              <Button variant="secondary" onClick={ping} disabled={isBusy}>
+                {busy === "ping" ? t("settings.measuring") : t("settings.ping")}
+              </Button>
+            </div>
+
+            {(busy === "test" || busy === "ping") && (
+              <div className="space-y-1">
+                {available.map((endpoint) => {
+                  const done =
+                    (testResult?.results ?? []).some((row) => row.key === endpoint.key) ||
+                    (pingResult?.results ?? []).some((row) => row.key === endpoint.key);
+                  const active = checking === endpoint.key;
+                  return (
+                    <div key={endpoint.key} className="flex items-center gap-2 text-sm">
+                      {active ? (
+                        <Loader2 size={14} className="animate-spin text-muted-foreground" aria-hidden />
+                      ) : done ? (
+                        <Check size={14} className="text-success" aria-hidden />
+                      ) : (
+                        <span className="inline-block size-[14px]" />
+                      )}
+                      <span className={active ? "font-medium" : done ? "" : "text-muted-foreground"}>
+                        {endpoint.name}
+                      </span>
+                      {active && <span className="text-xs text-muted-foreground">{t("settings.checking")}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {testResult && (
               <Table>
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t("settings.provider")}</TableHead>
-                    <TableHead className="text-right">{t("settings.samples")}</TableHead>
-                    <TableHead className="text-right">{t("settings.median")}</TableHead>
-                    <TableHead className="text-right">{t("settings.min")}</TableHead>
-                    <TableHead className="text-right">{t("settings.max")}</TableHead>
+                    <TableHead>{t("settings.result")}</TableHead>
+                    <TableHead className="text-right">{t("settings.firstByte")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {pingResult.results.map((row) => (
+                  {testResult.results.map((row) => (
                     <TableRow key={row.key}>
-                      <TableCell className="font-medium">
-                        {row.name}
-                        {pingResult.conclusive && pingResult.fastest === row.key && (
-                          <Badge variant="secondary" className="ml-2">
-                            {t("settings.fastest")}
-                          </Badge>
+                      <TableCell className="font-medium">{row.name}</TableCell>
+                      <TableCell>
+                        {row.ok ? (
+                          <Badge variant="secondary">{t("settings.accepted")}</Badge>
+                        ) : (
+                          <span className="text-destructive">{row.error ?? t("settings.failed")}</span>
                         )}
                       </TableCell>
-                      <TableCell className="text-right">{row.samples}</TableCell>
-                      <TableCell className="text-right">{row.medianMs === null ? "—" : `${row.medianMs} ms`}</TableCell>
-                      <TableCell className="text-right">{row.minMs === null ? "—" : `${row.minMs} ms`}</TableCell>
-                      <TableCell className="text-right">{row.maxMs === null ? "—" : `${row.maxMs} ms`}</TableCell>
+                      <TableCell className="text-right">{row.ttfbMs === null ? "—" : `${row.ttfbMs} ms`}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
-              <p className={pingResult.conclusive ? "text-sm" : "text-sm text-muted-foreground"}>
-                {pingResult.verdict}
-              </p>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Workflow size={16} aria-hidden /> {t("settings.agentModeTitle")}
-          </CardTitle>
-          <CardDescription>
-            {t("settings.agentModeSentAs")} <span className="font-mono">conversationState.agentTaskType</span>
-            {t("settings.agentModeOfficial")} <span className="font-mono">vibe</span> {t("settings.agentModeFreeform")}{" "}
-            <span className="font-mono">spec</span> {t("settings.and")} <span className="font-mono">task</span>{" "}
-            {t("settings.agentModeRest")}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="space-y-1">
-            <Label htmlFor="agent-mode">{t("settings.mode")}</Label>
-            <Select
-              value={agentMode ? agentMode.mode || OMIT_VALUE : undefined}
-              disabled={isBusy || !agentMode}
-              onValueChange={(value) => saveMode(value === OMIT_VALUE ? "" : value)}
-            >
-              <SelectTrigger id="agent-mode" className="w-48">
-                <SelectValue placeholder={t("settings.selectMode")} />
-              </SelectTrigger>
-              <SelectContent>
-                {(agentMode?.allowed ?? []).map((mode) => (
-                  <SelectItem key={mode || OMIT_VALUE} value={mode || OMIT_VALUE}>
-                    {mode === "" ? t("settings.omitField") : mode}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Users size={16} aria-hidden /> {t("settings.poolTitle")}
-          </CardTitle>
-          <CardDescription>{t("settings.poolDescription")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-1">
-            <Label htmlFor="balancing">{t("settings.accountOrdering")}</Label>
-            <Select
-              value={tunables?.loadBalancing}
-              disabled={isBusy || !tunables}
-              onValueChange={(value) => saveTunables({ loadBalancing: value })}
-            >
-              <SelectTrigger id="balancing" className="w-80">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(tunables?.loadBalancingOptions ?? []).map((option) => (
-                  <SelectItem key={option} value={option}>
-                    {loadBalancingLabel(option, t)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {loadBalancingHelp(tunables?.loadBalancing, t) && (
-              <p className="text-xs text-muted-foreground">{loadBalancingHelp(tunables?.loadBalancing, t)}</p>
             )}
-          </div>
 
-          <div className="flex flex-wrap items-end gap-4">
+            {pingResult && (
+              <div className="space-y-3">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{t("settings.provider")}</TableHead>
+                      <TableHead className="text-right">{t("settings.samples")}</TableHead>
+                      <TableHead className="text-right">{t("settings.median")}</TableHead>
+                      <TableHead className="text-right">{t("settings.min")}</TableHead>
+                      <TableHead className="text-right">{t("settings.max")}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pingResult.results.map((row) => (
+                      <TableRow key={row.key}>
+                        <TableCell className="font-medium">
+                          {row.name}
+                          {pingResult.conclusive && pingResult.fastest === row.key && (
+                            <Badge variant="secondary" className="ml-2">
+                              {t("settings.fastest")}
+                            </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">{row.samples}</TableCell>
+                        <TableCell className="text-right">{row.medianMs === null ? "—" : `${row.medianMs} ms`}</TableCell>
+                        <TableCell className="text-right">{row.minMs === null ? "—" : `${row.minMs} ms`}</TableCell>
+                        <TableCell className="text-right">{row.maxMs === null ? "—" : `${row.maxMs} ms`}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <p className={pingResult.conclusive ? "text-sm" : "text-sm text-muted-foreground"}>
+                  {pingResult.verdict}
+                </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Users size={16} aria-hidden /> {t("settings.poolTitle")}
+            </CardTitle>
+            <CardDescription>{t("settings.poolDescription")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
             <div className="space-y-1">
-              <Label htmlFor="refresh">{t("settings.refreshBefore")}</Label>
-              <Input
-                id="refresh"
-                type="number"
-                min={60}
-                max={3600}
-                value={refreshSeconds}
+              <Label htmlFor="balancing">{t("settings.accountOrdering")}</Label>
+              <Select
+                value={tunables?.loadBalancing}
                 disabled={isBusy || !tunables}
-                className="w-32"
-                onChange={(event) => setRefreshSeconds(Number(event.target.value))}
+                onValueChange={(value) => saveTunables({ loadBalancing: value })}
+              >
+                <SelectTrigger id="balancing" className="w-80">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(tunables?.loadBalancingOptions ?? []).map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {loadBalancingLabel(option, t)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {loadBalancingHelp(tunables?.loadBalancing, t) && (
+                <p className="text-xs text-muted-foreground">{loadBalancingHelp(tunables?.loadBalancing, t)}</p>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-end gap-4">
+              <div className="inline-grid gap-1">
+                <Label htmlFor="refresh" className="whitespace-nowrap">{t("settings.refreshBefore")}</Label>
+                <Input
+                  id="refresh"
+                  type="number"
+                  min={60}
+                  max={1800}
+                  value={refreshSeconds}
+                  disabled={isBusy || !tunables}
+                  className="w-0 min-w-full"
+                  onChange={(event) => setRefreshSeconds(Number(event.target.value))}
+                />
+              </div>
+              <Button
+                disabled={isBusy || !tunables || refreshSeconds === tunables?.tokenRefreshSeconds}
+                onClick={() => saveTunables({ tokenRefreshSeconds: refreshSeconds })}
+              >
+                {t("settings.save")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Database size={16} aria-hidden /> {t("settings.dataTitle")}
+            </CardTitle>
+            <CardDescription>{t("settings.dataDescription")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {data && (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <Field label={t("settings.requestLogs")} value={data.requestLogs.toLocaleString()} />
+                <Field label={t("settings.retention")} value={t("settings.retentionDays", { n: data.retentionDays })} />
+                <Field label={t("settings.database")} value={`${(data.databaseBytes / 1048576).toFixed(1)} MB`} />
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" disabled={isBusy} onClick={() => clear("usage")}>
+                {busy === "clear-usage" ? t("settings.clearing") : t("settings.clearUsage")}
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={isBusy || !data || data.requestLogs === 0}
+                onClick={() => clear("logs")}
+              >
+                {busy === "clear-logs" ? t("settings.clearing") : t("settings.clearLogs")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <ScrollText size={16} aria-hidden /> {t("settings.promptTitle")}
+            </CardTitle>
+            <CardDescription>{t("settings.shortenNote")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={promptFilter?.shortenTools ?? false}
+                disabled={isBusy || !promptFilter || promptFilter.shortenTools === undefined}
+                onChange={(event) => togglePrompt({ shortenTools: event.target.checked })}
               />
-            </div>
-            <Button
-              variant="secondary"
-              disabled={isBusy || !tunables || refreshSeconds === tunables?.tokenRefreshSeconds}
-              onClick={() => saveTunables({ tokenRefreshSeconds: refreshSeconds })}
-            >
-              {t("settings.save")}
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+              {t("settings.shortenTools", { n: promptFilter?.shortenThreshold ?? 1200 })}
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={promptFilter?.writeHint ?? false}
+                disabled={isBusy || !promptFilter || promptFilter.writeHint === undefined}
+                onChange={(event) => togglePrompt({ writeHint: event.target.checked })}
+              />
+              {t("settings.writeHint")}
+            </label>
+            {describeShortenStats(promptFilter?.lastShorten, t) && (
+              <p className="text-xs text-muted-foreground">{describeShortenStats(promptFilter?.lastShorten, t)}</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Database size={16} aria-hidden /> {t("settings.dataTitle")}
-          </CardTitle>
-          <CardDescription>{t("settings.dataDescription")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {data && (
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <Field label={t("settings.requestLogs")} value={data.requestLogs.toLocaleString()} />
-              <Field label={t("settings.retention")} value={t("settings.retentionDays", { n: data.retentionDays })} />
-              <Field label={t("settings.database")} value={`${(data.databaseBytes / 1048576).toFixed(1)} MB`} />
-            </div>
-          )}
-
-          <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" disabled={isBusy} onClick={() => clear("usage")}>
-              {busy === "clear-usage" ? t("settings.clearing") : t("settings.clearUsage")}
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={isBusy || !data || data.requestLogs === 0}
-              onClick={() => clear("logs")}
-            >
-              {busy === "clear-logs" ? t("settings.clearing") : t("settings.clearLogs")}
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            {t("settings.clearLogsNote")}
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ScrollText size={16} aria-hidden /> {t("settings.promptTitle")}
-          </CardTitle>
-          <CardDescription>{promptFilter?.preservedNote}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={promptFilter?.enabled ?? false}
-              disabled={isBusy || !promptFilter}
-              onChange={(event) => togglePrompt({ enabled: event.target.checked })}
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Network size={16} aria-hidden /> {t("settings.proxiesTitle")}
+            </CardTitle>
+            <CardDescription>
+              {t("settings.proxiesDescription", { n: proxies?.cooldownSeconds ?? 60, schemes: (proxies?.schemes ?? []).join(", ") })}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <textarea
+              className="min-h-24 w-full rounded-md border border-input bg-transparent p-3 font-mono text-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
+              spellCheck={false}
+              placeholder={"socks5h://user:pass@host:1080\nhttp://backup:8080"}
+              value={proxyText}
+              disabled={isBusy}
+              onChange={(event) => setProxyText(event.target.value)}
             />
-            {t("settings.replacePrompt")}
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={promptFilter?.shortenTools ?? false}
-              disabled={isBusy || !promptFilter || promptFilter.shortenTools === undefined}
-              onChange={(event) => togglePrompt({ shortenTools: event.target.checked })}
-            />
-            {t("settings.shortenTools", { n: promptFilter?.shortenThreshold ?? 1200 })}
-          </label>
-          {promptFilter?.shortenNote && <p className="text-xs text-muted-foreground">{promptFilter.shortenNote}</p>}
-          {describeShortenStats(promptFilter?.lastShorten, t) && (
-            <p className="text-xs text-muted-foreground">{describeShortenStats(promptFilter?.lastShorten, t)}</p>
-          )}
-          {promptFilter && (
+            {proxies && proxies.proxies.length > 0 && (
+              <div className="space-y-1">
+                {proxies.proxies.map((entry, index) => (
+                  <div key={entry.url} className="flex items-center gap-2 text-xs">
+                    <Badge variant="secondary">#{index + 1}</Badge>
+                    <span className="font-mono">{entry.url}</span>
+                    {entry.cooling && <span className="text-destructive">{t("settings.coolingDown")}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+            <Button onClick={saveProxies} disabled={isBusy || !proxiesDirty}>
+              {busy === "proxies" ? t("settings.saving") : t("settings.saveProxies")}
+            </Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Waves size={16} aria-hidden /> {t("settings.concurrencyTitle")}
+            </CardTitle>
+            <CardDescription>{t("settings.concurrencyDescription")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-3">
+              <div className="space-y-1">
+                <Label htmlFor="max-conc">{t("settings.totalInFlight")}</Label>
+                <Input
+                  id="max-conc"
+                  type="number"
+                  min={0}
+                  max={512}
+                  value={maxConcurrency}
+                  disabled={isBusy}
+                  onChange={(event) => setMaxConcurrency(Number(event.target.value))}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="max-acct">{t("settings.perAccount")}</Label>
+                <Input
+                  id="max-acct"
+                  type="number"
+                  min={0}
+                  max={128}
+                  value={maxAccountConcurrency}
+                  disabled={isBusy}
+                  onChange={(event) => setMaxAccountConcurrency(Number(event.target.value))}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="queue-timeout">{t("settings.queueWait")}</Label>
+                <Input
+                  id="queue-timeout"
+                  type="number"
+                  min={1}
+                  max={600}
+                  value={queueTimeout}
+                  disabled={isBusy}
+                  onChange={(event) => setQueueTimeout(Number(event.target.value))}
+                />
+              </div>
+            </div>
             <p className="text-xs text-muted-foreground">
-              {t("settings.droppedSections")} <span className="font-mono">{promptFilter.droppedSections.join(", ")}</span>
+              {t("settings.queueNote")}
             </p>
-          )}
-        </CardContent>
-      </Card>
+            <Button
+              disabled={isBusy || !limitsDirty}
+              onClick={() =>
+                saveTunables({
+                  maxConcurrency,
+                  maxAccountConcurrency,
+                  queueTimeoutSeconds: queueTimeout,
+                })
+              }
+            >
+              {busy === "tunables" ? t("settings.saving") : t("settings.saveLimits")}
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Network size={16} aria-hidden /> {t("settings.proxiesTitle")}
-          </CardTitle>
-          <CardDescription>{t("settings.proxiesDescription", { n: proxies?.cooldownSeconds ?? 60 })}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <textarea
-            className="min-h-24 w-full rounded-md border border-input bg-transparent p-3 font-mono text-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
-            spellCheck={false}
-            placeholder={"socks5h://user:pass@host:1080\nhttp://backup:8080"}
-            value={proxyText}
-            disabled={isBusy}
-            onChange={(event) => setProxyText(event.target.value)}
-          />
-          <p className="text-xs text-muted-foreground">
-            {t("settings.accepted.schemes")} <span className="font-mono">{(proxies?.schemes ?? []).join(", ")}</span>.{" "}
-            {t("settings.use")} <span className="font-mono">socks5h</span> {t("settings.socksHint")}
-          </p>
-          {proxies && proxies.proxies.length > 0 && (
-            <div className="space-y-1">
-              {proxies.proxies.map((entry, index) => (
-                <div key={entry.url} className="flex items-center gap-2 text-xs">
-                  <Badge variant="secondary">#{index + 1}</Badge>
-                  <span className="font-mono">{entry.url}</span>
-                  {entry.cooling && <span className="text-destructive">{t("settings.coolingDown")}</span>}
-                </div>
-              ))}
-            </div>
-          )}
-          <Button onClick={saveProxies} disabled={isBusy}>
-            {busy === "proxies" ? t("settings.saving") : t("settings.saveProxies")}
-          </Button>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Waves size={16} aria-hidden /> {t("settings.concurrencyTitle")}
-          </CardTitle>
-          <CardDescription>{t("settings.concurrencyDescription")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-3">
-            <div className="space-y-1">
-              <Label htmlFor="max-conc">{t("settings.totalInFlight")}</Label>
-              <Input
-                id="max-conc"
-                type="number"
-                min={0}
-                max={512}
-                value={maxConcurrency}
-                disabled={isBusy}
-                onChange={(event) => setMaxConcurrency(Number(event.target.value))}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="max-acct">{t("settings.perAccount")}</Label>
-              <Input
-                id="max-acct"
-                type="number"
-                min={0}
-                max={128}
-                value={maxAccountConcurrency}
-                disabled={isBusy}
-                onChange={(event) => setMaxAccountConcurrency(Number(event.target.value))}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="queue-timeout">{t("settings.queueWait")}</Label>
-              <Input
-                id="queue-timeout"
-                type="number"
-                min={1}
-                max={600}
-                value={queueTimeout}
-                disabled={isBusy}
-                onChange={(event) => setQueueTimeout(Number(event.target.value))}
-              />
-            </div>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            {t("settings.queueNote")}
-          </p>
-          <Button
-            variant="secondary"
-            disabled={isBusy}
-            onClick={() =>
-              saveTunables({
-                maxConcurrency,
-                maxAccountConcurrency,
-                queueTimeoutSeconds: queueTimeout,
-              })
-            }
-          >
-            {busy === "tunables" ? t("settings.saving") : t("settings.saveLimits")}
-          </Button>
-        </CardContent>
-      </Card>
+      <ModelListingCard onNotice={onNotice} />
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Coins size={16} aria-hidden /> {t("settings.costTitle")}
           </CardTitle>
-          <CardDescription>{costNote}</CardDescription>
+          <CardDescription>{t("settings.costNote")}</CardDescription>
         </CardHeader>
         <CardContent>
           {/* 19 rows is a tall column on its own; split it once there is room. */}

@@ -101,7 +101,7 @@ pub async fn test(
         return Err((409, "a probe is already running".into()));
     };
     let targets = selected(only)?;
-    let model = model.unwrap_or("claude-sonnet-4.5").to_owned();
+    let model = probe_model(model).await;
     let auth = account(state, &model).await?;
     let mut results = Vec::new();
     for ep in targets {
@@ -113,6 +113,46 @@ pub async fn test(
     Ok(json!({"model": model, "requestsSpent": results.len(), "results": results}))
 }
 
+pub async fn probe_model(requested: Option<&str>) -> String {
+    if let Some(m) = requested.map(str::trim).filter(|m| !m.is_empty()) {
+        return m.to_owned();
+    }
+    let configured = crate::settings::endpoint_settings().probe_model;
+    if !configured.is_empty() {
+        return configured;
+    }
+    tokio::task::spawn_blocking(most_used_model)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "claude-sonnet-4.5".to_owned())
+}
+
+fn most_used_model() -> Option<String> {
+    let since = crate::store::now_i64() - 86400;
+    crate::store::with(|c| {
+        use rusqlite::OptionalExtension;
+        c.query_row(
+            "SELECT model FROM request_logs WHERE created_at >= ?1 AND model IS NOT NULL AND route IN ('/v1/chat/completions', '/v1/messages', '/v1/responses') GROUP BY model ORDER BY COUNT(*) DESC LIMIT 1",
+            [since],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+    })
+    .ok()
+    .flatten()
+    .map(|m| crate::model_resolver::get_model_id_for_kiro(&m))
+}
+
+pub fn scheduled_probe_due(last_generations: u64, last_run: f64, now: f64) -> bool {
+    let s = crate::settings::endpoint_settings();
+    s.rotation
+        && s.strategy == endpoints::FASTEST
+        && s.probe_interval_minutes > 0
+        && now - last_run >= (s.probe_interval_minutes * 60) as f64
+        && endpoints::generations() > last_generations
+}
+
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(f64::total_cmp);
     let n = v.len();
@@ -120,6 +160,35 @@ fn median(v: &mut [f64]) -> f64 {
         v[n / 2]
     } else {
         (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Measures every endpoint once the active slot has a usable account, so the
+/// `fastest` order starts from a fresh reading instead of the manual list.
+/// Gives up after five minutes; the scheduled probe takes over from there.
+pub async fn startup_probe(state: &Shared) {
+    let s = crate::settings::endpoint_settings();
+    if !s.rotation || s.strategy != endpoints::FASTEST {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let active = !state.quiesced.load(std::sync::atomic::Ordering::SeqCst);
+        if active && state.pool.accounts().iter().any(|a| a.auth().is_some()) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::info!("[Endpoints] Startup latency probe skipped: no account became ready");
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    match ping(state, 3, None, None).await {
+        Ok(v) => tracing::info!(
+            "[Endpoints] Startup latency probe: {}",
+            v["verdict"].as_str().unwrap_or("")
+        ),
+        Err((_, e)) => tracing::warn!("[Endpoints] Startup latency probe skipped: {e}"),
     }
 }
 
@@ -134,7 +203,7 @@ pub async fn ping(
     };
     let reps = reps.clamp(1, PING_REPS_MAX);
     let targets = selected(only)?;
-    let model = model.unwrap_or("claude-sonnet-4.5").to_owned();
+    let model = probe_model(model).await;
     let auth = account(state, &model).await?;
     let mut samples: Vec<Vec<f64>> = vec![vec![]; targets.len()];
     let mut failures: Vec<Vec<String>> = vec![vec![]; targets.len()];
@@ -166,7 +235,10 @@ pub async fn ping(
         };
         results.push(json!({"key": ep.key, "name": ep.name, "samples": samples[i].len(), "medianMs": med, "minMs": min, "maxMs": max, "failures": failures[i]}));
     }
-    let mut out = json!({"model": model, "reps": reps, "requestsSpent": reps * targets.len() as i64, "results": results});
+    let region = auth.api_region.clone();
+    let measured: Vec<(&str, f64)> = medians.iter().map(|(k, m, _)| (*k, *m)).collect();
+    endpoints::record_latency(&region, &model, &measured);
+    let mut out = json!({"model": model, "reps": reps, "requestsSpent": reps * targets.len() as i64, "results": results, "region": region});
     let verdict = if medians.is_empty() {
         json!({"fastest": null, "conclusive": false, "verdict": "No endpoint answered."})
     } else {

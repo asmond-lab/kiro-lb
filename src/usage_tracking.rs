@@ -20,6 +20,8 @@ pub struct RequestUsage {
     pub credits: Option<f64>,
     pub generation_ms: Option<i64>,
     pub ttft_ms: Option<i64>,
+    pub effort: Option<String>,
+    pub upstream_cut: Option<String>,
 }
 
 /// Everything a request needs to attribute its usage, shared with its stream task.
@@ -33,6 +35,8 @@ pub struct RequestCtx {
     /// with a protocol failure, so telemetry classifies it without parsing
     /// model-generated text.
     pub stream_failed: Arc<std::sync::atomic::AtomicBool>,
+    pub input_estimate: Arc<Mutex<Option<(Option<u64>, i64)>>>,
+    pub received: Option<Instant>,
 }
 
 impl RequestCtx {
@@ -43,10 +47,33 @@ impl RequestCtx {
         }
     }
 
+    pub fn set_input_estimate(&self, session: Option<u64>, estimate: i64) {
+        *self.input_estimate.lock() = Some((session, estimate));
+    }
+
+    pub fn observe_reported_input(&self, model: &str, reported: i64) {
+        if let Some((session, estimate)) = *self.input_estimate.lock() {
+            crate::input_calibration::observe(session, model, estimate, reported);
+        }
+    }
+
     pub fn capture(&self, f: impl FnOnce(&mut crate::debug::Capture)) {
         if let Some(c) = &self.capture {
             f(&mut c.lock());
         }
+    }
+
+    pub fn note_effort(&self, payload: &serde_json::Value) {
+        let effort = payload
+            .pointer("/additionalModelRequestFields/output_config/effort")
+            .or_else(|| payload.pointer("/additionalModelRequestFields/reasoning/effort"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        self.usage.lock().effort = effort;
+    }
+
+    pub fn note_upstream_cut(&self, what: &str) {
+        self.usage.lock().upstream_cut = Some(what.to_owned());
     }
 
     pub fn note_model(&self, model: &str) {
@@ -203,8 +230,12 @@ pub struct GenerationTimer {
 
 impl GenerationTimer {
     pub fn start() -> Self {
+        Self::start_at(None)
+    }
+
+    pub fn start_at(received: Option<Instant>) -> Self {
         GenerationTimer {
-            started: Instant::now(),
+            started: received.unwrap_or_else(Instant::now),
             first: None,
             last: None,
         }
@@ -223,8 +254,19 @@ impl GenerationTimer {
 
     pub fn decode_seconds(&self) -> Option<f64> {
         let secs = self.last?.duration_since(self.first?).as_secs_f64();
-        (secs > 0.0).then_some(secs)
+        (secs >= MIN_DECODE_SECONDS).then_some(secs)
     }
+}
+
+pub const MIN_DECODE_SECONDS: f64 = 0.25;
+
+pub fn tool_call_text<'a>(calls: impl IntoIterator<Item = (&'a str, String)>) -> String {
+    let mut out = String::new();
+    for (name, args) in calls {
+        out.push_str(name);
+        out.push_str(&args);
+    }
+    out
 }
 
 pub fn tokens_per_second(output_tokens: i64, decode_ms: i64) -> Option<f64> {
@@ -247,6 +289,12 @@ mod tests {
         };
         assert_eq!(timer.ttft_ms(), Some(1500));
         assert_eq!(timer.decode_seconds(), Some(2.0));
+        let burst = GenerationTimer {
+            started: t0,
+            first: Some(t0 + Duration::from_millis(1500)),
+            last: Some(t0 + Duration::from_millis(1700)),
+        };
+        assert_eq!(burst.decode_seconds(), None);
         assert_eq!(tokens_per_second(101, 2000), Some(50.0));
     }
 

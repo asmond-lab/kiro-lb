@@ -138,6 +138,14 @@ pub fn routing_state(a: &Account, now: f64) -> (&'static str, i64) {
     ("available", 0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Unavailable {
+    Model,
+    Quota { resets_in: f64 },
+    Accounts,
+    Temporary,
+}
+
 #[derive(Clone)]
 pub struct RateObservation {
     pub at: f64,
@@ -149,7 +157,14 @@ pub struct RateObservation {
 
 struct SessionEntry {
     account: String,
-    touched: Instant,
+    login_identity: Option<String>,
+    touched: f64,
+}
+
+impl SessionEntry {
+    fn is_live(&self, now: f64) -> bool {
+        now - self.touched < config::get().session_affinity_ttl_seconds as f64
+    }
 }
 
 #[derive(Default)]
@@ -415,8 +430,48 @@ impl AccountManager {
                     }
                 }
             }
+            Self::restore_sessions_locked(&mut inner, state);
         }
         self.seed_quota();
+    }
+
+    fn restore_sessions_locked(inner: &mut PoolInner, state: &Value) {
+        let now = store::now_f64();
+        let cap = config::get().session_affinity_capacity.max(1);
+        let Some(saved) = state.get("sessions").and_then(Value::as_array) else {
+            return;
+        };
+        for item in saved {
+            if inner.sessions.len() >= cap {
+                break;
+            }
+            let (Some(key), Some(account), Some(touched)) = (
+                item.get("key")
+                    .and_then(Value::as_str)
+                    .and_then(|k| k.parse::<u64>().ok()),
+                item.get("account").and_then(Value::as_str),
+                item.get("touched").and_then(Value::as_f64),
+            ) else {
+                continue;
+            };
+            let entry = SessionEntry {
+                account: account.to_owned(),
+                login_identity: item
+                    .get("login_identity")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                touched,
+            };
+            let Some(a) = inner.accounts.get(account).cloned() else {
+                continue;
+            };
+            if !entry.is_live(now) || a.state.lock().login_identity != entry.login_identity {
+                continue;
+            }
+            Self::drop_session_locked(inner, key);
+            a.state.lock().sessions += 1;
+            inner.sessions.insert(key, entry);
+        }
     }
 
     pub fn restore_account_state(&self, id: &str) {
@@ -426,6 +481,20 @@ impl AccountManager {
         };
         let identity = KiroAuth::bind_source_login(&source);
         self.bind_login_state(&account, identity.as_deref());
+        {
+            let mut inner = self.inner.lock();
+            let stale: Vec<u64> = inner
+                .sessions
+                .iter()
+                .filter(|(_, e)| e.account == id && e.login_identity != identity)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale {
+                inner.sessions.remove(&k);
+            }
+            let live = inner.sessions.values().filter(|e| e.account == id).count() as i64;
+            account.state.lock().sessions = live;
+        }
         self.seed_quota();
     }
 
@@ -539,6 +608,15 @@ impl AccountManager {
             .map(|(m, l)| (m.clone(), json!({"accounts": l})))
             .collect();
         let current_index = inner.current_index;
+        let now = store::now_f64();
+        let sessions: Vec<Value> = inner
+            .sessions
+            .iter()
+            .filter(|(_, e)| e.is_live(now))
+            .map(|(k, e)| {
+                json!({"key": k.to_string(), "account": e.account, "login_identity": e.login_identity, "touched": e.touched})
+            })
+            .collect();
         drop(inner);
         let disabled: std::collections::HashSet<String> = sources
             .iter()
@@ -554,7 +632,7 @@ impl AccountManager {
                 }
             }
         }
-        json!({"current_account_index": current_index, "accounts": accounts, "model_to_accounts": models})
+        json!({"current_account_index": current_index, "accounts": accounts, "model_to_accounts": models, "sessions": sessions})
     }
 
     pub fn state_document(&self) -> Value {
@@ -748,6 +826,48 @@ impl AccountManager {
         F: FnOnce(Arc<KiroAuth>) -> Fut,
         Fut: std::future::Future<Output = Option<Vec<Value>>>,
     {
+        self.refresh_models_inner(a, fetch, false).await;
+    }
+
+    pub async fn force_refresh_models(&self, a: &Arc<Account>) -> bool {
+        let http = self.http.clone();
+        self.force_refresh_models_with(a, move |auth| {
+            let http = http.clone();
+            async move { crate::model_catalog::fetch_available_models(&auth, &http).await }
+        })
+        .await
+    }
+
+    pub async fn force_refresh_models_with<F, Fut>(&self, a: &Arc<Account>, fetch: F) -> bool
+    where
+        F: FnOnce(Arc<KiroAuth>) -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<Value>>>,
+    {
+        self.refresh_models_inner(a, fetch, true).await
+    }
+
+    pub fn schedule_catalog_rereads(self: &Arc<Self>, id: &str) {
+        for delay in [60u64, 300] {
+            let (pool, id) = (self.clone(), id.to_owned());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                if let Some(a) = pool.get(&id).filter(|a| a.auth().is_some()) {
+                    let before = model_resolver::available_models(&a.models).len();
+                    pool.force_refresh_models(&a).await;
+                    let after = model_resolver::available_models(&a.models).len();
+                    if after != before {
+                        tracing::info!("[Models] {id} now lists {after} models (was {before})");
+                    }
+                }
+            });
+        }
+    }
+
+    async fn refresh_models_inner<F, Fut>(&self, a: &Arc<Account>, fetch: F, force: bool) -> bool
+    where
+        F: FnOnce(Arc<KiroAuth>) -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<Value>>>,
+    {
         let _flight = a.models_refresh.lock().await;
         let ttl = if a.models.is_authoritative() {
             config::get().account_cache_ttl as f64
@@ -755,10 +875,10 @@ impl AccountManager {
             config::MODEL_CACHE_TTL as f64
         };
         let cached = a.state.lock().models_cached_at;
-        if cached > 0.0 && store::now_f64() - cached <= ttl {
-            return;
+        if !force && cached > 0.0 && store::now_f64() - cached <= ttl {
+            return true;
         }
-        let Some(auth) = a.auth() else { return };
+        let Some(auth) = a.auth() else { return false };
         let refresh_revision = a.models.refresh_revision();
         let refreshed = fetch(auth.clone()).await;
         let still_current = a
@@ -769,14 +889,33 @@ impl AccountManager {
                 "Discarding model refresh for {}: its login was replaced",
                 a.id
             );
-            return;
+            return false;
         }
+        let ok = refreshed.is_some();
         match refreshed {
-            Some(m) => a.models.update_after_refresh(m, refresh_revision),
+            Some(m) => {
+                a.models.update_after_refresh(m, refresh_revision);
+                let available = model_resolver::available_models(&a.models);
+                let mut inner = self.inner.lock();
+                for m in available {
+                    let list = inner.model_to_accounts.entry(m).or_default();
+                    if !list.contains(&a.id) {
+                        list.push(a.id.clone());
+                    }
+                }
+            }
+            None if force && a.models.is_authoritative() => {
+                tracing::warn!(
+                    "[Models] Forced catalog read for {} failed; keeping the current catalog",
+                    a.id
+                );
+                return false;
+            }
             None => a.models.seed_fallback(),
         }
         a.state.lock().models_cached_at = store::now_f64();
         self.mark_dirty();
+        ok
     }
 
     fn schedule_account_maintenance(self: &Arc<Self>) {
@@ -890,8 +1029,31 @@ impl AccountManager {
             keyed.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         };
         let mut pinned = None;
-        let ordered: Vec<String> = if !config::get().quota_weighted_routing || strategy == "sticky"
-        {
+        let quota_weighted = config::get().quota_weighted_routing;
+        let ordered: Vec<String> = if let Some(key) = session.filter(|_| strategy == "session") {
+            let pinned_id = inner
+                .sessions
+                .get(&key)
+                .filter(|e| e.is_live(now))
+                .filter(|e| {
+                    inner
+                        .accounts
+                        .get(&e.account)
+                        .is_some_and(|a| a.state.lock().login_identity == e.login_identity)
+                })
+                .map(|e| e.account.clone());
+            let mut rest = if quota_weighted {
+                weighted(&inner)
+            } else {
+                rotate(inner.current_index)
+            };
+            if let Some(p) = pinned_id {
+                pinned = Some(p.clone());
+                rest.retain(|x| *x != p);
+                rest.insert(0, p);
+            }
+            rest
+        } else if !quota_weighted || strategy == "sticky" {
             rotate(inner.current_index)
         } else if strategy == "most_credits" {
             let mut v = ids.clone();
@@ -909,20 +1071,6 @@ impl AccountManager {
                 wb.total_cmp(&wa)
             });
             v
-        } else if let Some(key) = session.filter(|_| strategy == "session") {
-            let ttl = Duration::from_secs(config::get().session_affinity_ttl_seconds);
-            let pinned_id = inner
-                .sessions
-                .get(&key)
-                .filter(|e| e.touched.elapsed() < ttl)
-                .map(|e| e.account.clone());
-            let mut rest = weighted(&inner);
-            if let Some(p) = pinned_id.filter(|p| inner.accounts.contains_key(p)) {
-                pinned = Some(p.clone());
-                rest.retain(|x| *x != p);
-                rest.insert(0, p);
-            }
-            rest
         } else {
             weighted(&inner)
         };
@@ -1038,6 +1186,41 @@ impl AccountManager {
         unsupported
     }
 
+    /// Why no account can take `model` right now. Only `Temporary` is worth a
+    /// client retry; the other states hold until an operator or a quota reset
+    /// changes them, so retrying them only loops.
+    pub fn unavailability(&self, model: &str) -> Unavailable {
+        let now = store::now_f64();
+        let accounts = self.accounts();
+        if accounts.is_empty() {
+            return Unavailable::Temporary;
+        }
+        let (mut serving, mut quota, mut gone, mut soonest) = (0, 0, 0, f64::MAX);
+        for a in &accounts {
+            if a.models.support(model) == ModelSupport::Unsupported {
+                continue;
+            }
+            serving += 1;
+            let signed_out = a.auth.lock().is_none();
+            let s = a.state.lock();
+            if s.quota_exhausted_until > now {
+                quota += 1;
+                soonest = soonest.min(s.quota_exhausted_until - now);
+            } else if signed_out || s.suspended_until > now || s.auth_dead_until > now {
+                gone += 1;
+            }
+        }
+        if serving == 0 {
+            Unavailable::Model
+        } else if quota + gone < serving {
+            Unavailable::Temporary
+        } else if quota > 0 {
+            Unavailable::Quota { resets_in: soonest }
+        } else {
+            Unavailable::Accounts
+        }
+    }
+
     pub fn pin_session(&self, session: Option<u64>, account_id: &str) {
         let Some(key) = session else { return };
         if settings::tunables().load_balancing != "session" {
@@ -1049,35 +1232,42 @@ impl AccountManager {
 
     fn pin_session_locked(inner: &mut PoolInner, key: u64, account_id: &str) {
         let cap = config::get().session_affinity_capacity.max(1);
-        let previous = inner.sessions.get(&key).map(|e| e.account.clone());
-        if previous.as_deref() == Some(account_id) {
-            if let Some(e) = inner.sessions.get_mut(&key) {
-                e.touched = Instant::now();
-            }
+        let now = store::now_f64();
+        let identity = inner
+            .accounts
+            .get(account_id)
+            .and_then(|a| a.state.lock().login_identity.clone());
+        if let Some(e) = inner
+            .sessions
+            .get_mut(&key)
+            .filter(|e| e.account == account_id)
+        {
+            e.touched = now;
+            e.login_identity = identity;
             return;
         }
         if inner.sessions.len() >= cap {
-            let ttl = Duration::from_secs(config::get().session_affinity_ttl_seconds);
-            inner.sessions.retain(|_, e| e.touched.elapsed() < ttl);
+            Self::prune_sessions_locked(inner, now);
             if inner.sessions.len() >= cap {
                 if let Some(oldest) = inner
                     .sessions
                     .iter()
-                    .min_by_key(|(_, e)| e.touched)
+                    .min_by(|a, b| a.1.touched.total_cmp(&b.1.touched))
                     .map(|(k, _)| *k)
                 {
-                    inner.sessions.remove(&oldest);
+                    Self::drop_session_locked(inner, oldest);
                 }
             }
         }
-        inner.sessions.insert(
+        let previous = inner.sessions.insert(
             key,
             SessionEntry {
                 account: account_id.to_owned(),
-                touched: Instant::now(),
+                login_identity: identity,
+                touched: now,
             },
         );
-        if let Some(prev) = previous.and_then(|p| inner.accounts.get(&p).cloned()) {
+        if let Some(prev) = previous.and_then(|p| inner.accounts.get(&p.account).cloned()) {
             prev.state.lock().sessions -= 1;
         }
         if let Some(a) = inner.accounts.get(account_id) {
@@ -1085,15 +1275,46 @@ impl AccountManager {
         }
     }
 
+    fn drop_session_locked(inner: &mut PoolInner, key: u64) {
+        if let Some(e) = inner.sessions.remove(&key) {
+            if let Some(a) = inner.accounts.get(&e.account) {
+                a.state.lock().sessions -= 1;
+            }
+        }
+    }
+
+    fn prune_sessions_locked(inner: &mut PoolInner, now: f64) {
+        let expired: Vec<u64> = inner
+            .sessions
+            .iter()
+            .filter(|(_, e)| !e.is_live(now))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in expired {
+            Self::drop_session_locked(inner, k);
+        }
+    }
+
+    fn pin_is_lost(inner: &PoolInner, entry: &SessionEntry, model: &str, now: f64) -> bool {
+        let Some(a) = inner.accounts.get(&entry.account) else {
+            return true;
+        };
+        if a.auth.lock().is_none() || a.models.support(model) == ModelSupport::Unsupported {
+            return true;
+        }
+        let s = a.state.lock();
+        s.login_identity != entry.login_identity
+            || s.auth_dead_until > now
+            || s.suspended_until > now
+            || s.quota_exhausted_until > now
+            || is_quota_depleted(&s, now)
+    }
+
     pub fn session_counts(&self) -> HashMap<String, i64> {
         let inner = self.inner.lock();
-        let ttl = Duration::from_secs(config::get().session_affinity_ttl_seconds);
+        let now = store::now_f64();
         let mut out: HashMap<String, i64> = HashMap::new();
-        for e in inner
-            .sessions
-            .values()
-            .filter(|e| e.touched.elapsed() < ttl)
-        {
+        for e in inner.sessions.values().filter(|e| e.is_live(now)) {
             *out.entry(e.account.clone()).or_default() += 1;
         }
         out
@@ -1170,7 +1391,13 @@ impl AccountManager {
         }
         if settings::tunables().load_balancing == "session" {
             if let Some(key) = session {
-                Self::pin_session_locked(&mut inner, key, &a.id);
+                let now = store::now_f64();
+                let keep = inner.sessions.get(&key).is_some_and(|e| {
+                    e.account != a.id && e.is_live(now) && !Self::pin_is_lost(&inner, e, model, now)
+                });
+                if !keep {
+                    Self::pin_session_locked(&mut inner, key, &a.id);
+                }
             }
         }
         drop(inner);
@@ -1568,8 +1795,8 @@ mod tests {
         assert_eq!(settings::tunables().load_balancing, "session");
         let pool = AccountManager::new(reqwest::Client::new());
         let a = account("a");
-        let touched = Instant::now()
-            - Duration::from_secs(config::get().session_affinity_ttl_seconds.saturating_sub(1));
+        let touched =
+            store::now_f64() - config::get().session_affinity_ttl_seconds.saturating_sub(1) as f64;
         {
             let mut inner = pool.inner.lock();
             inner.order.push(a.id.clone());
@@ -1578,6 +1805,7 @@ mod tests {
                 7,
                 SessionEntry {
                     account: "a".into(),
+                    login_identity: None,
                     touched,
                 },
             );

@@ -48,34 +48,15 @@ const solLongContext: RequestLogDetail = {
 };
 
 describe("RequestLogTable", () => {
-  it("labels list spend as credits instead of a multiplier", () => {
-    const html = renderToString(
-      <RequestLogTable page={page(8.8)} isLoading={false} model="" order="newest" {...emptyHandlers} />,
-    );
-
-    expect(html).toContain("gpt-5.6-sol");
-    expect(html).toContain("8.8 credits");
-    expect(html).toContain("Credits spent");
-    expect(html).not.toContain("8.8x");
-  });
-
-  it("shows a 0.03 spend as credits, not 0.03x", () => {
-    const html = renderToString(
-      <RequestLogTable page={page(0.03)} isLoading={false} model="" order="newest" {...emptyHandlers} />,
-    );
-
-    expect(html).toContain("0.03 credits");
-    expect(html).not.toContain("0.03x");
-  });
-
-  it("renders the multiplier separately when the list payload includes it", () => {
+  it("leaves spend and multiplier to the detail view", () => {
     const html = renderToString(
       <RequestLogTable page={page(8.8, 4.4)} isLoading={false} model="" order="newest" {...emptyHandlers} />,
     );
 
-    expect(html).toContain("8.8 credits");
-    expect(html).toContain("4.4x");
-    expect(html).toContain("Model multiplier");
+    expect(html).toContain("gpt-5.6-sol");
+    expect(html).not.toContain("8.8 credits");
+    expect(html).not.toContain("4.4x");
+    expect(html).not.toContain("tok/s");
   });
 
   it("omits the spend mark when credits are absent", () => {

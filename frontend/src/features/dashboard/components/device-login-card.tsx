@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ComponentType } from "react";
-import { Check, Copy, ExternalLink, TriangleAlert, X } from "lucide-react";
+import { Link2, LogIn, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { dashboardApi } from "../api";
-import { copyCodeAriaLabel, copyUserCode } from "../copy-user-code";
+import { dismissAlert, pushAlert, pushError } from "../alerts";
 import { registrationMessage } from "../device-login-result";
 import type { DeviceLoginFlow, DeviceLoginProvider } from "../types";
 import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
-import { translate, usePreferences } from "../preferences";
+import { usePreferences } from "../preferences";
 
 const POLL_INTERVAL_MS = 2500;
 
@@ -23,39 +23,40 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   const { t, language } = usePreferences();
   const [flow, setFlow] = useState<DeviceLoginFlow>();
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [message, setMessage] = useState<{ tone: "ok" | "warn" | "error"; text: string }>();
+  const [now, setNow] = useState(() => Date.now());
+  const [deadline, setDeadline] = useState(0);
   const registering = useRef(false);
-  const copiedTimer = useRef<number | undefined>(undefined);
+  const linkAlert = useRef<number | undefined>(undefined);
 
   const start = async (provider: DeviceLoginProvider) => {
     setBusy(true);
-    setMessage(undefined);
-    setCopied(false);
     try {
       const started = await dashboardApi.startDeviceLogin(provider);
       setFlow(started);
-      window.open(started.verificationUriComplete, "_blank", "noopener");
+      setDeadline(Date.now() + started.expiresInSeconds * 1000);
+      setNow(Date.now());
+      await copyLink(started.verificationUriComplete);
     } catch (cause) {
-      setMessage({ tone: "error", text: (cause as Error).message });
+      pushError(cause);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const copyLink = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      linkAlert.current = pushAlert({ tone: "success", key: "accounts.login.linkCopied" });
+    } catch {
+      linkAlert.current = pushAlert({ tone: "warning", key: "accounts.login.copyFailed" });
     }
   };
 
   const cancel = useCallback(async () => {
     if (flow) await dashboardApi.cancelDeviceLogin(flow.flowId).catch(() => undefined);
     setFlow(undefined);
-    setCopied(false);
+    if (linkAlert.current !== undefined) dismissAlert(linkAlert.current);
   }, [flow]);
-
-  const copyCode = async () => {
-    if (!flow) return;
-    await copyUserCode(flow.userCode);
-    setCopied(true);
-    window.clearTimeout(copiedTimer.current);
-    copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
-  };
 
   // Registration is triggered by the approval itself, so the operator only ever
   // clicks once. The ref guards against a second poll landing mid-registration.
@@ -65,11 +66,12 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
       registering.current = true;
       try {
         const result = await dashboardApi.registerDeviceLogin(flowId);
-        setMessage(registrationMessage(language, result));
+        const registered = registrationMessage(language, result);
+        pushAlert({ tone: registered.tone === "ok" ? "success" : "warning", text: registered.text });
         setFlow(undefined);
         await onRegistered();
       } catch (cause) {
-        setMessage({ tone: "error", text: (cause as Error).message });
+        pushError(cause);
         setFlow(undefined);
       } finally {
         registering.current = false;
@@ -94,13 +96,17 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
           return;
         }
         if (next.status !== "pending") {
-          setMessage({ tone: "error", text: next.detail ?? translate(language, "accounts.login.status", { status: next.status }) });
+          pushAlert(
+            next.detail
+              ? { tone: "error", error: next.detail }
+              : { tone: "error", key: "accounts.login.status", vars: { status: next.status } },
+          );
           setFlow(undefined);
           return;
         }
       } catch (cause) {
         if (stopped) return;
-        setMessage({ tone: "error", text: (cause as Error).message });
+        pushError(cause);
         setFlow(undefined);
         return;
       }
@@ -112,52 +118,43 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [flow, registerApproved, language]);
+  }, [flow, registerApproved]);
 
-  useEffect(() => () => window.clearTimeout(copiedTimer.current), []);
+  const pending = flow?.status === "pending";
+  useEffect(() => {
+    if (!pending) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [pending]);
+
+  const remaining = Math.max(0, Math.ceil((deadline - now) / 1000));
+  const remainingLabel = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t("accounts.login.title")}</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <LogIn size={16} aria-hidden /> {t("accounts.login.title")}
+        </CardTitle>
         <CardDescription>
           {t("accounts.login.description")}
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent>
         {flow && flow.status === "pending" ? (
           <div className="space-y-3 rounded-lg border p-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-1">
-                <p className="text-sm">
-                  {t("accounts.login.waiting")}{" "}
-                  <span className="inline-flex items-center gap-1">
-                    <span className="font-mono font-medium">{flow.userCode}</span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={copyCodeAriaLabel(copied)}
-                      onClick={() => void copyCode()}
-                    >
-                      {copied ? <Check /> : <Copy />}
-                    </Button>
-                  </span>
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {t("accounts.login.expires", { m: Math.floor(flow.expiresInSeconds / 60), s: flow.expiresInSeconds % 60 })}
-                </p>
-              </div>
+              <p className="text-sm">
+                {t("accounts.login.waiting", { time: remainingLabel })}
+              </p>
               <Badge variant="secondary">{flow.provider}</Badge>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Button asChild size="sm" variant="outline">
-                <a href={flow.verificationUriComplete} target="_blank" rel="noreferrer">
-                  <ExternalLink />
-                  {t("accounts.login.reopen")}
-                </a>
+              <Button size="sm" variant="outline" onClick={() => void copyLink(flow.verificationUriComplete)}>
+                <Link2 />
+                {t("accounts.login.copyLink")}
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => void cancel()}>
+              <Button size="sm" variant="outline" onClick={() => void cancel()}>
                 <X />
                 {t("accounts.cancel")}
               </Button>
@@ -179,22 +176,8 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                 </Button>
               ))}
             </div>
-            <p className="text-xs text-muted-foreground">{t("accounts.login.socialNote")}</p>
           </div>
         )}
-
-        {message ? (
-          <p
-            role={message.tone === "ok" ? "status" : "alert"}
-            className={`flex items-center gap-1.5 text-sm ${
-              message.tone === "error" ? "text-destructive" : message.tone === "warn" ? "text-warning" : "text-success"
-            }`}
-          >
-            {message.tone === "ok" && <Check size={14} />}
-            {message.tone === "warn" && <TriangleAlert size={14} aria-hidden className="shrink-0" />}
-            {message.text}
-          </p>
-        ) : null}
       </CardContent>
     </Card>
   );

@@ -111,7 +111,7 @@ pub fn stream(
     ctx: StreamCtx,
 ) -> Pin<Box<dyn futures_util::Stream<Item = Result<String, StreamError>> + Send>> {
     Box::pin(async_stream::try_stream! {
-        let mut timer = GenerationTimer::start();
+        let mut timer = GenerationTimer::start_at(ctx.request.received);
         let mut em = Emitter { validator: AnthropicValidator::new() };
         let message_id = utils::message_id();
         let mut index: i64 = 0;
@@ -320,7 +320,8 @@ pub fn stream(
         if truncated {
             tracing::error!("Content truncated by Kiro API: stream ended without completion signals, length={} chars.", full_content.chars().count());
         }
-        let output_text = format!("{full_content}{full_thinking}");
+        let tool_text = crate::usage_tracking::tool_call_text(tool_blocks.iter().map(|(_, n, i)| (n.as_str(), pyjson::dumps(i))));
+        let output_text = format!("{full_content}{full_thinking}{tool_text}");
         let model = ctx.model.clone();
         let output_tokens = if output_text.len() >= 8192 {
             tokio::task::spawn_blocking(move || count_tokens(&output_text, true, Some(&model))).await.unwrap_or(0)
@@ -332,6 +333,7 @@ pub fn stream(
         if let Some((p, _)) = stream_core::tokens_from_context_usage(context_usage, output_tokens, ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model))) {
             input_tokens = p;
             from_upstream = true;
+            ctx.request.observe_reported_input(&ctx.model, p);
         }
         let mapped = stop_reasons::to_anthropic(stop_reason.as_deref());
         let final_reason = if truncated || stop_reasons::is_truncated(stop_reason.as_deref()) {
@@ -442,7 +444,13 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
             }
         }
     }
-    let output_text = format!("{acc_content}{acc_thinking}");
+    let tool_text = crate::usage_tracking::tool_call_text(
+        content
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| (b["name"].as_str().unwrap_or(""), pyjson::dumps(&b["input"]))),
+    );
+    let output_text = format!("{acc_content}{acc_thinking}{tool_text}");
     let model = ctx.model.clone();
     let output_tokens = if output_text.len() >= 8192 {
         tokio::task::spawn_blocking(move || count_tokens(&output_text, true, Some(&model)))
@@ -459,6 +467,7 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
             .max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model)),
     ) {
         input_tokens = p;
+        ctx.request.observe_reported_input(&ctx.model, p);
     }
     let completed = result.context_usage_percentage.is_some();
     let truncated = !completed && !result.content.is_empty() && result.tool_calls.is_empty();

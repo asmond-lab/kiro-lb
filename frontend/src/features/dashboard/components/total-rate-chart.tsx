@@ -8,17 +8,14 @@ import { Tooltip } from "@/components/dither-kit/tooltip";
 import { XAxis } from "@/components/dither-kit/x-axis";
 import { YAxis } from "@/components/dither-kit/y-axis";
 import { EmptyState } from "@/components/empty-state";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChartSkeleton } from "./skeletons";
 import { rateChartConfig, rateChartRows } from "../dither-series";
 import { summarizeRate, throttledAccounts } from "../request-rate-totals";
 import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { RequestRate } from "../types";
 import { usePreferences } from "../preferences";
-
-function formatClock(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
+import { RATE_WINDOWS, type RateWindowSeconds } from "../use-dashboard";
 
 function round(value: number): string {
   // A rate is rarely a whole number once buckets are scaled to a minute, but a
@@ -38,7 +35,14 @@ function Figure({ label, value, hint, tone }: { label: string; value: string; hi
   );
 }
 
-export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
+type TotalRateChartProps = {
+  rate?: RequestRate;
+  isLoading: boolean;
+  rateWindow?: RateWindowSeconds;
+  onWindowChange?: (seconds: RateWindowSeconds) => void;
+};
+
+export function TotalRateChart({ rate, isLoading, rateWindow, onWindowChange }: TotalRateChartProps) {
   const { t } = usePreferences();
   const totals = useMemo(() => summarizeRate(rate), [rate]);
   const throttled = useMemo(() => throttledAccounts(rate), [rate]);
@@ -48,22 +52,35 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
-        <CardTitle>{t("rate.totalTitle")}</CardTitle>
-        <CardDescription>
-          {rate
-            ? t("rate.totalDescWindow", {
-                s: rate.bucketSeconds,
-                from: formatClock(rate.bucketStarts[0]),
-                to: formatClock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds),
-              })
-            : t("rate.totalDesc")}
-        </CardDescription>
+        <CardTitle className="flex items-center gap-2">
+          <Activity size={16} aria-hidden /> {t("rate.totalTitle")}
+        </CardTitle>
+        <CardDescription>{t("rate.totalShort")}</CardDescription>
+        {onWindowChange && (
+          <CardAction>
+            <div role="group" aria-label={t("rate.period")} className="flex rounded-md border bg-muted/40 p-0.5">
+              {RATE_WINDOWS.map((option) => (
+                <button
+                  key={option.seconds}
+                  type="button"
+                  aria-pressed={rateWindow === option.seconds}
+                  onClick={() => onWindowChange(option.seconds)}
+                  className={`rounded px-2.5 py-1 text-xs font-medium tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                    rateWindow === option.seconds ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </CardAction>
+        )}
       </CardHeader>
-      <CardContent className="flex-1">
+      <CardContent className="flex flex-1 flex-col">
         {isLoading || !rate ? (
           <ChartSkeleton rows={1} />
         ) : (
-          <div className="space-y-4">
+          <div className="flex flex-1 flex-col gap-4">
             {/* Floor the plot area so this card's divider lines up with the token
                 panel's when the two share a row. */}
             <div className={`flex flex-col justify-center ${PANEL_UPPER_MIN_HEIGHT}`}>
@@ -105,7 +122,7 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
             {/* Container queries, not viewport ones: this panel sits full-width on
                 its own and half-width beside the token chart, so the column count
                 has to follow the card rather than the screen. */}
-            <dl className="grid grid-cols-2 gap-3 border-t pt-4 @md/panel:grid-cols-3 @2xl/panel:grid-cols-5">
+            <dl className="mt-auto grid grid-cols-2 gap-3 border-t pt-4 @md/panel:grid-cols-3 @2xl/panel:grid-cols-5">
               <Figure
                 label={t("rate.peak")}
                 value={`${round(totals.peakPerMinute)}/min`}

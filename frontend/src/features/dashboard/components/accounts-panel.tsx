@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2 } from "lucide-react";
+import { Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2, Users } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -284,7 +284,9 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t("accounts.title")}</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <Users size={16} aria-hidden /> {t("accounts.title")}
+        </CardTitle>
         <CardDescription>{t("accounts.description")}</CardDescription>
       </CardHeader>
       <CardContent>

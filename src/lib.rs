@@ -14,6 +14,7 @@ pub mod debug;
 pub mod device_login;
 pub mod docs;
 pub mod errors;
+pub mod input_calibration;
 pub mod metrics;
 pub mod model_catalog;
 pub mod model_costs;

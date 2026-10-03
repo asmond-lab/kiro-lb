@@ -1,18 +1,16 @@
 import {
   Activity,
-  CircleCheck,
   Coins,
   CreditCard,
+  ServerCog,
+  ShieldCheck,
   Wallet,
   Info,
   KeyRound,
   LayoutDashboard,
-  ServerCog,
   Settings,
-  ShieldCheck,
   TriangleAlert,
   Users,
-  X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -37,8 +35,10 @@ import { AccountTokenPanel } from "@/features/dashboard/components/account-token
 import { TotalRateChart } from "@/features/dashboard/components/total-rate-chart";
 import { AppearancePanel } from "@/features/dashboard/components/appearance-panel";
 import { usePreferences } from "@/features/dashboard/preferences";
-import { AppHeader, KiroLogo, StatCard } from "@/features/dashboard/components/shell";
+import { KiroLbWordmark, SignOutButton, KiroLogo, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
+import { AlertStack } from "@/features/dashboard/components/alert-stack";
+import { pushAlert } from "@/features/dashboard/alerts";
 
 // Quota moves slowly, so this is deliberately far apart: each tick is a real
 // call to Kiro for every account.
@@ -78,6 +78,23 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [isAuthenticated, isLive, refreshUsageQuietly]);
 
+  const { actionError, actionNotice, clearActionError, clearActionNotice } = dashboard;
+  useEffect(() => {
+    if (!actionError) return;
+    pushAlert({ tone: "error", error: actionError });
+    clearActionError();
+  }, [actionError, clearActionError]);
+  useEffect(() => {
+    if (!actionNotice) return;
+    pushAlert({ tone: "success", text: actionNotice });
+    clearActionNotice();
+  }, [actionNotice, clearActionNotice]);
+
+  const signInError = isAuthenticated ? "" : dashboard.error || dashboard.connectionError || "";
+  useEffect(() => {
+    if (signInError) pushAlert({ tone: "error", error: signInError });
+  }, [signInError]);
+
   if (!dashboard.isAuthenticated && isLoading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
@@ -92,7 +109,12 @@ export default function App() {
   if (!dashboard.isAuthenticated) {
     // A cold-start outage should not present as a silent login screen: surface
     // the non-auth failure the hook kept out of the auth error slot.
-    return <LoginCard error={dashboard.error || dashboard.connectionError || ""} onSignIn={dashboard.signIn} />;
+    return (
+      <>
+        <AlertStack />
+        <LoginCard error="" onSignIn={dashboard.signIn} />
+      </>
+    );
   }
 
   const createKey = async (name: string) => {
@@ -101,20 +123,61 @@ export default function App() {
     return created.apiKey;
   };
 
+  const navGroups = [
+    { label: t("navMonitoring"), items: [{ value: "overview", label: t("overview"), icon: LayoutDashboard }] },
+    {
+      label: t("navManagement"),
+      items: [
+        { value: "accounts", label: t("accounts"), icon: Users },
+        { value: "keys", label: t("apiKeys"), icon: KeyRound },
+      ],
+    },
+    {
+      label: t("navSystem"),
+      items: [
+        { value: "settings", label: t("settings"), icon: Settings },
+        { value: "info", label: t("info"), icon: Info },
+      ],
+    },
+  ];
+  const navItems = navGroups.flatMap((group) => group.items);
+  const signOut = () => void dashboard.signOut();
+
   return (
-    <div className="min-h-screen bg-background">
-      <AppHeader
-        isMutating={isMutating}
-        isLive={dashboard.isLive}
-        lastUpdatedAt={dashboard.lastUpdatedAt}
-        onToggleLive={() => dashboard.setIsLive(!dashboard.isLive)}
-        onRefresh={() => void runAction(dashboardApi.refreshUsage)}
-        onSignOut={() => void dashboard.signOut()}
-      />
+    <Tabs value={tab} onValueChange={selectTab} orientation="vertical" className="min-h-screen gap-0 bg-background">
+      <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col gap-6 border-r bg-muted/30 px-3 py-5 md:flex">
+        <div className="px-2">
+          <KiroLbWordmark />
+        </div>
+        <TabsList aria-label={t("navigation")} className="h-auto w-full flex-col items-stretch gap-5 bg-transparent p-0">
+          {navGroups.map((group) => (
+            <div key={group.label} className="flex flex-col gap-1">
+              <span className="px-3 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                {group.label}
+              </span>
+              {group.items.map(({ value, label, icon: Icon }) => (
+                <TabsTrigger
+                  key={value}
+                  value={value}
+                  className="h-9 flex-none justify-start gap-3 px-3 data-[state=active]:bg-background data-[state=active]:shadow-sm"
+                >
+                  <Icon aria-hidden />
+                  {label}
+                </TabsTrigger>
+              ))}
+            </div>
+          ))}
+        </TabsList>
+        <div className="mt-auto border-t pt-4">
+          <SignOutButton vertical onSignOut={signOut} />
+        </div>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col">
 
       {dashboard.connectionError && (
         <div role="status" aria-live="polite" className="border-b border-warning/30 bg-warning/10 text-warning">
-          <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
+          <div className="flex items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
             <span className="flex items-center gap-2 font-medium">
               <TriangleAlert size={15} aria-hidden />
               {t("overview.connectionLost")}
@@ -126,97 +189,46 @@ export default function App() {
         </div>
       )}
 
-      {dashboard.actionError && (
-        <div role="alert" className="border-b border-destructive/30 bg-destructive/10 text-destructive">
-          <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
-            <span className="flex items-center gap-2">
-              <TriangleAlert size={15} aria-hidden />
-              {dashboard.actionError}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              aria-label={t("overview.dismissError")}
-              onClick={dashboard.clearActionError}
-            >
-              <X aria-hidden />
-            </Button>
-          </div>
-        </div>
-      )}
+      <AlertStack />
 
-      {dashboard.actionNotice && (
-        <div role="status" aria-live="polite" className="border-b border-success/30 bg-success/10 text-success">
-          <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
-            <span className="flex items-center gap-2">
-              <CircleCheck size={15} aria-hidden />
-              {dashboard.actionNotice}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              aria-label={t("overview.dismissNotice")}
-              onClick={dashboard.clearActionNotice}
-            >
-              <X aria-hidden />
-            </Button>
+      <main className="w-full space-y-6 p-4 sm:p-6">
+          <div className="flex items-center justify-between gap-3 md:hidden">
+            <KiroLbWordmark />
+            <SignOutButton onSignOut={signOut} />
           </div>
-        </div>
-      )}
-
-      <main className="mx-auto max-w-7xl 2xl:max-w-[100rem] p-4 sm:p-6">
-        <Tabs value={tab} onValueChange={selectTab} className="space-y-6">
-          <TabsList className="h-10 w-full">
-            <TabsTrigger value="overview" className="gap-2 px-2 sm:px-3" title={t("overview")}>
-              <LayoutDashboard aria-hidden />
-              <span className="hidden sm:inline">{t("overview")}</span>
-            </TabsTrigger>
-            <TabsTrigger value="accounts" className="gap-2 px-2 sm:px-3" title={t("accounts")}>
-              <Users aria-hidden />
-              <span className="hidden sm:inline">{t("accounts")}</span>
-            </TabsTrigger>
-            <TabsTrigger value="keys" className="gap-2 px-2 sm:px-3" title={t("apiKeys")}>
-              <KeyRound aria-hidden />
-              <span className="hidden sm:inline">{t("apiKeys")}</span>
-            </TabsTrigger>
-            <TabsTrigger value="settings" className="gap-2 px-2 sm:px-3" title={t("settings")}>
-              <Settings aria-hidden />
-              <span className="hidden sm:inline">{t("settings")}</span>
-            </TabsTrigger>
-            <TabsTrigger value="info" className="gap-2 px-2 sm:px-3" title={t("info")}>
-              <Info aria-hidden />
-              <span className="hidden sm:inline">{t("info")}</span>
-            </TabsTrigger>
+          <TabsList aria-label={t("navigation")} className="h-10! w-full flex-row! md:hidden">
+            {navItems.map(({ value, label, icon: Icon }) => (
+              <TabsTrigger key={value} value={value} className="w-auto! justify-center! gap-2 px-2 sm:px-3" title={label}>
+                <Icon aria-hidden />
+                <span className="hidden sm:inline">{label}</span>
+              </TabsTrigger>
+            ))}
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
-            <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-12 xl:[&>*]:col-span-4">
+            <section className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border bg-border shadow-sm sm:grid-cols-3 xl:grid-cols-6">
               {isLoading || !overview ? (
                 Array.from({ length: 6 }).map((_, index) => <StatCardSkeleton key={index} />)
               ) : (
                 <>
                   <StatCard
-                    label={t("overview.totalTokens")}
+                    label={t("overview.totalTokens")} icon={<Coins />}
                     value={<span title={exactTokens(totals.totalTokens)}>{formatTokens(totals.totalTokens)}</span>}
-                    icon={<Coins size={15} />}
                   />
-                  <StatCard label={t("overview.requests24h")} value={overview.requests24h.toLocaleString()} icon={<Activity size={15} />} />
+                  <StatCard label={t("overview.requests24h")} icon={<Activity />} value={overview.requests24h.toLocaleString()} />
                   <StatCard
-                    label={t("overview.success24h")}
+                    label={t("overview.success24h")} icon={<ShieldCheck />}
                     value={
                       <span
                         className={kpis?.success.isCritical ? "text-destructive" : undefined}
                         title={t("overview.successTitle", { ok: overview.successes24h.toLocaleString(), total: overview.requests24h.toLocaleString() })}
                       >
-                        {kpis?.success.label}
+                        {kpis?.success.label.split(" (")[0]}
                       </span>
                     }
-                    icon={<ShieldCheck size={15} className={kpis?.success.isCritical ? "text-destructive" : undefined} />}
                   />
                   <StatCard
-                    label={t("overview.routableAccounts")}
+                    label={t("overview.routableAccounts")} icon={<ServerCog />}
                     value={
                       <span
                         className={kpis?.routableAccounts.isCritical ? "text-destructive" : undefined}
@@ -225,27 +237,18 @@ export default function App() {
                         {kpis?.routableAccounts.count}/{kpis?.routableAccounts.total}
                       </span>
                     }
-                    icon={
-                      <ServerCog
-                        size={15}
-                        className={kpis?.routableAccounts.isCritical ? "text-destructive" : undefined}
-                      />
-                    }
                   />
                   <StatCard
-                    label={t("overview.creditsUsed")}
+                    label={t("overview.creditsUsed")} icon={<CreditCard />}
                     value={<span title={t("overview.creditsAccounts", { n: credits.accounts })}>{formatCreditTotal(credits.used)}</span>}
-                    icon={<CreditCard size={15} />}
                   />
                   <StatCard
-                    label={t("overview.creditsAvailable")}
+                    label={t("overview.creditsAvailable")} icon={<Wallet />}
                     value={
                       <span title={t("overview.creditsAccounts", { n: credits.accounts })}>
-                        {formatCreditTotal(credits.available)}
-                        <span className="text-base text-muted-foreground"> / {formatCreditTotal(credits.limit)}</span>
+                        {formatCreditTotal(credits.available)} / {formatCreditTotal(credits.limit)}
                       </span>
                     }
-                    icon={<Wallet size={15} />}
                   />
                 </>
               )}
@@ -258,7 +261,12 @@ export default function App() {
                 Overview stays pool-wide; the per-account breakdown and its
                 inferred limits live on the Accounts tab, where a limit applies. */}
             <section className="grid items-stretch gap-6 xl:grid-cols-2">
-              <TotalRateChart rate={dashboard.rate} isLoading={isLoading} />
+              <TotalRateChart
+                rate={dashboard.rate}
+                isLoading={isLoading}
+                rateWindow={dashboard.rateWindow}
+                onWindowChange={dashboard.setRateWindow}
+              />
               <TokenUsagePanel keyUsage={dashboard.keyUsage} isLoading={isLoading} />
             </section>
 
@@ -309,7 +317,6 @@ export default function App() {
               accounts={dashboard.accounts}
               routableAccounts={kpis?.routableAccounts?.count}
               lastUpdatedAt={dashboard.lastUpdatedAt}
-              isLive={dashboard.isLive}
               isCheckingUpdates={dashboard.isCheckingUpdates}
               onCheckUpdates={() => void dashboard.checkForUpdates()}
               isInstallingUpdate={dashboard.isInstallingUpdate}
@@ -318,15 +325,12 @@ export default function App() {
           </TabsContent>
 
           <TabsContent value="settings">
-            <div className="space-y-6">
-              <AppearancePanel />
-              <SettingsPanel onNotice={dashboard.notify} />
-            </div>
+            <SettingsPanel onNotice={dashboard.notify} leading={<AppearancePanel />} />
           </TabsContent>
-        </Tabs>
       </main>
+      </div>
 
       <CreateKeyDialog open={isCreateKeyOpen} onOpenChange={setIsCreateKeyOpen} onCreate={createKey} />
-    </div>
+    </Tabs>
   );
 }

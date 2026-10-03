@@ -1,5 +1,5 @@
 import { Check, Moon, Paintbrush, Sun } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
@@ -7,8 +7,8 @@ import { Flag } from "./flags";
 import { LANGUAGES, setPreferences, usePreferences, type Language, type Theme } from "../preferences";
 
 const THEME_OPTIONS: { id: Theme; icon: typeof Sun; bg: string; card: string; line: string; accent: string }[] = [
-  { id: "dark", icon: Moon, bg: "bg-black", card: "bg-neutral-900 border-neutral-800", line: "bg-neutral-700", accent: "bg-neutral-200" },
-  { id: "light", icon: Sun, bg: "bg-neutral-100", card: "bg-white border-neutral-200", line: "bg-neutral-300", accent: "bg-neutral-800" },
+  { id: "dark", icon: Moon, bg: "bg-black", card: "bg-[#0a0a0a] border-[#1f1f1f]", line: "bg-[#262626]", accent: "bg-[#9046ff]" },
+  { id: "light", icon: Sun, bg: "bg-[#fafafa]", card: "bg-white border-[#ebebea]", line: "bg-[#e2e2e0]", accent: "bg-[#d97757]" },
 ];
 
 function ThemePreview({ option }: { option: (typeof THEME_OPTIONS)[number] }) {
@@ -36,6 +36,7 @@ export function AppearancePanel() {
           <Paintbrush className="size-4" aria-hidden />
           {t("appearance")}
         </CardTitle>
+        <CardDescription>{t("appearanceDescription")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="space-y-2">

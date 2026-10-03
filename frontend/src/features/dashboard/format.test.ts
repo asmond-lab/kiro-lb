@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { translate } from "./preferences";
 import {
   formatCredits,
   formatCreditsLabel,
@@ -194,5 +195,13 @@ describe("formatTokens", () => {
   it("renders an em dash for a missing value", () => {
     expect(formatTokens(null)).toBe("—");
     expect(formatTokens(undefined)).toBe("—");
+  });
+});
+
+describe("formatRelativeTime in another language", () => {
+  it("uses the translator it is given", () => {
+    const t = (key: string, vars?: Record<string, string | number>) => translate("pt-BR", key, vars);
+    expect(formatRelativeTime(10_000_000, 10_000_000 / 1000, t)).toBe("agora");
+    expect(formatRelativeTime(10_000_000 + 120_000, 10_000_000 / 1000, t)).toBe("há 2 min");
   });
 });

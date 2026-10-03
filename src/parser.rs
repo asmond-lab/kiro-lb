@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use crate::pyjson;
 use crate::utils::tool_call_id;
 
-const PATTERNS: [(&str, &str); 12] = [
+const PATTERNS: [(&str, &str); 13] = [
     ("{\"content\":", "content"),
     ("{\"name\":", "tool_start"),
     ("{\"input\":", "tool_input"),
@@ -23,6 +23,7 @@ const PATTERNS: [(&str, &str); 12] = [
     ("{\"stopReason\":", "stop_reason"),
     ("{\"text\":", "native_thinking"),
     ("{\"signature\":", "native_thinking_signature"),
+    ("{\"reason\":", "upstream_error"),
 ];
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ pub enum ParsedEvent {
     StopReason(String),
     Thinking { text: String, is_first: bool },
     ThinkingSignature(String),
+    UpstreamError { reason: String, message: String },
 }
 
 impl ParsedEvent {
@@ -51,6 +53,9 @@ impl ParsedEvent {
             }
             ParsedEvent::ThinkingSignature(s) => {
                 json!({"type": "native_thinking_signature", "data": s})
+            }
+            ParsedEvent::UpstreamError { reason, message } => {
+                json!({"type": "upstream_error", "reason": reason, "message": message})
             }
         }
     }
@@ -241,7 +246,7 @@ impl AwsEventStreamParser {
         let bytes = buffer.as_bytes();
         let mut events = Vec::new();
         let mut pos = 0usize;
-        let mut next_hit: [Option<Option<usize>>; 12] = [None; 12];
+        let mut next_hit: [Option<Option<usize>>; 13] = [None; 13];
         let mut keep_from = None;
         loop {
             let (earliest_pos, kind, scan_from, depth, in_string);
@@ -388,6 +393,18 @@ impl AwsEventStreamParser {
                         .to_owned(),
                 ))
             }
+            "upstream_error" => Some(ParsedEvent::UpstreamError {
+                reason: data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                message: data
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            }),
             _ => None,
         }
     }
