@@ -6,7 +6,7 @@ import { ReferenceLine } from "@/components/dither-kit/reference-line";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
-import { accountRateSeries } from "../dither-series";
+import { accountRateSeries, formatClock } from "../dither-series";
 import { isUnroutable, rateGuideReason } from "../routing-state";
 import type { AccountRateSeries } from "../types";
 import type { RequestRate } from "../types";
@@ -108,10 +108,6 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
   );
 }
 
-function clock(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
 export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
   const { t } = usePreferences();
   const [showUnroutable, setShowUnroutable] = useState(false);
@@ -139,8 +135,8 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
           {rate && rate.bucketStarts.length > 0
             ? t("rate.perAccountDescWindow", {
                 s: rate.bucketSeconds,
-                from: clock(rate.bucketStarts[0]),
-                to: clock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds),
+                from: formatClock(rate.bucketStarts[0]),
+                to: formatClock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds),
               })
             : t("rate.perAccountDesc")}
         </CardDescription>
