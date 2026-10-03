@@ -108,6 +108,10 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
   );
 }
 
+function clock(unixSeconds: number): string {
+  return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
   const { t } = usePreferences();
   const [showUnroutable, setShowUnroutable] = useState(false);
@@ -131,7 +135,15 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
         <CardTitle className="flex items-center gap-2">
           <Activity size={16} aria-hidden /> {t("rate.perAccountTitle")}
         </CardTitle>
-        <CardDescription>{t("rate.perAccountDesc")}</CardDescription>
+        <CardDescription>
+          {rate && rate.bucketStarts.length > 0
+            ? t("rate.perAccountDescWindow", {
+                s: rate.bucketSeconds,
+                from: clock(rate.bucketStarts[0]),
+                to: clock(rate.bucketStarts[rate.bucketStarts.length - 1] + rate.bucketSeconds),
+              })
+            : t("rate.perAccountDesc")}
+        </CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading || !rate ? (

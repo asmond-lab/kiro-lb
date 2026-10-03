@@ -89,3 +89,24 @@ fn the_auto_kiro_alias_resolves_for_price_window_and_catalog() {
         kiro_lb::model_resolver::ModelSupport::Supported
     );
 }
+
+#[test]
+fn version_first_claude_ids_are_hyphenated_too() {
+    assert_eq!(
+        kiro_lb::model_resolver::public_model_id("claude-3.7-sonnet"),
+        "claude-3-7-sonnet"
+    );
+    assert_eq!(
+        kiro_lb::model_resolver::public_model_id("claude-opus-4.6"),
+        "claude-opus-4-6"
+    );
+}
+
+#[test]
+fn failed_initializations_back_off_up_to_five_minutes() {
+    use kiro_lb::pool::init_retry_delay;
+    assert_eq!(init_retry_delay(0).as_secs(), 10);
+    assert_eq!(init_retry_delay(1).as_secs(), 20);
+    assert_eq!(init_retry_delay(3).as_secs(), 80);
+    assert_eq!(init_retry_delay(10).as_secs(), 300);
+}

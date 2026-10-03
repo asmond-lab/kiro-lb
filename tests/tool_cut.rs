@@ -71,3 +71,22 @@ async fn malformed_tool_input_that_is_not_a_cut_still_fails() {
         "{events:?}"
     );
 }
+
+#[tokio::test]
+async fn a_tool_only_response_cut_mid_argument_still_ends_as_max_tokens() {
+    let events = run(
+        r#"{"name":"Write","toolUseId":"t1","input":"{\"file_path\": \"/a.txt\"","stop":true}"#,
+    )
+    .await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert_eq!(stop_reasons(&events), vec!["MAX_TOKENS"]);
+}
+
+#[tokio::test]
+async fn an_empty_thinking_frame_does_not_turn_a_load_error_into_a_cut() {
+    let events = run(r#"{"text":""}{"reason":"MODEL_TEMPORARILY_UNAVAILABLE","message":"Encountered unexpectedly high load"}"#).await;
+    assert!(
+        matches!(events.last(), Some(Err(StreamError::Upstream(_)))),
+        "{events:?}"
+    );
+}

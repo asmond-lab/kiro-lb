@@ -83,10 +83,16 @@ pub fn get_model_id_for_kiro(model_name: &str) -> String {
 
 pub fn public_model_id(kiro_id: &str) -> String {
     static DOTTED: OnceLock<Regex> = OnceLock::new();
+    static VERSION_FIRST: OnceLock<Regex> = OnceLock::new();
     let re =
         DOTTED.get_or_init(|| Regex::new(r"^(claude-(?:haiku|sonnet|opus)-\d+)\.(\d+)$").unwrap());
-    match re.captures(kiro_id) {
-        Some(c) => format!("{}-{}", &c[1], &c[2]),
+    if let Some(c) = re.captures(kiro_id) {
+        return format!("{}-{}", &c[1], &c[2]);
+    }
+    let first = VERSION_FIRST
+        .get_or_init(|| Regex::new(r"^claude-(\d+)\.(\d+)-(haiku|sonnet|opus)$").unwrap());
+    match first.captures(kiro_id) {
+        Some(c) => format!("claude-{}-{}-{}", &c[1], &c[2], &c[3]),
         None => kiro_id.to_owned(),
     }
 }

@@ -45,7 +45,7 @@ export function AlertStack() {
                 className={`border-b ${TONE_CLASS[alert.tone]}`}
               >
                 <div className="flex items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
-                  <span className="flex items-center gap-2">
+                  <span className="flex min-w-0 flex-1 items-center gap-2 break-words [overflow-wrap:anywhere]">
                     <Icon size={15} aria-hidden className="shrink-0" />
                     {text}
                   </span>

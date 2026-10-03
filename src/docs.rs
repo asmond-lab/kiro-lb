@@ -146,7 +146,12 @@ pub async fn openapi() -> Response {
         if !params.is_empty() {
             o["parameters"] = Value::Array(params);
         }
-        if matches!(*method, "post" | "put" | "patch") {
+        if *path == "/api/dashboard/models" && *method == "put" {
+            o["requestBody"] = json!({"required": true, "content": {"application/json": {
+                "schema": {"type": "object", "required": ["hidden"], "properties": {"hidden": {"type": "array", "items": {"type": "string"}, "description": "Model ids left out of /v1/models"}}},
+                "example": {"hidden": ["claude-opus-4-5"]},
+            }}});
+        } else if matches!(*method, "post" | "put" | "patch") {
             o["requestBody"] =
                 json!({"content": {"application/json": {"schema": {"type": "object"}}}});
         }

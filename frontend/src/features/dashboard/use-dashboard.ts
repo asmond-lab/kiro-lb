@@ -170,11 +170,12 @@ export function useDashboard(): DashboardState {
   const reload = useCallback(async () => {
     const requestId = ++dashboardRequestId.current;
     try {
+      const window = rateWindowRef.current;
       const [nextOverview, nextAccounts, nextKeys, nextRate, nextKeyUsage, nextAccountUsage] = await Promise.all([
         dashboardApi.overview(),
         dashboardApi.accounts(),
         dashboardApi.apiKeys(),
-        dashboardApi.requestRate(rateWindowRef.current, rateBucket(rateWindowRef.current)),
+        dashboardApi.requestRate(window, rateBucket(window)),
         dashboardApi.keyUsage(),
         dashboardApi.accountTokenUsage(),
       ]);
@@ -182,7 +183,7 @@ export function useDashboard(): DashboardState {
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
       setApiKeys(nextKeys.apiKeys);
-      setRate(nextRate);
+      if (window === rateWindowRef.current) setRate(nextRate);
       setKeyUsage(nextKeyUsage.usage);
       setAccountTokenUsage(nextAccountUsage.usage);
       noteSuccess();
@@ -201,17 +202,18 @@ export function useDashboard(): DashboardState {
   const refreshLive = useCallback(async () => {
     const requestId = ++dashboardRequestId.current;
     try {
+      const window = rateWindowRef.current;
       const [nextOverview, nextAccounts, nextRate, nextKeyUsage, nextAccountUsage] = await Promise.all([
         dashboardApi.overview(),
         dashboardApi.accounts(),
-        dashboardApi.requestRate(rateWindowRef.current, rateBucket(rateWindowRef.current)),
+        dashboardApi.requestRate(window, rateBucket(window)),
         dashboardApi.keyUsage(),
         dashboardApi.accountTokenUsage(),
       ]);
       if (requestId !== dashboardRequestId.current) return;
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
-      setRate(nextRate);
+      if (window === rateWindowRef.current) setRate(nextRate);
       setKeyUsage(nextKeyUsage.usage);
       setAccountTokenUsage(nextAccountUsage.usage);
       noteSuccess();
@@ -232,8 +234,10 @@ export function useDashboard(): DashboardState {
       .then((next) => {
         if (rateWindowRef.current === seconds) setRate(next);
       })
-      .catch(() => undefined);
-  }, []);
+      .catch((cause) => {
+        if (rateWindowRef.current === seconds) handleFailure(cause);
+      });
+  }, [handleFailure]);
 
   useEffect(() => {
     void reload();

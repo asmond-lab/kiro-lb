@@ -120,13 +120,13 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String
 
 /// Records every /v1 request once its body finishes, off the runtime, and
 /// gates new work while a blue/green handoff drains the slot.
-/// `/v1` answers any origin, so browser clients can call it with a key. The
-/// control plane is served to its own SPA only: a wildcard there would let any
-/// page the operator opens read dashboard replies.
+/// Only `/v1` answers any origin, so browser clients can call it with a key.
+/// The control plane, handoff and internal routes are served to the gateway's
+/// own pages: a wildcard there would let any page the operator opens read them.
 pub async fn cors_headers(req: Request<Body>, next: Next) -> Response {
-    let control_plane = req.uri().path().starts_with("/api/dashboard");
+    let data_plane = req.uri().path().starts_with("/v1/") || req.uri().path() == "/v1";
     let mut r = next.run(req).await;
-    if !control_plane {
+    if data_plane {
         r.headers_mut().insert(
             "access-control-allow-origin",
             axum::http::HeaderValue::from_static("*"),

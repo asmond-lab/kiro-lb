@@ -74,6 +74,12 @@ export type SettingsPanelProps = {
 
 const AUTO_PROBE_MODEL = "__auto__";
 
+/** The gateway accepts 0 (off) or 5..1440 minutes; anything between snaps to the minimum. */
+function probeIntervalToSave(minutes: number): number {
+  if (!Number.isFinite(minutes) || minutes <= 0) return 0;
+  return Math.min(1440, Math.max(5, Math.round(minutes)));
+}
+
 export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
   const { t } = usePreferences();
   const [endpoints, setEndpoints] = useState<EndpointsResponse | null>(null);
@@ -165,7 +171,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
         cooldownSeconds: cooldown,
         strategy,
         probeModel,
-        probeIntervalMinutes: probeInterval,
+        probeIntervalMinutes: probeIntervalToSave(probeInterval),
       });
       setOrder(saved.settings.order);
       setEndpoints((previous) => (previous ? { ...previous, settings: saved.settings } : previous));
@@ -511,6 +517,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
                       disabled={isBusy}
                       className="w-0 min-w-full"
                       onChange={(event) => setProbeInterval(Number(event.target.value))}
+                      onBlur={() => setProbeInterval((value) => probeIntervalToSave(value))}
                     />
                   </div>
                 </>

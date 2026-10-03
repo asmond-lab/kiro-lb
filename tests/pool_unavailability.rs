@@ -1,3 +1,5 @@
+mod common;
+
 use kiro_lb::pool::{AccountManager, Unavailable};
 use serde_json::json;
 
@@ -25,7 +27,7 @@ async fn unavailability_separates_lasting_states_from_temporary_ones() {
     let sources = vec![source("a"), source("b")];
     kiro_lb::store::with(|c| kiro_lb::store::replace_account_sources(c, &sources, true)).unwrap();
 
-    let pool = AccountManager::new(reqwest::Client::new());
+    let pool = AccountManager::new(common::upstream().await.http);
     pool.load_credentials();
     pool.load_state();
     for id in ["a", "b"] {
@@ -63,4 +65,18 @@ async fn unavailability_separates_lasting_states_from_temporary_ones() {
     a.state.lock().quota_exhausted_until = 0.0;
     a.state.lock().suspended_until = now + 3600.0;
     assert_eq!(pool.unavailability("m"), Unavailable::Accounts);
+
+    a.state.lock().suspended_until = 0.0;
+    b.state.lock().suspended_until = 0.0;
+    for x in [&a, &b] {
+        let mut st = x.state.lock();
+        st.quota_headroom = Some(0.0);
+        st.quota_overage_enabled = Some(false);
+        st.quota_resets_at = now + 7200.0;
+        st.quota_observed_at = now;
+    }
+    match pool.unavailability("m") {
+        Unavailable::Quota { resets_in } => assert!(resets_in > 7100.0 && resets_in <= 7200.0),
+        other => panic!("spent usage must read as quota, got {other:?}"),
+    }
 }

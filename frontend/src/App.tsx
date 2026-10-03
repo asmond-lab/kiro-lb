@@ -38,7 +38,8 @@ import { usePreferences } from "@/features/dashboard/preferences";
 import { KiroLbWordmark, SignOutButton, KiroLogo, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 import { AlertStack } from "@/features/dashboard/components/alert-stack";
-import { pushAlert } from "@/features/dashboard/alerts";
+import { dismissAlert, pushAlert } from "@/features/dashboard/alerts";
+import { useMediaQuery } from "@/features/dashboard/use-media-query";
 
 // Quota moves slowly, so this is deliberately far apart: each tick is a real
 // call to Kiro for every account.
@@ -91,9 +92,17 @@ export default function App() {
   }, [actionNotice, clearActionNotice]);
 
   const signInError = isAuthenticated ? "" : dashboard.error || dashboard.connectionError || "";
+  const signInAlert = useRef<number | undefined>(undefined);
   useEffect(() => {
-    if (signInError) pushAlert({ tone: "error", error: signInError });
+    if (signInError) signInAlert.current = pushAlert({ tone: "error", error: signInError });
   }, [signInError]);
+  useEffect(() => {
+    if (isAuthenticated && signInAlert.current !== undefined) {
+      dismissAlert(signInAlert.current);
+      signInAlert.current = undefined;
+    }
+  }, [isAuthenticated]);
+  const wide = useMediaQuery("(min-width: 768px)");
 
   if (!dashboard.isAuthenticated && isLoading) {
     return (
@@ -144,7 +153,7 @@ export default function App() {
   const signOut = () => void dashboard.signOut();
 
   return (
-    <Tabs value={tab} onValueChange={selectTab} orientation="vertical" className="min-h-screen gap-0 bg-background">
+    <Tabs value={tab} onValueChange={selectTab} orientation={wide ? "vertical" : "horizontal"} className="min-h-screen flex-row! gap-0 bg-background">
       <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col gap-6 border-r bg-muted/30 px-3 py-5 md:flex">
         <div className="px-2">
           <KiroLbWordmark />

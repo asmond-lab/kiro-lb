@@ -68,6 +68,7 @@ pub struct Account {
     pub state: Mutex<AccountState>,
     init: tokio::sync::Mutex<()>,
     init_retry_at: Mutex<Option<Instant>>,
+    init_failures: std::sync::atomic::AtomicU32,
     init_scheduled: std::sync::atomic::AtomicBool,
     init_complete: tokio::sync::Notify,
     models_refresh: tokio::sync::Mutex<()>,
@@ -193,6 +194,15 @@ pub struct AccountManager {
 /// After a warm-up that initialized nothing, discovery answers "not ready"
 /// immediately for this long instead of sweeping dead accounts on every poll.
 pub const WARM_UP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+const INIT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Each failed background initialization waits twice as long as the last, so
+/// an auth-host outage is not retried every 10 seconds for as long as it lasts.
+pub fn init_retry_delay(previous_failures: u32) -> std::time::Duration {
+    WARM_UP_RETRY_AFTER
+        .saturating_mul(1u32 << previous_failures.min(5))
+        .min(INIT_RETRY_MAX)
+}
 
 fn source_for_account(account: &Account) -> Option<Source> {
     match account.config.get("type").and_then(Value::as_str) {
@@ -374,6 +384,7 @@ impl AccountManager {
                         state: Mutex::new(AccountState::default()),
                         init: tokio::sync::Mutex::new(()),
                         init_retry_at: Mutex::new(None),
+                        init_failures: 0.into(),
                         init_scheduled: false.into(),
                         init_complete: tokio::sync::Notify::new(),
                         models_refresh: tokio::sync::Mutex::new(()),
@@ -799,7 +810,16 @@ impl AccountManager {
     async fn initialize_for_maintenance(&self, a: &Arc<Account>, timeout: Duration) -> bool {
         let result = tokio::time::timeout(timeout, self.initialize(a)).await;
         let initialized = matches!(result, Ok(true));
-        *a.init_retry_at.lock() = (!initialized).then(|| Instant::now() + WARM_UP_RETRY_AFTER);
+        *a.init_retry_at.lock() = if initialized {
+            a.init_failures
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            None
+        } else {
+            let failures = a
+                .init_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Instant::now() + init_retry_delay(failures))
+        };
         if result.is_err() {
             tracing::warn!(
                 "Account {} did not initialize within {timeout:?}; it will be retried in the background",
@@ -1201,12 +1221,14 @@ impl AccountManager {
                 continue;
             }
             serving += 1;
-            let signed_out = a.auth.lock().is_none();
             let s = a.state.lock();
             if s.quota_exhausted_until > now {
                 quota += 1;
                 soonest = soonest.min(s.quota_exhausted_until - now);
-            } else if signed_out || s.suspended_until > now || s.auth_dead_until > now {
+            } else if is_quota_depleted(&s, now) {
+                quota += 1;
+                soonest = soonest.min((s.quota_resets_at - now).max(0.0));
+            } else if s.suspended_until > now || s.auth_dead_until > now {
                 gone += 1;
             }
         }
@@ -1783,6 +1805,7 @@ mod tests {
             state: Mutex::new(AccountState::default()),
             init: tokio::sync::Mutex::new(()),
             init_retry_at: Mutex::new(None),
+            init_failures: 0.into(),
             init_scheduled: false.into(),
             init_complete: tokio::sync::Notify::new(),
             models_refresh: tokio::sync::Mutex::new(()),

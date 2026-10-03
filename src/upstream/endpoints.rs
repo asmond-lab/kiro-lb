@@ -132,9 +132,10 @@ pub fn record_latency(region: &str, model: &str, medians: &[(&str, f64)]) {
     }
     let snapshot = with_latency(|all| {
         let r = all.entry(region.to_owned()).or_default();
-        for (k, ms) in medians {
-            r.medians.insert((*k).to_owned(), *ms);
-        }
+        r.medians = medians
+            .iter()
+            .map(|(k, ms)| ((*k).to_owned(), *ms))
+            .collect();
         r.measured_at = crate::store::now_f64();
         r.model = Some(model.to_owned());
         let best = r

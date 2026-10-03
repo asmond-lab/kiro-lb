@@ -76,7 +76,7 @@ export function RequestLogTable({
           <ScrollText size={16} aria-hidden /> {t("logs.title")}
         </CardTitle>
         <CardDescription>{t("logs.short")}</CardDescription>
-        <CardAction className="flex flex-wrap items-center justify-end gap-2">
+        <CardAction className="col-span-full col-start-1 row-span-1 row-start-3 flex flex-wrap items-center justify-start gap-2 justify-self-stretch sm:col-span-1 sm:col-start-2 sm:row-span-2 sm:row-start-1 sm:justify-end sm:justify-self-end">
           <Select value={model || ALL_MODELS} onValueChange={(value) => onModelChange(value === ALL_MODELS ? "" : value)}>
             <SelectTrigger className="w-56" aria-label={t("logs.filterModel")}>
               <SelectValue placeholder={t("logs.allModels")} />

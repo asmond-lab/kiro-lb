@@ -149,6 +149,14 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
               </p>
               <Badge variant="secondary">{flow.provider}</Badge>
             </div>
+            <a
+              href={flow.verificationUriComplete}
+              target="_blank"
+              rel="noreferrer"
+              className="block break-all font-mono text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              {flow.verificationUriComplete}
+            </a>
             <div className="flex flex-wrap gap-2">
               <Button size="sm" variant="outline" onClick={() => void copyLink(flow.verificationUriComplete)}>
                 <Link2 />

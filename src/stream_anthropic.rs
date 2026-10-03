@@ -240,6 +240,7 @@ pub fn stream(
                                     yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
                                     index += 1;
                                     intercepted.insert(tool_call_signature(&json!({"function": {"name": name, "arguments": pyjson::dumps(&input)}})));
+                                    ctx.request.input_estimate.lock().take();
                                     current = followup(id.clone(), query.clone(), web_search::summary(&query, &results)).await?;
                                     stop_reason = None;
                                     context_usage = None;
@@ -285,6 +286,7 @@ pub fn stream(
                 yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": t}}))?;
             }
         }
+        let native_tools = tool_blocks.len();
         let mut native: HashSet<String> = tool_blocks.iter().map(|(_, n, i)| tool_call_signature(&json!({"function": {"name": n, "arguments": pyjson::dumps(i)}}))).collect();
         native.extend(intercepted);
         let bracket: Vec<Value> = parse_bracket_tool_calls(&full_content).into_iter().filter(|t| !native.contains(&tool_call_signature(t))).collect();
@@ -320,7 +322,7 @@ pub fn stream(
         if truncated {
             tracing::error!("Content truncated by Kiro API: stream ended without completion signals, length={} chars.", full_content.chars().count());
         }
-        let tool_text = crate::usage_tracking::tool_call_text(tool_blocks.iter().map(|(_, n, i)| (n.as_str(), pyjson::dumps(i))));
+        let tool_text = crate::usage_tracking::tool_call_text(tool_blocks[..native_tools].iter().map(|(_, n, i)| (n.as_str(), pyjson::dumps(i))));
         let output_text = format!("{full_content}{full_thinking}{tool_text}");
         let model = ctx.model.clone();
         let output_tokens = if output_text.len() >= 8192 {
@@ -417,6 +419,7 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         );
         native.push(json!({"type": "server_tool_use", "id": srv_id, "name": "web_search", "input": {"query": query}}));
         native.push(json!({"type": "web_search_tool_result", "tool_use_id": srv_id, "content": web_search::search_content(&results)}));
+        ctx.request.input_estimate.lock().take();
         let next = followup(id, query.clone(), web_search::summary(&query, &results)).await?;
         result = stream_core::collect(next).await?;
     }
@@ -447,7 +450,9 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
     let tool_text = crate::usage_tracking::tool_call_text(
         content
             .iter()
-            .filter(|b| b["type"] == "tool_use")
+            .zip(&native)
+            .filter(|(b, n)| b["type"] == "tool_use" && n["tool"].get("_bracket").is_none())
+            .map(|(b, _)| b)
             .map(|b| (b["name"].as_str().unwrap_or(""), pyjson::dumps(&b["input"]))),
     );
     let output_text = format!("{acc_content}{acc_thinking}{tool_text}");

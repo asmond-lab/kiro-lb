@@ -843,9 +843,17 @@ impl KiroAuth {
 
     pub async fn force_refresh(&self) -> Result<String, AuthError> {
         let _guard = self.refresh_lock.lock().await;
-        self.refresh_with_lease(true)
-            .await
-            .map_err(|e| self.dead(e))?;
+        if self.in_refresh_backoff() {
+            return Err(refresh_backoff_error());
+        }
+        if let Err(e) = self.refresh_with_lease(true).await {
+            if is_transient_refresh_error(&e) {
+                *self.refresh_retry_at.lock() = now() + REFRESH_RETRY_SECONDS;
+                return Err(e);
+            }
+            return Err(self.dead(e));
+        }
+        *self.refresh_retry_at.lock() = 0.0;
         self.cached_token()
             .ok_or_else(|| AuthError::Other("Failed to obtain access token".into()))
     }

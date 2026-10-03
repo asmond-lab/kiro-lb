@@ -236,8 +236,12 @@ pub async fn ping(
         results.push(json!({"key": ep.key, "name": ep.name, "samples": samples[i].len(), "medianMs": med, "minMs": min, "maxMs": max, "failures": failures[i]}));
     }
     let region = auth.api_region.clone();
-    let measured: Vec<(&str, f64)> = medians.iter().map(|(k, m, _)| (*k, *m)).collect();
-    endpoints::record_latency(&region, &model, &measured);
+    if only.is_none() {
+        let measured: Vec<(&'static str, f64)> = medians.iter().map(|(k, m, _)| (*k, *m)).collect();
+        let (r, m) = (region.clone(), model.clone());
+        let _ =
+            tokio::task::spawn_blocking(move || endpoints::record_latency(&r, &m, &measured)).await;
+    }
     let mut out = json!({"model": model, "reps": reps, "requestsSpent": reps * targets.len() as i64, "results": results, "region": region});
     let verdict = if medians.is_empty() {
         json!({"fastest": null, "conclusive": false, "verdict": "No endpoint answered."})

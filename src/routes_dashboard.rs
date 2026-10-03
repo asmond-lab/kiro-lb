@@ -1572,7 +1572,7 @@ pub async fn dashboard_models(State(state): State<Shared>, headers: HeaderMap) -
     json_response(
         200,
         json!({
-            "models": models.iter().map(|m| json!({"id": m, "listedAs": crate::model_resolver::public_model_id(m), "listed": settings::is_listed(m)})).collect::<Vec<_>>(),
+            "models": models.iter().map(|m| json!({"id": m, "listedAs": crate::model_resolver::public_model_id(m), "key": settings::listing_key(m), "listed": settings::is_listed(m)})).collect::<Vec<_>>(),
             "hidden": settings::unlisted_models(),
         }),
     )

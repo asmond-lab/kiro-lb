@@ -26,7 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - end the turn as `max_tokens` / `length` when Kiro cuts a response inside a tool call, or with its `MODEL_TEMPORARILY_UNAVAILABLE` event after output started, instead of a 500 the client retried forever; the cut call is dropped
 - record a response Kiro cut in the request log (warning icon and a detail field), including a cut tool call after complete ones, which ends the turn as `tool_use`
-- `/api/dashboard` no longer sends `access-control-allow-origin: *`, and with `DASHBOARD_AUTH=false` it refuses cross-site requests
+- only `/v1` sends `access-control-allow-origin: *`; with `DASHBOARD_AUTH=false` the dashboard refuses cross-site requests (`Sec-Fetch-Site`, then Origin against Host)
+- a failing background account initialization backs off from 10s up to 5 minutes, and a forced token refresh honours the 30s backoff
+- an account still initializing no longer makes the pool answer 403, and usage that reports the quota spent with overage off counts as out of quota (402)
+- a single-endpoint ping no longer changes routing; a full probe replaces the region's measurements, so models never mix, and the write runs off the async runtime
+- tool calls recovered from `[Called …]` text are counted once in output tokens
+- a session's input calibration applies only to the model it was measured on, and web-search follow-ups no longer feed it
+- the per-account rate chart states its bucket and time window again; the request log filters wrap below the title on small screens
+- device login shows the approval link as a fallback when the clipboard is unavailable
+- a period change is no longer overwritten by a poll already in flight, and its failures reach the dashboard's error handling
+- the light theme's terracotta is darkened to `#b85a36` for WCAG AA contrast on buttons
+- the mobile tab bar uses left/right arrow keys; a failed sign-in alert is dismissed once signed in
 - the `fastest` endpoint strategy is no longer overridden by the endpoint that last served an account, and a cooldown of 0 disables its backoff
 - a transient token refresh failure backs off for 30s even after the access token expired, instead of retrying on every request
 - hidden models are stored by Kiro id, so a hyphenated or dotted spelling can be listed again from the dashboard

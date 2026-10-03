@@ -29,8 +29,10 @@ export function ModelListingCard({ onNotice }: { onNotice: (message: string) => 
     void load();
   }, [load]);
 
-  const toggle = async (id: string, listed: boolean) => {
-    const next = listed ? hidden.filter((h) => h !== id) : [...hidden, id];
+  const toggle = async (model: DashboardModel, listed: boolean) => {
+    const id = model.id;
+    const key = model.key ?? id;
+    const next = listed ? hidden.filter((h) => h !== key) : [...hidden.filter((h) => h !== key), key];
     setBusy("save");
     try {
       const saved = await dashboardApi.saveListedModels(next);
@@ -74,7 +76,7 @@ export function ModelListingCard({ onNotice }: { onNotice: (message: string) => 
                   type="checkbox"
                   checked={listed}
                   disabled={busy !== null}
-                  onChange={(event) => void toggle(m.id, event.target.checked)}
+                  onChange={(event) => void toggle(m, event.target.checked)}
                 />
                 <ModelMark model={m.id} />
                 <span className="font-mono text-xs">{m.listedAs ?? m.id}</span>

@@ -52,7 +52,7 @@ impl RequestCtx {
     }
 
     pub fn observe_reported_input(&self, model: &str, reported: i64) {
-        if let Some((session, estimate)) = *self.input_estimate.lock() {
+        if let Some((session, estimate)) = self.input_estimate.lock().take() {
             crate::input_calibration::observe(session, model, estimate, reported);
         }
     }

@@ -132,7 +132,7 @@ pub fn stream(
         } else {
             mapped.unwrap_or("stop")
         };
-        let tool_text = crate::usage_tracking::tool_call_text(all.iter().map(|t| {
+        let tool_text = crate::usage_tracking::tool_call_text(all.iter().filter(|t| t.get("_bracket").is_none()).map(|t| {
             (
                 t.pointer("/function/name").and_then(Value::as_str).unwrap_or(""),
                 t.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("").to_owned(),

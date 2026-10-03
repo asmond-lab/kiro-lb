@@ -28,6 +28,7 @@ describe("alerts", () => {
     const first = alerts.pushAlert({ tone: "error", error: "Invalid password" });
     const second = alerts.pushAlert({ tone: "error", error: "Invalid password" });
     expect(second).toBe(first);
+    expect(alerts.getSnapshot()).toHaveLength(1);
     const third = alerts.pushAlert({ tone: "error", error: "Not Found" });
     expect(third).not.toBe(first);
   });

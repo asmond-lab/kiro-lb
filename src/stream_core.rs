@@ -115,10 +115,12 @@ impl CutTracker {
 }
 
 fn convert(e: ParsedEvent, cut: &mut CutTracker) -> Result<Option<KiroEvent>, StreamError> {
-    let produced = matches!(
-        &e,
-        ParsedEvent::Content(_) | ParsedEvent::Thinking { .. } | ParsedEvent::ThinkingSignature(_)
-    );
+    let produced = match &e {
+        ParsedEvent::Content(c) => !c.is_empty(),
+        ParsedEvent::Thinking { text, .. } => !text.is_empty(),
+        ParsedEvent::ThinkingSignature(s) => !s.is_empty(),
+        _ => false,
+    };
     if produced {
         cut.produced = true;
     }
@@ -204,7 +206,7 @@ fn parse_kiro_stream_inner(
                 yield event;
             }
         }
-        if !received {
+        if !received && !cut.cut {
             Err(StreamError::Protocol(NO_EVENTS))?;
         }
         if cut.cut && !cut.tools {

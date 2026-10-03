@@ -263,6 +263,7 @@ export type EndpointStrategy = "ordered" | "fastest";
 export interface DashboardModel {
   id: string;
   listedAs?: string;
+  key?: string;
   listed?: boolean;
 }
 

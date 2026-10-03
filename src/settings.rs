@@ -459,7 +459,7 @@ pub fn update_endpoints(
 
 static UNLISTED_MODELS: RwLock<Option<Vec<String>>> = RwLock::new(None);
 
-fn listing_key(model: &str) -> String {
+pub fn listing_key(model: &str) -> String {
     crate::model_resolver::get_model_id_for_kiro(model)
 }
 
@@ -530,12 +530,13 @@ fn apply_release_defaults() {
     {
         return;
     }
+    let mut written = Ok(());
     for (env, key) in [
         ("SHORTEN_CLAUDE_TOOLS", "shorten_claude_tools"),
         ("CLAUDE_WRITE_HINT", "claude_write_hint"),
     ] {
         if std::env::var_os(env).is_none() {
-            let _ = store::save_setting(key, &json!(true));
+            written = written.and(store::save_setting(key, &json!(true)));
         }
     }
     let mut endpoints = match store::load_setting("endpoints") {
@@ -553,7 +554,13 @@ fn apply_release_defaults() {
         "strategy".into(),
         json!(crate::upstream::endpoints::FASTEST),
     );
-    let _ = store::save_setting("endpoints", &Value::Object(endpoints));
+    written = written.and(store::save_setting("endpoints", &Value::Object(endpoints)));
+    if let Err(e) = written {
+        tracing::warn!(
+            "[Settings] Could not apply the {RELEASE_DEFAULTS} defaults; retrying next start: {e}"
+        );
+        return;
+    }
     match store::save_setting("release_defaults", &json!(RELEASE_DEFAULTS)) {
         Ok(()) => tracing::info!(
             "[Settings] Applied {RELEASE_DEFAULTS} defaults: tool shortening, Write/Edit hint, fastest endpoint order"

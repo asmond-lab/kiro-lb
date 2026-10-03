@@ -64,4 +64,5 @@ async fn dashboard_opens_without_a_session_when_auth_is_off() {
             .status(),
         403
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }

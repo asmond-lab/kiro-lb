@@ -10,7 +10,7 @@ const COUNT_TOKENS_REFRESH_SECONDS: f64 = 600.0;
 
 #[derive(Default)]
 struct State {
-    sessions: HashMap<u64, (f64, f64)>,
+    sessions: HashMap<u64, (String, f64, f64)>,
     models: HashMap<String, f64>,
     count_tokens: HashMap<String, (f64, f64)>,
 }
@@ -42,21 +42,24 @@ pub fn observe(session: Option<u64>, model: &str, estimate: i64, reported: i64) 
             if let Some(oldest) = s
                 .sessions
                 .iter()
-                .min_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                .min_by(|a, b| a.1 .2.total_cmp(&b.1 .2))
                 .map(|(k, _)| *k)
             {
                 s.sessions.remove(&oldest);
             }
         }
-        s.sessions.insert(k, (ratio, now));
+        s.sessions.insert(k, (key(model), ratio, now));
     }
 }
 
 pub fn calibrate(session: Option<u64>, model: &str, estimate: i64) -> i64 {
     let s = state().lock();
+    let model_key = key(model);
     let ratio = session
-        .and_then(|k| s.sessions.get(&k).map(|(r, _)| *r))
-        .or_else(|| s.models.get(&key(model)).copied())
+        .and_then(|k| s.sessions.get(&k))
+        .filter(|(m, _, _)| *m == model_key)
+        .map(|(_, r, _)| *r)
+        .or_else(|| s.models.get(&model_key).copied())
         .unwrap_or(1.0);
     scale(estimate, ratio)
 }
