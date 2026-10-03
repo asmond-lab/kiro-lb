@@ -65,6 +65,8 @@ struct CutTracker {
     produced: bool,
     tools: bool,
     cut: bool,
+    pending_tool: Option<String>,
+    discard_pending: bool,
     request: Option<RequestCtx>,
 }
 
@@ -102,6 +104,14 @@ impl CutTracker {
         reason: String,
         message: String,
     ) -> Result<Option<KiroEvent>, StreamError> {
+        if let Some(name) = self.pending_tool.clone() {
+            tracing::warn!(
+                "Kiro cut the response with {reason} inside tool call '{name}': {message}; dropping it and ending the turn as max_tokens"
+            );
+            self.discard_pending = true;
+            self.mark(&name);
+            return Ok(None);
+        }
         if !self.produced {
             tracing::warn!("Kiro reported {reason} before any output: {message}");
             return Err(StreamError::Upstream(format!("Kiro reported {reason}")));
@@ -165,6 +175,21 @@ fn convert_batch(
     Ok(converted)
 }
 
+fn feed(
+    parser: &mut AwsEventStreamParser,
+    chunk: &[u8],
+    meter: &mut Option<GenerationCredits>,
+    cut: &mut CutTracker,
+) -> Result<Vec<KiroEvent>, StreamError> {
+    let events = parser.feed(chunk);
+    cut.pending_tool = parser.pending_tool_name();
+    let converted = convert_batch(events, meter, cut)?;
+    if std::mem::take(&mut cut.discard_pending) {
+        parser.discard_pending_tool();
+    }
+    Ok(converted)
+}
+
 fn parse_kiro_stream_inner(
     mut body: ByteStream,
     first_token_timeout: f64,
@@ -182,7 +207,7 @@ fn parse_kiro_stream_inner(
             Ok(Some(Err(e))) => Err(StreamError::Upstream(e.to_string()))?,
             Ok(Some(Ok(b))) => b,
         };
-        let events = convert_batch(parser.feed(&first), &mut meter, &mut cut)?;
+        let events = feed(&mut parser, &first, &mut meter, &mut cut)?;
         received |= !events.is_empty();
         for event in events {
             yield event;
@@ -194,7 +219,7 @@ fn parse_kiro_stream_inner(
             };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| StreamError::Upstream(e.to_string()))?;
-            let events = convert_batch(parser.feed(&chunk), &mut meter, &mut cut)?;
+            let events = feed(&mut parser, &chunk, &mut meter, &mut cut)?;
             received |= !events.is_empty();
             for event in events {
                 yield event;

@@ -502,6 +502,24 @@ impl AwsEventStreamParser {
         deduplicate_tool_calls(&self.tool_calls)
     }
 
+    /// Name of a tool call whose start or input arrived but which has not been
+    /// finalized yet. Kiro holds a long argument until it is complete, so this
+    /// is the only sign of a call in progress when the response is cut.
+    pub fn pending_tool_name(&self) -> Option<String> {
+        self.current_tool_call.as_ref().map(|t| {
+            t.pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        })
+    }
+
+    /// Drops the call in progress so a cut never emits a partial argument
+    /// that happens to parse as JSON.
+    pub fn discard_pending_tool(&mut self) {
+        self.current_tool_call = None;
+    }
+
     pub fn get_unemitted_tool_calls(&mut self) -> Vec<Value> {
         if self.current_tool_call.is_some() {
             self.finalize();

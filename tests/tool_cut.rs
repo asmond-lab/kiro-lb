@@ -90,3 +90,23 @@ async fn an_empty_thinking_frame_does_not_turn_a_load_error_into_a_cut() {
         "{events:?}"
     );
 }
+
+#[tokio::test]
+async fn a_load_event_inside_an_unfinished_tool_call_is_a_cut() {
+    let events = run(r#"{"name":"Write","toolUseId":"t1","input":"{\"file_path\": \"/a.txt\""}{"reason":"MODEL_TEMPORARILY_UNAVAILABLE","message":"Encountered unexpectedly high load"}"#).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert_eq!(tool_count(&events), 0, "the partial call is dropped");
+    assert_eq!(stop_reasons(&events), vec!["MAX_TOKENS"]);
+}
+
+#[tokio::test]
+async fn a_load_event_inside_a_call_whose_partial_input_parses_still_drops_it() {
+    let events = run(r#"{"name":"Write","toolUseId":"t1","input":"{\"file_path\": \"/a.txt\"}"}{"reason":"MODEL_TEMPORARILY_UNAVAILABLE","message":"Encountered unexpectedly high load"}"#).await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert_eq!(
+        tool_count(&events),
+        0,
+        "a call cut before its stop frame is never emitted"
+    );
+    assert_eq!(stop_reasons(&events), vec!["MAX_TOKENS"]);
+}
