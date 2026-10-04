@@ -153,6 +153,7 @@ pub async fn fetch_account_usage(
             .map(str::to_owned)
     };
     Ok(json!({
+        "userId": pick(payload.pointer("/userInfo/userId")),
         "email": pick(payload.pointer("/userInfo/email")),
         "subscriptionTitle": pick(sub.get("subscriptionTitle")).or(pick(sub.get("type"))).unwrap_or("Unknown".into()),
         "subscriptionType": pick(sub.get("type")).unwrap_or("Unknown".into()),

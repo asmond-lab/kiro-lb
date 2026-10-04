@@ -27,6 +27,7 @@ pub mod probe;
 pub mod prompt_filter;
 pub mod pyjson;
 pub mod routes_dashboard;
+pub mod routes_inferx;
 pub mod routes_v1;
 pub mod settings;
 pub mod store;

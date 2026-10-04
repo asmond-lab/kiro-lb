@@ -226,6 +226,64 @@ for the source evidence and live-capture limits. Metered credits remain separate
 from model-cost estimates and cache-token counts. Existing stored totals are not
 recalculated because individual historical metering events are not retained.
 
+## InferX internal engine API
+
+Set `INFERX_CONTROL_TOKEN` to enable the engine-owned, opt-in API at
+`/internal/inferx/v1/connections/{uuid}`. Requests use
+`Authorization: Bearer <token>`; this token is intentionally independent from
+dashboard and `/v1` credentials. `PUT` starts Google/GitHub/AWS Builder ID device login,
+`GET` reads status, `POST .../poll` advances it, and `DELETE` disconnects it.
+Every request is additionally bound to the exact `ownerId` supplied by InferX.
+
+This contract supports the dedicated InferX backend and one running engine
+instance per SQLite database. Pending device flows expire on
+restart; registered records remain durable. Marketplace credentials are stored
+in the existing SQLite database (plaintext at rest, like existing internal
+credentials) but in a separate table and are never loaded into the unrestricted
+`/v1` account pool. Financial settlement belongs exclusively to InferX's
+PostgreSQL backend, not this engine or the Cloudflare frontend.
+
+This feature is restricted to a dedicated instance with an empty operator
+account pool; connection starts reject existing operator sources or accounts.
+Do not add operator accounts later or expose the dashboard and `/v1` publicly.
+Protect the database and backups; managed encryption is still needed before a
+public marketplace rollout. Disconnect erases stored credentials, not upstream
+OAuth grants. Registered status checks read saved metadata, not current upstream
+health; credentials refresh on demand for seller-scoped serving. Continuous
+health checks are not included. Initialize a fresh dedicated database for this
+contract; there is no compatibility path for earlier prototype schemas.
+
+`PUT` takes `{ownerId, provider}` with `provider` equal to `github`,
+`google`, or `builder-id`; polling takes `{ownerId}`. `GET` and `DELETE` take `ownerId` in the query.
+Responses expose only `{id, status, authorization, account}`. Authorization has
+`url`, `userCode`, `expiresAt` (Unix milliseconds), and `intervalSeconds`; account
+has the verified upstream `id` and nullable `email`. Both are nullable. Status is
+`pending`, `registered`, `expired`, `failed`, or `disconnected`. Neither the
+control token nor provider tokens belong in browser requests.
+
+Retry ambiguous requests with the same canonical UUID. Ownership is immutable,
+including after disconnection. Deleting an unknown UUID creates a tombstone to
+block late starts. Use a new UUID after a terminal state. Verification uses the
+upstream user ID, not the shared social-login profile ARN or mutable email.
+
+`POST /internal/inferx/v1/requests/{uuid}` accepts
+`{ownerId, connectionId, request}` with text-only OpenAI chat parameters. It
+durably admits a request ID once and uses only the specified seller connection.
+The backend must reserve funds before dispatch. `stream:true` forwards native
+OpenAI SSE chunks followed by a private `inferx.receipt` event after persistence;
+the engine omits `[DONE]` so the backend can settle before declaring success.
+Channel saturation emits an error instead of falsely successful truncated output.
+Execution and receipt persistence continue after a client disconnect.
+`stream:false` returns a receipt with a one-time completion; content is not stored.
+
+`GET .../requests/{uuid}?ownerId=…` reads a saved receipt. `DELETE` reads it or
+durably fences an unknown UUID before the backend releases its hold. A late POST
+cannot execute a fenced request. Restart marks interrupted execution indeterminate;
+the backend does not bill unverified completions. Preserve the receipt database
+and drain admitted work on shutdown. Usage is tokenizer-estimated, not an upstream
+invoice; exceeding the requested output ceiling fails without confirmed usage but
+may consume seller quota. Never expose these endpoints directly to buyers.
+
 ## Release maintenance
 
 Release-plz opens or updates a release PR after changes reach `main`. Review its

@@ -311,7 +311,7 @@ impl Drop for RequestLogGuard {
 /// old slot has stopped changing the pool before the standby takes over.
 pub fn is_account_mutation(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
-    path.starts_with("/api/dashboard/accounts")
+    (path.starts_with("/api/dashboard/accounts") || path.starts_with("/internal/inferx/"))
         && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
