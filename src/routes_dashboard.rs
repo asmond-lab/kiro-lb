@@ -1114,6 +1114,43 @@ pub async fn internal_register_account(
     register_from_body(&state, &body).await
 }
 
+/// Each pool account's last upstream usage reading, for the factory that
+/// created it: email, used and limit of the current allowance, and when it
+/// resets. Same secret as registration; accounts with no reading are omitted.
+pub async fn internal_account_quota(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize_registration(&headers) {
+        return r;
+    }
+    let ids: Vec<String> = state.pool.accounts().iter().map(|a| a.id.clone()).collect();
+    let accounts = tokio::task::spawn_blocking(move || {
+        ids.iter()
+            .filter_map(|id| {
+                let u = ds::cached_usage(id);
+                let email = u["email"].as_str()?;
+                if !u["error"].is_null() {
+                    return None;
+                }
+                let resets_at = match &u["nextDateReset"] {
+                    Value::Number(n) => n.as_f64(),
+                    Value::String(s) => s.parse::<f64>().ok(),
+                    _ => None,
+                };
+                Some(json!({
+                    "email": email,
+                    "used": u["currentUsage"].as_f64()?,
+                    "limit": u["usageLimit"].as_f64()?,
+                    "unit": u["unit"],
+                    "resetsAt": resets_at,
+                    "observedAt": u["updatedAt"].as_i64()?,
+                }))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    json_response(200, json!({"accounts": accounts}))
+}
+
 async fn register_from_body(state: &Shared, body: &Bytes) -> Response {
     let payload = match json_object(body) {
         Ok(m) => m,

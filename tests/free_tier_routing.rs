@@ -2,7 +2,7 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use common::*;
 use kiro_lb::pool::AccountManager;
@@ -71,6 +71,7 @@ async fn registered_free_account_serves_free_routing_models() {
             "/_internal/accounts/register",
             post(d::internal_register_account),
         )
+        .route("/_internal/accounts/quota", get(d::internal_account_quota))
         .with_state(state(pool.clone(), &up.http, false));
 
     let (status, _) = register(&app, None, tiered("free-acct", "free")).await;
@@ -135,9 +136,35 @@ async fn registered_free_account_serves_free_routing_models() {
         assert!(kiro_lb::dashboard_store::save_account_usage(
             "pro-acct",
             &pro_login,
-            &json!({"subscriptionType": plan, "currentUsage": 1.0, "usageLimit": 100.0}),
+            &json!({"email": "pro@example.invalid", "subscriptionType": plan, "currentUsage": 1.0, "usageLimit": 100.0, "unit": "INVOCATIONS", "nextDateReset": "1793491200.0"}),
         ));
     }
+    let quota = |secret: Option<&'static str>| {
+        let mut req =
+            Request::get("/_internal/accounts/quota").header("host", "kiro.example.internal");
+        if let Some(secret) = secret {
+            req = req.header("x-handoff-secret", secret);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap())
+    };
+    assert_eq!(quota(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+    let res = quota(Some(SECRET)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let pro = body["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["email"] == "pro@example.invalid")
+        .expect("pro-acct reading");
+    assert_eq!(pro["used"], 1.0);
+    assert_eq!(pro["limit"], 100.0);
+    assert_eq!(pro["resetsAt"], 1793491200.0);
     assert_eq!(
         kiro_lb::store::load_subscription_types()
             .get("pro-acct")
