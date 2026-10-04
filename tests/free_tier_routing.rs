@@ -17,8 +17,17 @@ const SONNET: &str = "claude-sonnet-4.5";
 const OTHER: &str = "claude-opus-4.6";
 
 async fn register(app: &Router, secret: Option<&str>, body: Value) -> (StatusCode, Value) {
+    register_via(app, "127.0.0.1:8000", secret, body).await
+}
+
+async fn register_via(
+    app: &Router,
+    host: &str,
+    secret: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
     let mut req = Request::post("/_internal/accounts/register")
-        .header("host", "127.0.0.1:8000")
+        .header("host", host)
         .header("content-type", "application/json");
     if let Some(secret) = secret {
         req = req.header("x-handoff-secret", secret);
@@ -71,7 +80,22 @@ async fn registered_free_account_serves_free_routing_models() {
     let (status, body) = register(&app, Some(SECRET), tiered("free-acct", "free\u{7}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-    let (status, body) = register(&app, Some(SECRET), tiered("free-acct", "free")).await;
+    // The factory may address the stable edge name; the secret is the credential.
+    let (status, _) = register_via(
+        &app,
+        "kiro.example.internal",
+        Some("wrong"),
+        tiered("free-acct", "free"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = register_via(
+        &app,
+        "kiro.example.internal",
+        Some(SECRET),
+        tiered("free-acct", "free"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["initialized"], true, "{body}");
     let (status, body) = register(&app, Some(SECRET), tiered("pro-acct", "Pro")).await;

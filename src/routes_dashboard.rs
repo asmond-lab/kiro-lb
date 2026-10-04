@@ -1077,15 +1077,38 @@ pub async fn register_account(
     register_from_body(&state, &body).await
 }
 
+/// The account factory's credential: the handoff secret, from any host. Unlike
+/// the blue/green controls it is not slot-local, so a factory can address the
+/// stable edge name instead of whichever slot is active; the mutation gate
+/// still holds a registration back during a handoff.
+fn authorize_registration(headers: &HeaderMap) -> Result<(), Response> {
+    use subtle::ConstantTimeEq;
+    let expected = config::get().handoff_secret.as_bytes();
+    let supplied = headers
+        .get("x-handoff-secret")
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    if expected.is_empty()
+        || supplied.len() != expected.len()
+        || !bool::from(supplied.ct_eq(expected))
+    {
+        return Err(detail(
+            403,
+            "account registration requires the handoff secret",
+        ));
+    }
+    Ok(())
+}
+
 /// Programmatic registration for an external account factory. Same payload,
 /// validation and persistence as `POST /api/dashboard/accounts`, authorized by
-/// the direct-slot handoff secret instead of a dashboard session.
+/// the handoff secret instead of a dashboard session.
 pub async fn internal_register_account(
     State(state): State<Shared>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authorize_handoff(&headers) {
+    if let Err(r) = authorize_registration(&headers) {
         return r;
     }
     register_from_body(&state, &body).await
