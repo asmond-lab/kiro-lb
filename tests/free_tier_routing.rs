@@ -7,7 +7,7 @@ use axum::Router;
 use common::*;
 use kiro_lb::pool::AccountManager;
 use kiro_lb::routes_dashboard as d;
-use kiro_lb::settings::{self, TunableKey};
+use kiro_lb::settings;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use tower::ServiceExt;
@@ -104,6 +104,11 @@ async fn registered_free_account_serves_free_routing_models() {
         );
     }
 
+    // Free routing follows the free account's catalog, not a configured list.
+    pool.get("free-acct")
+        .unwrap()
+        .models
+        .update(vec![json!({"modelId": SONNET})]);
     for model in [SONNET, "claude-sonnet-4-5-20250929"] {
         for _ in 0..20 {
             let selected = pool
@@ -133,24 +138,6 @@ async fn registered_free_account_serves_free_routing_models() {
         fallback.id, "pro-acct",
         "fallback serves from the full pool"
     );
-
-    settings::set_tunable(&TunableKey::FreeRoutingFallback, &json!(false))
-        .unwrap()
-        .unwrap();
-    assert!(pool
-        .next_account(SONNET, &excluded(&["free-acct"]), None)
-        .await
-        .is_none());
-    assert_eq!(
-        pool.next_account(OTHER, &excluded(&["free-acct"]), None)
-            .await
-            .unwrap()
-            .id,
-        "pro-acct"
-    );
-    settings::set_tunable(&TunableKey::FreeRoutingFallback, &json!(true))
-        .unwrap()
-        .unwrap();
 
     let _ = std::fs::remove_dir_all(dir);
 }

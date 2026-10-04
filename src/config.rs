@@ -155,9 +155,6 @@ pub struct Config {
     pub data_dir: String,
     pub kiro_slot: String,
     pub handoff_secret: String,
-    /// Normalized model names routed to free-tier accounts first even before a
-    /// free account's catalog lists them (catalog models are added at runtime).
-    pub free_routing_models: Vec<String>,
     /// Subscription types (case-insensitive) that count as free tier.
     pub free_tier_subscription_types: Vec<String>,
 }
@@ -239,10 +236,6 @@ impl Config {
             data_dir: env_str("DASHBOARD_DATA_DIR", "data"),
             kiro_slot: env_str("KIRO_SLOT", ""),
             handoff_secret: env_str("HANDOFF_SECRET", ""),
-            free_routing_models: env_list("FREE_ROUTING_MODELS", "claude-sonnet-4.5")
-                .iter()
-                .map(|m| crate::model_resolver::normalize_model_name(m))
-                .collect(),
             // Kiro's free plan reports Q_DEVELOPER_STANDALONE_FREE; "Free" keeps a
             // registration hint recognised until the first usage refresh replaces it.
             free_tier_subscription_types: env_list(

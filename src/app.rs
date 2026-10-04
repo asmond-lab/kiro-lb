@@ -146,6 +146,11 @@ pub async fn data_plane_middleware(
             return detail(503, "Gateway is quiesced for handoff");
         }
         let _guard = InflightGuard::enter(&state);
+        // Close the race with a quiesce that began after the first check but
+        // before this mutation counted itself, as the /v1 path does below.
+        if state.quiesced.load(Ordering::SeqCst) {
+            return detail(503, "Gateway is quiesced for handoff");
+        }
         return next.run(req).await;
     }
     if !path.starts_with("/v1/") {

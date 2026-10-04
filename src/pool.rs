@@ -80,24 +80,20 @@ fn known_subscription_type(subscription_type: Option<&str>) -> Option<&str> {
         .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("unknown"))
 }
 
-/// A model is free-routed when `FREE_ROUTING_MODELS` lists it or when a
-/// free-tier account's live catalog serves it. The catalog half follows Kiro's
-/// free plan as it changes; the list covers a pool that has not read a free
-/// account's catalog yet.
-fn is_free_routed(
-    model: &str,
-    routing_models: &[String],
-    accounts: &[Arc<Account>],
-    free_types: &[String],
-) -> bool {
-    let normalized = normalize_model_name(model);
-    routing_models
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(&normalized))
-        || accounts.iter().any(|a| {
-            a.models.support(model) == ModelSupport::Supported
-                && is_free_tier(&a.state.lock(), free_types)
-        })
+/// A model is free-routed when a free-tier account's live catalog serves it,
+/// so the set follows Kiro's free plan as it changes. Until a free account's
+/// catalog is read, nothing is free-routed and the pool keeps its usual order.
+fn is_free_routed(model: &str, accounts: &[Arc<Account>], free_types: &[String]) -> bool {
+    accounts.iter().any(|a| {
+        a.models.support(model) == ModelSupport::Supported
+            && is_free_tier(&a.state.lock(), free_types)
+    })
+}
+
+/// Every concurrency slot of the account is taken, so a request would queue on it.
+fn is_saturated(a: &Account) -> bool {
+    crate::upstream::http::account_concurrency_load(&a.id)
+        .is_some_and(|(held, limit)| held >= limit)
 }
 
 fn is_free_tier(s: &AccountState, free_types: &[String]) -> bool {
@@ -106,27 +102,33 @@ fn is_free_tier(s: &AccountState, free_types: &[String]) -> bool {
         .is_some_and(|tier| free_types.iter().any(|f| f.eq_ignore_ascii_case(tier)))
 }
 
-/// For a free-routed model (see `is_free_routed`), keeps only free-tier
-/// accounts in their existing strategy order. With `fallback`, the other
-/// accounts follow them so the request is still served when no free account is
-/// eligible; without it they are dropped and the request sees no account. Other
-/// models are returned untouched. Weights are never changed here.
+/// For a free-routed model (see `is_free_routed`), puts free-tier accounts
+/// first in their existing strategy order; the other accounts follow, so the
+/// request is still served when no free account is eligible. Other models are
+/// returned untouched. Weights are never changed here.
+///
+/// The tier preference never outranks capacity: an account whose concurrency
+/// slots are all taken stays behind every account that can start the request
+/// now, free or not, exactly as `candidate_order` sorted it.
 fn free_routing_order(
     accounts: Vec<Arc<Account>>,
     routed: bool,
     free_types: &[String],
-    fallback: bool,
+    saturated: impl Fn(&Account) -> bool,
 ) -> Vec<Arc<Account>> {
     if !routed {
         return accounts;
     }
-    let (mut free, rest): (Vec<_>, Vec<_>) = accounts
-        .into_iter()
-        .partition(|a| is_free_tier(&a.state.lock(), free_types));
-    if fallback {
-        free.extend(rest);
+    let (ready, saturated): (Vec<_>, Vec<_>) = accounts.into_iter().partition(|a| !saturated(a));
+    let mut ordered = Vec::new();
+    for group in [ready, saturated] {
+        let (free, rest): (Vec<_>, Vec<_>) = group
+            .into_iter()
+            .partition(|a| is_free_tier(&a.state.lock(), free_types));
+        ordered.extend(free);
+        ordered.extend(rest);
     }
-    free
+    ordered
 }
 
 pub struct Account {
@@ -1207,21 +1209,16 @@ impl AccountManager {
             (load.0, support, load.1)
         });
         let cfg = config::get();
-        let fallback = settings::tunables().free_routing_fallback;
         let free_types = &cfg.free_tier_subscription_types;
         let routed = {
             let everyone: Vec<Arc<Account>> = accounts.iter().chain(&pinned).cloned().collect();
-            is_free_routed(model, &cfg.free_routing_models, &everyone, free_types)
+            is_free_routed(model, &everyone, free_types)
         };
-        let mut accounts = free_routing_order(accounts, routed, free_types, fallback);
+        let mut accounts = free_routing_order(accounts, routed, free_types, is_saturated);
         // A live pin stays first, ahead of free-tier accounts too: moving a
         // conversation off its account throws away that account's prompt cache.
-        // Strict free routing (no fallback) still keeps a non-free pin out of a
-        // free-routed model's candidates.
         if let Some(pinned) = pinned {
-            if fallback || !routed || is_free_tier(&pinned.state.lock(), free_types) {
-                accounts.insert(0, pinned);
-            }
+            accounts.insert(0, pinned);
         }
         accounts
     }
@@ -1937,11 +1934,10 @@ mod tests {
     #[test]
     fn free_tier_preference_keeps_a_live_session_pin_first() {
         assert_eq!(settings::tunables().load_balancing, "session");
-        assert!(settings::tunables().free_routing_fallback);
         let pool = AccountManager::new(reqwest::Client::new());
         let paid = account("paid");
         paid.state.lock().tier = Some("Pro".into());
-        let free = account("free");
+        let free = serving(account("free"), &["claude-sonnet-4.5"]);
         free.state.lock().tier = Some("Q_DEVELOPER_STANDALONE_FREE".into());
         {
             let mut inner = pool.inner.lock();
@@ -2084,23 +2080,26 @@ mod tests {
         accounts.iter().map(|a| a.id.as_str()).collect()
     }
 
+    fn serving(a: Arc<Account>, models: &[&str]) -> Arc<Account> {
+        a.models
+            .update(models.iter().map(|m| json!({"modelId": m})).collect());
+        a
+    }
+
     #[test]
-    fn free_routing_keeps_only_free_accounts_in_strategy_order() {
-        let models = vec!["claude-sonnet-4.5".to_owned()];
+    fn free_routing_puts_free_accounts_first_in_strategy_order() {
         let free = vec!["Free".to_owned()];
         let pool = vec![
-            tiered("pro-1", Some("Pro")),
-            tiered("free-1", Some("FREE")),
+            serving(tiered("pro-1", Some("Pro")), &["claude-sonnet-4.5"]),
+            serving(tiered("free-1", Some("FREE")), &["claude-sonnet-4.5"]),
             tiered("unknown", None),
             tiered("free-2", Some("free")),
         ];
 
         for model in ["claude-sonnet-4.5", "claude-sonnet-4-5-20250929"] {
-            let routed = is_free_routed(model, &models, &pool, &free);
+            let routed = is_free_routed(model, &pool, &free);
             assert!(routed, "{model}");
-            let only_free = free_routing_order(pool.clone(), routed, &free, false);
-            assert_eq!(ids(&only_free), ["free-1", "free-2"], "{model}");
-            let preferred = free_routing_order(pool.clone(), routed, &free, true);
+            let preferred = free_routing_order(pool.clone(), routed, &free, |_| false);
             assert_eq!(
                 ids(&preferred),
                 ["free-1", "free-2", "pro-1", "unknown"],
@@ -2108,46 +2107,53 @@ mod tests {
             );
         }
 
-        let routed = is_free_routed("claude-opus-4.6", &models, &pool, &free);
-        assert!(!routed, "no free catalog serves it and the list omits it");
-        let other = free_routing_order(pool.clone(), routed, &free, false);
+        let routed = is_free_routed("claude-opus-4.6", &pool, &free);
+        assert!(!routed, "no free catalog serves it");
+        let other = free_routing_order(pool.clone(), routed, &free, |_| false);
         assert_eq!(ids(&other), ["pro-1", "free-1", "unknown", "free-2"]);
     }
 
     #[test]
-    fn a_model_a_free_account_serves_is_free_routed_without_being_listed() {
+    fn free_routing_follows_free_catalogs_and_waits_for_one() {
         let free = vec!["Q_DEVELOPER_STANDALONE_FREE".to_owned()];
-        let paid = tiered("pro-1", Some("Pro"));
-        paid.models.update(vec![
-            json!({"modelId": "claude-haiku-4.5"}),
-            json!({"modelId": "claude-opus-4.6"}),
-        ]);
-        let free_acct = tiered("free-1", Some("Q_DEVELOPER_STANDALONE_FREE"));
-        free_acct
-            .models
-            .update(vec![json!({"modelId": "claude-haiku-4.5"})]);
-        let pool = vec![paid, free_acct];
+        let paid = serving(
+            tiered("pro-1", Some("Pro")),
+            &["claude-haiku-4.5", "claude-opus-4.6"],
+        );
+        let unread = tiered("free-1", Some("Q_DEVELOPER_STANDALONE_FREE"));
+        assert!(
+            !is_free_routed("claude-haiku-4.5", &[paid.clone(), unread.clone()], &free),
+            "no free catalog read yet: the pool keeps its usual order"
+        );
 
-        assert!(is_free_routed("claude-haiku-4.5", &[], &pool, &free));
-        let ordered = free_routing_order(pool.clone(), true, &free, true);
+        let pool = vec![paid, serving(unread, &["claude-haiku-4.5"])];
+        assert!(is_free_routed("claude-haiku-4.5", &pool, &free));
+        let ordered = free_routing_order(pool.clone(), true, &free, |_| false);
         assert_eq!(ids(&ordered), ["free-1", "pro-1"]);
         assert!(
-            !is_free_routed("claude-opus-4.6", &[], &pool, &free),
+            !is_free_routed("claude-opus-4.6", &pool, &free),
             "a paid-only model keeps the whole pool"
         );
     }
 
     #[test]
-    fn free_routing_without_free_accounts_falls_back_only_when_enabled() {
-        let models = vec!["claude-sonnet-4.5".to_owned()];
+    fn a_saturated_free_account_stays_behind_an_idle_paid_one() {
+        let free = vec!["Free".to_owned()];
+        let pool = vec![
+            tiered("pro-idle", Some("Pro")),
+            tiered("free-full", Some("Free")),
+        ];
+        let ordered = free_routing_order(pool, true, &free, |a| a.id == "free-full");
+        assert_eq!(ids(&ordered), ["pro-idle", "free-full"]);
+    }
+
+    #[test]
+    fn free_routing_without_free_accounts_keeps_the_pool() {
         let free = vec!["Free".to_owned()];
         let pool = vec![tiered("pro-1", Some("Pro")), tiered("unknown", None)];
 
-        let routed = is_free_routed("claude-sonnet-4.5", &models, &pool, &free);
-        let fallback = free_routing_order(pool.clone(), routed, &free, true);
-        assert_eq!(ids(&fallback), ["pro-1", "unknown"]);
-        let strict = free_routing_order(pool, routed, &free, false);
-        assert!(strict.is_empty());
+        let ordered = free_routing_order(pool, true, &free, |_| false);
+        assert_eq!(ids(&ordered), ["pro-1", "unknown"]);
     }
 
     #[test]
