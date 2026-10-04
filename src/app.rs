@@ -308,10 +308,12 @@ impl Drop for RequestLogGuard {
 }
 
 /// Account mutations share the handoff gate with /v1: quiesce must mean the
-/// old slot has stopped changing the pool before the standby takes over.
+/// old slot has stopped changing the pool before the standby takes over. The
+/// factory's internal registration changes the pool exactly like the dashboard
+/// route does, so it is gated the same way.
 pub fn is_account_mutation(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
-    path.starts_with("/api/dashboard/accounts")
+    (path.starts_with("/api/dashboard/accounts") || path == "/_internal/accounts/register")
         && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
@@ -378,4 +380,30 @@ pub async fn wait_for_data_plane_drain(state: &Shared) {
 
 pub fn bytes_body(b: Bytes) -> Body {
     Body::from(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_account_mutation;
+    use axum::http::Method;
+
+    #[test]
+    fn internal_registration_shares_the_handoff_mutation_gate() {
+        assert!(is_account_mutation(
+            &Method::POST,
+            "/_internal/accounts/register"
+        ));
+        assert!(is_account_mutation(
+            &Method::POST,
+            "/api/dashboard/accounts"
+        ));
+        assert!(!is_account_mutation(
+            &Method::GET,
+            "/_internal/accounts/register"
+        ));
+        assert!(!is_account_mutation(
+            &Method::POST,
+            "/_internal/handoff/quiesce"
+        ));
+    }
 }
