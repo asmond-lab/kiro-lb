@@ -1116,7 +1116,9 @@ pub async fn internal_register_account(
 
 /// Each pool account's last upstream usage reading, for the factory that
 /// created it: email, used and limit of the current allowance, and when it
-/// resets. Same secret as registration; accounts with no reading are omitted.
+/// resets. Same secret as registration. Accounts with no reading, or whose
+/// last persisted refresh failed, are omitted; every reading carries its
+/// `observedAt`, so a consumer can tell a reading that stopped refreshing.
 pub async fn internal_account_quota(State(state): State<Shared>, headers: HeaderMap) -> Response {
     if let Err(r) = authorize_registration(&headers) {
         return r;

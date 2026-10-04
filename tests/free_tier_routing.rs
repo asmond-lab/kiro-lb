@@ -162,6 +162,11 @@ async fn registered_free_account_serves_free_routing_models() {
         .iter()
         .find(|a| a["email"] == "pro@example.invalid")
         .expect("pro-acct reading");
+    assert_eq!(
+        body["accounts"].as_array().unwrap().len(),
+        1,
+        "accounts without a usage reading are omitted"
+    );
     assert_eq!(pro["used"], 1.0);
     assert_eq!(pro["limit"], 100.0);
     assert_eq!(pro["resetsAt"], 1793491200.0);
