@@ -104,6 +104,23 @@ async fn registered_free_account_serves_free_routing_models() {
         );
     }
 
+    // A refresh that omits the plan ("Unknown") keeps the last known type, so a
+    // restart cannot fall back to the registration hint.
+    let pro_login = kiro_lb::store::login_identity("pro-acct").unwrap();
+    for plan in ["KIRO PRO", "Unknown"] {
+        assert!(kiro_lb::dashboard_store::save_account_usage(
+            "pro-acct",
+            &pro_login,
+            &json!({"subscriptionType": plan, "currentUsage": 1.0, "usageLimit": 100.0}),
+        ));
+    }
+    assert_eq!(
+        kiro_lb::store::load_subscription_types()
+            .get("pro-acct")
+            .map(String::as_str),
+        Some("KIRO PRO")
+    );
+
     // Free routing follows the free account's catalog, not a configured list.
     pool.get("free-acct")
         .unwrap()
