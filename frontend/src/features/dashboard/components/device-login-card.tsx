@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { dashboardApi } from "../api";
+import { DashboardApiError, dashboardApi } from "../api";
 import { dismissAlert, pushAlert, pushError } from "../alerts";
 import { isBrowserCallback, usesBrowserSignIn, type SocialLoginMode } from "../browser-login";
 import { registrationMessage } from "../device-login-result";
@@ -41,14 +41,17 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   const { t, language } = usePreferences();
   const [active, setActive] = useState<ActiveFlow>();
   const [mode, setMode] = useState<SocialLoginMode>("browser");
-  const [busy, setBusy] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [submittingFlowId, setSubmittingFlowId] = useState<string>();
   const [pasted, setPasted] = useState("");
   const [now, setNow] = useState(() => Date.now());
   const [deadline, setDeadline] = useState(0);
   // True while an approved flow is being registered: the pending card stays up
   // (no new sign-in can start) and polling stops.
   const [registeringFlow, setRegisteringFlow] = useState(false);
-  const registering = useRef(false);
+  // Consume the id before registration or cancellation. Late responses from
+  // either polling or a pasted callback must not revive a finished flow.
+  const pendingFlowId = useRef<string | undefined>(undefined);
   const linkAlert = useRef<number | undefined>(undefined);
   const pasteId = useId();
 
@@ -62,15 +65,17 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   };
 
   const start = async (provider: DeviceLoginProvider) => {
-    setBusy(true);
+    setStarting(true);
     setPasted("");
     try {
       if (usesBrowserSignIn(provider, mode)) {
         const started = await dashboardApi.startBrowserLogin(provider);
+        pendingFlowId.current = started.flowId;
         setActive({ kind: "browser", flow: started });
         setDeadline(Date.now() + started.expiresInSeconds * 1000);
       } else {
         const started = await dashboardApi.startDeviceLogin(provider);
+        pendingFlowId.current = started.flowId;
         setActive({ kind: "device", flow: started });
         setDeadline(Date.now() + started.expiresInSeconds * 1000);
         await copyLink(started.verificationUriComplete);
@@ -79,22 +84,25 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
     } catch (cause) {
       pushError(cause);
     } finally {
-      setBusy(false);
+      setStarting(false);
     }
   };
 
   const cancel = useCallback(async () => {
-    if (active) await flowApi[active.kind].cancel(active.flow.flowId).catch(() => undefined);
+    if (!active || pendingFlowId.current !== active.flow.flowId) return;
+    pendingFlowId.current = undefined;
     setActive(undefined);
     if (linkAlert.current !== undefined) dismissAlert(linkAlert.current);
+    await flowApi[active.kind].cancel(active.flow.flowId).catch(() => undefined);
   }, [active]);
 
   // Registration is triggered by the approval itself, so the operator only ever
-  // clicks once. The ref guards against a second poll landing mid-registration.
+  // clicks once. Claim the flow before awaiting, even if another response arrives
+  // after registration has already finished.
   const registerApproved = useCallback(
     async (kind: ActiveFlow["kind"], flowId: string) => {
-      if (registering.current) return;
-      registering.current = true;
+      if (pendingFlowId.current !== flowId) return;
+      pendingFlowId.current = undefined;
       setRegisteringFlow(true);
       try {
         const result = await flowApi[kind].register(flowId);
@@ -106,7 +114,6 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         pushError(cause);
         setActive(undefined);
       } finally {
-        registering.current = false;
         setRegisteringFlow(false);
       }
     },
@@ -115,6 +122,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
 
   const settle = useCallback(
     async (next: ActiveFlow) => {
+      if (pendingFlowId.current !== next.flow.flowId) return true;
       if (next.flow.status === "approved") {
         // Keep showing the pending flow until registration has finished.
         await registerApproved(next.kind, next.flow.flowId);
@@ -122,6 +130,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
       }
       setActive(next);
       if (next.flow.status !== "pending") {
+        pendingFlowId.current = undefined;
         pushAlert(
           next.flow.detail
             ? { tone: "error", error: next.flow.detail }
@@ -137,14 +146,17 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
 
   const submitPasted = async () => {
     if (active?.kind !== "browser") return;
-    setBusy(true);
+    const flowId = active.flow.flowId;
+    if (pendingFlowId.current !== flowId) return;
+    setSubmittingFlowId(flowId);
     try {
-      const next = await dashboardApi.completeBrowserLogin(active.flow.flowId, pasted.trim());
+      const next = await dashboardApi.completeBrowserLogin(flowId, pasted.trim());
       await settle({ kind: "browser", flow: next });
     } catch (cause) {
-      pushError(cause);
+      if (pendingFlowId.current === flowId) pushError(cause);
     } finally {
-      setBusy(false);
+      // A finished flow must neither block a new sign-in nor unlock its form.
+      setSubmittingFlowId((current) => current === flowId ? undefined : current);
     }
   };
 
@@ -165,10 +177,15 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         const next = { kind: pendingKind, flow } as ActiveFlow;
         if (await settle(next)) return;
       } catch (cause) {
-        if (stopped) return;
+        if (stopped || pendingFlowId.current !== pendingId) return;
         pushError(cause);
-        setActive(undefined);
-        return;
+        if (cause instanceof DashboardApiError && cause.status === 404) {
+          pendingFlowId.current = undefined;
+          setActive(undefined);
+          return;
+        }
+        // A failed status request does not end the sign-in. Retry while a
+        // pasted callback may still be completing successfully in parallel.
       }
       if (!stopped) timer = window.setTimeout(tick, POLL_INTERVAL_MS);
     };
@@ -254,7 +271,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                 type="submit"
                 size="sm"
                 variant="outline"
-                disabled={busy || registeringFlow || !isBrowserCallback(pasted)}
+                disabled={submittingFlowId === active.flow.flowId || registeringFlow || !isBrowserCallback(pasted)}
               >
                 {t("accounts.login.pasteSubmit")}
               </Button>
@@ -283,7 +300,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                 <Button
                   key={id}
                   variant="outline"
-                  disabled={busy}
+                  disabled={starting || registeringFlow}
                   onClick={() => void start(id)}
                   className="h-11 justify-center gap-2.5 font-medium"
                 >
