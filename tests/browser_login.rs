@@ -18,7 +18,11 @@ async fn token_server() -> (String, Seen) {
         .route(
             "/oauth/token",
             post(
-                |State(seen): State<Seen>, Json(body): Json<Value>| async move {
+                |State(seen): State<Seen>, headers: axum::http::HeaderMap, Json(mut body): Json<Value>| async move {
+                    body["_userAgent"] = json!(headers
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default());
                     seen.lock().push(body.clone());
                     if body["code"] == "good" {
                         (
@@ -120,6 +124,36 @@ async fn browser_sign_in_exchanges_the_code_with_the_registered_redirect() {
     assert_eq!(flow.status, "approved");
     assert_eq!(flow.provider, "Github");
     let cred = browser_login::internal_credentials(&flow).unwrap();
+    assert_eq!(flow.account_id(), format!("browser-github-{id}"));
+    let lineage = cred["_kiroLbLoginIdentity"].as_str().unwrap().to_owned();
+    assert!(lineage.starts_with("lineage:"));
+    // The exchange already speaks as the account kiro-lb is about to register.
+    assert_eq!(
+        body["_userAgent"],
+        kiro_lb::utils::refresh_user_agent(&flow.machine_id())
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "kirolb-browser-login-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("DASHBOARD_DATA_DIR", &dir);
+    kiro_lb::store::initialize().unwrap();
+    let entry = json!({"type": "internal", "id": flow.account_id(), "credential": cred.clone()});
+    kiro_lb::store::with(|c| kiro_lb::store::replace_account_sources(c, &[entry], true)).unwrap();
+    let auth = kiro_lb::auth::KiroAuth::new(
+        kiro_lb::auth::Source::Internal(flow.account_id()),
+        "us-east-1",
+        None,
+        http.clone(),
+    )
+    .unwrap();
+    assert_eq!(auth.login_identity(), Some(lineage.as_str()));
+    assert_eq!(
+        auth.machine_id(),
+        flow.machine_id(),
+        "refresh uses the exchange's machine id"
+    );
     assert_eq!(cred["refreshToken"], "refresh-1");
     assert_eq!(cred["accessToken"], "access-1");
     assert_eq!(cred["region"], "us-east-1");
@@ -187,4 +221,6 @@ async fn browser_sign_in_exchanges_the_code_with_the_registered_redirect() {
         .is_err());
     browser_login::discard(&id);
     browser_login::discard(other["flowId"].as_str().unwrap());
+    drop(auth);
+    let _ = std::fs::remove_dir_all(&dir);
 }

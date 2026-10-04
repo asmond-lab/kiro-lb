@@ -45,6 +45,9 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   const [pasted, setPasted] = useState("");
   const [now, setNow] = useState(() => Date.now());
   const [deadline, setDeadline] = useState(0);
+  // True while an approved flow is being registered: the pending card stays up
+  // (no new sign-in can start) and polling stops.
+  const [registeringFlow, setRegisteringFlow] = useState(false);
   const registering = useRef(false);
   const linkAlert = useRef<number | undefined>(undefined);
   const pasteId = useId();
@@ -92,6 +95,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
     async (kind: ActiveFlow["kind"], flowId: string) => {
       if (registering.current) return;
       registering.current = true;
+      setRegisteringFlow(true);
       try {
         const result = await flowApi[kind].register(flowId);
         const registered = registrationMessage(language, result);
@@ -103,6 +107,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         setActive(undefined);
       } finally {
         registering.current = false;
+        setRegisteringFlow(false);
       }
     },
     [onRegistered, language],
@@ -110,11 +115,12 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
 
   const settle = useCallback(
     async (next: ActiveFlow) => {
-      setActive(next);
       if (next.flow.status === "approved") {
+        // Keep showing the pending flow until registration has finished.
         await registerApproved(next.kind, next.flow.flowId);
         return true;
       }
+      setActive(next);
       if (next.flow.status !== "pending") {
         pushAlert(
           next.flow.detail
@@ -142,8 +148,9 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
     }
   };
 
-  const pendingKind = active?.flow.status === "pending" ? active.kind : undefined;
-  const pendingId = active?.flow.status === "pending" ? active.flow.flowId : undefined;
+  const polling = active?.flow.status === "pending" && !registeringFlow;
+  const pendingKind = polling ? active.kind : undefined;
+  const pendingId = polling ? active.flow.flowId : undefined;
 
   useEffect(() => {
     if (!pendingKind || !pendingId) return;
@@ -216,7 +223,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
             <Link2 />
             {t("accounts.login.copyLink")}
           </Button>
-          <Button size="sm" variant="outline" onClick={() => void cancel()}>
+          <Button size="sm" variant="outline" disabled={registeringFlow} onClick={() => void cancel()}>
             <X />
             {t("accounts.cancel")}
           </Button>
@@ -243,7 +250,12 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                 spellCheck={false}
                 className="font-mono text-xs"
               />
-              <Button type="submit" size="sm" variant="outline" disabled={busy || !isBrowserCallback(pasted)}>
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                disabled={busy || registeringFlow || !isBrowserCallback(pasted)}
+              >
                 {t("accounts.login.pasteSubmit")}
               </Button>
             </div>

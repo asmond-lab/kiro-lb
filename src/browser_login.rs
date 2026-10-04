@@ -63,6 +63,9 @@ pub struct BrowserFlow {
     state: String,
     authorization_url: String,
     expires_at: f64,
+    /// Login lineage minted up front, so the code exchange and every later refresh
+    /// of the registered account send the same machine id.
+    lineage: String,
     exchanging: bool,
     pub status: String,
     pub detail: Option<String>,
@@ -72,6 +75,16 @@ pub struct BrowserFlow {
 impl BrowserFlow {
     pub fn authorization_url(&self) -> &str {
         &self.authorization_url
+    }
+
+    /// The account id the sign-in registers under.
+    pub fn account_id(&self) -> String {
+        format!("browser-{}-{}", self.provider.to_lowercase(), self.id)
+    }
+
+    /// The machine id `KiroAuth::machine_id` derives for the registered account.
+    pub fn machine_id(&self) -> String {
+        crate::utils::account_machine_id(&format!("{}#{}", self.account_id(), self.lineage))
     }
 
     pub fn view(&self) -> Value {
@@ -175,6 +188,7 @@ pub async fn start_on(
         state,
         authorization_url: url.to_string(),
         expires_at: now_f64() + FLOW_TTL,
+        lineage: format!("lineage:{}", uuid::Uuid::new_v4().simple()),
         exchanging: false,
         status: "pending".into(),
         detail: None,
@@ -377,10 +391,10 @@ async fn complete_with_params(
             ))
         }
     };
-    match exchange_code(exchange, &flow.id, code, &flow.verifier, &option).await {
+    let mut flow = flow;
+    flow.provider = provider;
+    match exchange_code(exchange, &flow.machine_id(), code, &flow.verifier, &option).await {
         Ok(token) => {
-            let mut flow = flow;
-            flow.provider = provider;
             flow.token = Some(token);
             tracing::info!("{provider} browser sign-in {} approved", flow.id);
             Ok(finish(flow, "approved", None))
@@ -391,19 +405,18 @@ async fn complete_with_params(
 
 async fn exchange_code(
     exchange: &Exchange,
-    flow_id: &str,
+    machine_id: &str,
     code: &str,
     verifier: &str,
     option: &str,
 ) -> Result<Value, String> {
-    let machine_id = crate::utils::account_machine_id(&format!("browser-login\0{flow_id}"));
     let resp = exchange
         .http
         .post(&exchange.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(
             reqwest::header::USER_AGENT,
-            crate::utils::refresh_user_agent(&machine_id),
+            crate::utils::refresh_user_agent(machine_id),
         )
         .json(&json!({"code": code, "code_verifier": verifier, "redirect_uri": exchange_redirect_uri(option)}))
         .timeout(Duration::from_secs(20))
@@ -475,6 +488,7 @@ pub fn internal_credentials(flow: &BrowserFlow) -> Result<Value, String> {
     let mut doc = json!({
         "refreshToken": token["refreshToken"], "accessToken": token["accessToken"],
         "expiresAt": expires, "region": SOCIAL_REGION, "identityProvider": flow.provider,
+        "_kiroLbLoginIdentity": flow.lineage,
     });
     if let Some(arn) = token.get("profileArn").filter(|v| v.is_string()) {
         doc["profileArn"] = arn.clone();

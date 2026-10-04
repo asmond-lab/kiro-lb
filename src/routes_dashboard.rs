@@ -1199,7 +1199,7 @@ pub async fn register_browser_login(
         Ok(c) => c,
         Err(e) => return detail(400, e),
     };
-    let entry = json!({"type": "internal", "id": format!("browser-{}-{}", flow.provider.to_lowercase(), flow.id), "credential": credential});
+    let entry = json!({"type": "internal", "id": flow.account_id(), "credential": credential});
     let response = register_login(&state, flow.provider, entry).await;
     browser_login::discard(&id);
     response

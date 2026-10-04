@@ -20,10 +20,15 @@ describe("isBrowserCallback", () => {
     ).toBe(true);
   });
 
+  it("accepts a denied sign-in so the dashboard can report it", () => {
+    expect(isBrowserCallback("http://localhost:3128/oauth/callback?error=access_denied&state=xyz")).toBe(true);
+  });
+
   it("rejects other addresses and incomplete callbacks", () => {
     expect(isBrowserCallback("")).toBe(false);
     expect(isBrowserCallback("not a url")).toBe(false);
     expect(isBrowserCallback("https://app.kiro.dev/signin?state=xyz")).toBe(false);
     expect(isBrowserCallback("http://localhost:3128/oauth/callback?state=xyz")).toBe(false);
+    expect(isBrowserCallback("http://localhost:3128/oauth/callback?code=abc")).toBe(false);
   });
 });
