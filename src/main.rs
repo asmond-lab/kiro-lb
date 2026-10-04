@@ -344,10 +344,9 @@ fn main() {
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
     print_banner(&addr);
-    if let Some(g) = &generated {
+    if generated.is_some() {
         println!("  No .env found: created .env and .env.example with fresh credentials.");
-        println!("  PROXY_API_KEY:      {}", g.api_key);
-        println!("  DASHBOARD_PASSWORD: {}", g.password);
+        println!("  Read credentials from the private .env file.");
         println!();
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
