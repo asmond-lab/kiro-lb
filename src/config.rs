@@ -155,7 +155,8 @@ pub struct Config {
     pub data_dir: String,
     pub kiro_slot: String,
     pub handoff_secret: String,
-    /// Normalized model names served only by free-tier accounts.
+    /// Normalized model names routed to free-tier accounts first even before a
+    /// free account's catalog lists them (catalog models are added at runtime).
     pub free_routing_models: Vec<String>,
     /// Subscription types (case-insensitive) that count as free tier.
     pub free_tier_subscription_types: Vec<String>,
