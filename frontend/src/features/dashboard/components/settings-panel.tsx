@@ -330,7 +330,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         {leading}
         <Card>
           <CardHeader>
@@ -530,7 +530,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
         </Card>
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -658,7 +658,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
                 disabled={isBusy || !tunables}
                 onValueChange={(value) => saveTunables({ loadBalancing: value })}
               >
-                <SelectTrigger id="balancing" className="w-80">
+                <SelectTrigger id="balancing" className="w-full max-w-80">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -675,8 +675,8 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
             </div>
 
             <div className="flex flex-wrap items-end gap-4">
-              <div className="inline-grid gap-1">
-                <Label htmlFor="refresh" className="whitespace-nowrap">{t("settings.refreshBefore")}</Label>
+              <div className="inline-grid max-w-full gap-1">
+                <Label htmlFor="refresh" className="leading-snug">{t("settings.refreshBefore")}</Label>
                 <Input
                   id="refresh"
                   type="number"
@@ -699,7 +699,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
         </Card>
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -764,7 +764,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
         </Card>
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -876,7 +876,7 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
         </CardHeader>
         <CardContent>
           {/* 19 rows is a tall column on its own; split it once there is room. */}
-          <div className="grid gap-x-8 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
             {[sortedCosts.slice(0, Math.ceil(sortedCosts.length / 2)), sortedCosts.slice(Math.ceil(sortedCosts.length / 2))].map(
               (half, index) => (
                 <Table key={index}>

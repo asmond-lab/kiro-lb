@@ -482,6 +482,7 @@ pub fn grouped_models(known: &[String]) -> Vec<String> {
         .map(|m| {
             crate::model_resolver::public_model_id(&crate::model_resolver::get_model_id_for_kiro(m))
         })
+        .filter(|m| !m.is_empty())
         .collect();
     out.sort();
     out.dedup();
