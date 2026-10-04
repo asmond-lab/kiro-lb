@@ -245,6 +245,12 @@ async fn native_sse_is_incremental_and_never_reports_success_after_channel_press
     let _test_lock = TEST_LOCK.lock().await;
     let dir = common::data_dir("inferx-native-sse");
     common::seed(&[]);
+    let previous_endpoints = kiro_lb::settings::endpoint_settings().as_json();
+    let mut endpoints = previous_endpoints.clone();
+    // Keep this fixture on its local runtime instead of the live endpoint pool.
+    endpoints["rotation"] = json!(false);
+    store::save_setting("endpoints", &endpoints).unwrap();
+    kiro_lb::settings::load_endpoint_settings();
     std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
     let (http, runtime_url) = successful_upstream().await;
     std::env::set_var("KIRO_TEST_RUNTIME_URL", runtime_url);
@@ -320,5 +326,7 @@ async fn native_sse_is_incremental_and_never_reports_success_after_channel_press
         "succeeded"
     );
     std::env::remove_var("KIRO_TEST_RUNTIME_URL");
+    store::save_setting("endpoints", &previous_endpoints).unwrap();
+    kiro_lb::settings::load_endpoint_settings();
     std::fs::remove_dir_all(dir).unwrap();
 }
