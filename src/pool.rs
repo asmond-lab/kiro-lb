@@ -80,6 +80,13 @@ fn known_subscription_type(subscription_type: Option<&str>) -> Option<&str> {
         .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("unknown"))
 }
 
+fn is_free_routed(model: &str, routing_models: &[String]) -> bool {
+    let normalized = normalize_model_name(model);
+    routing_models
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(&normalized))
+}
+
 fn is_free_tier(s: &AccountState, free_types: &[String]) -> bool {
     s.tier
         .as_deref()
@@ -98,11 +105,7 @@ fn free_routing_order(
     free_types: &[String],
     fallback: bool,
 ) -> Vec<Arc<Account>> {
-    let normalized = normalize_model_name(model);
-    if !routing_models
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(&normalized))
-    {
+    if !is_free_routed(model, routing_models) {
         return accounts;
     }
     let (mut free, rest): (Vec<_>, Vec<_>) = accounts
@@ -1191,17 +1194,28 @@ impl AccountManager {
                 .unwrap_or((false, 0));
             (load.0, support, load.1)
         });
-        if let Some(pinned) = pinned {
-            accounts.insert(0, pinned);
-        }
         let cfg = config::get();
-        free_routing_order(
+        let fallback = settings::tunables().free_routing_fallback;
+        let mut accounts = free_routing_order(
             accounts,
             model,
             &cfg.free_routing_models,
             &cfg.free_tier_subscription_types,
-            settings::tunables().free_routing_fallback,
-        )
+            fallback,
+        );
+        // A live pin stays first, ahead of free-tier accounts too: moving a
+        // conversation off its account throws away that account's prompt cache.
+        // Strict free routing (no fallback) still keeps a non-free pin out of a
+        // free-routed model's candidates.
+        if let Some(pinned) = pinned {
+            if fallback
+                || !is_free_routed(model, &cfg.free_routing_models)
+                || is_free_tier(&pinned.state.lock(), &cfg.free_tier_subscription_types)
+            {
+                accounts.insert(0, pinned);
+            }
+        }
+        accounts
     }
 
     pub async fn next_account(
@@ -1910,6 +1924,46 @@ mod tests {
             models_refresh: tokio::sync::Mutex::new(()),
             models_refresh_scheduled: false.into(),
         })
+    }
+
+    #[test]
+    fn free_tier_preference_keeps_a_live_session_pin_first() {
+        assert_eq!(settings::tunables().load_balancing, "session");
+        assert!(settings::tunables().free_routing_fallback);
+        let pool = AccountManager::new(reqwest::Client::new());
+        let paid = account("paid");
+        paid.state.lock().tier = Some("Pro".into());
+        let free = account("free");
+        free.state.lock().tier = Some("Q_DEVELOPER_STANDALONE_FREE".into());
+        {
+            let mut inner = pool.inner.lock();
+            for a in [paid, free] {
+                inner.order.push(a.id.clone());
+                inner.accounts.insert(a.id.clone(), a);
+            }
+            inner.sessions.insert(
+                11,
+                SessionEntry {
+                    account: "paid".into(),
+                    login_identity: None,
+                    touched: store::now_f64(),
+                },
+            );
+        }
+
+        let pinned: Vec<String> = pool
+            .candidate_order("claude-sonnet-4.5", Some(11))
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        assert_eq!(pinned, ["paid", "free"]);
+
+        let unpinned: Vec<String> = pool
+            .candidate_order("claude-sonnet-4.5", None)
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        assert_eq!(unpinned.first().map(String::as_str), Some("free"));
     }
 
     #[test]
