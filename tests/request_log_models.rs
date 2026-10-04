@@ -27,6 +27,16 @@ fn the_model_filter_joins_every_spelling_of_one_model() {
 }
 
 #[test]
+fn the_model_filter_omits_empty_names_but_keeps_unknown_models() {
+    let known: Vec<String> = ["", "claude-opus-5.5", "custom-model", "claude-opus-5-5"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(grouped_models(&known), ["claude-opus-5-5", "custom-model"]);
+    assert!(grouped_models(&[String::new()]).is_empty());
+}
+
+#[test]
 fn the_effort_recorded_is_the_one_sent_to_kiro() {
     let ctx = RequestCtx::new(None);
     ctx.note_effort(

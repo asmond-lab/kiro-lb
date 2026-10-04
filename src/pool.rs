@@ -58,6 +58,77 @@ pub struct AccountState {
     pub quota_overage_enabled: Option<bool>,
     pub stats: AccountStats,
     pub sessions: i64,
+    /// Effective subscription tier: the latest upstream `subscription_type`
+    /// when one is known, otherwise the tier the account was registered with.
+    pub tier: Option<String>,
+}
+
+fn registered_tier(config: &Value) -> Option<String> {
+    config
+        .get("tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+}
+
+/// The usage API reports "Unknown" when it has no subscription info; that is
+/// absence of evidence and must not override the registered tier.
+fn known_subscription_type(subscription_type: Option<&str>) -> Option<&str> {
+    subscription_type
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("unknown"))
+}
+
+/// A model is free-routed when a free-tier account's live catalog serves it,
+/// so the set follows Kiro's free plan as it changes. Until a free account's
+/// catalog is read, nothing is free-routed and the pool keeps its usual order.
+fn is_free_routed(model: &str, accounts: &[Arc<Account>], free_types: &[String]) -> bool {
+    accounts.iter().any(|a| {
+        a.models.support(model) == ModelSupport::Supported
+            && is_free_tier(&a.state.lock(), free_types)
+    })
+}
+
+/// Every concurrency slot of the account is taken, so a request would queue on it.
+fn is_saturated(a: &Account) -> bool {
+    crate::upstream::http::account_concurrency_load(&a.id)
+        .is_some_and(|(held, limit)| held >= limit)
+}
+
+fn is_free_tier(s: &AccountState, free_types: &[String]) -> bool {
+    s.tier
+        .as_deref()
+        .is_some_and(|tier| free_types.iter().any(|f| f.eq_ignore_ascii_case(tier)))
+}
+
+/// For a free-routed model (see `is_free_routed`), puts free-tier accounts
+/// first in their existing strategy order; the other accounts follow, so the
+/// request is still served when no free account is eligible. Other models are
+/// returned untouched. Weights are never changed here.
+///
+/// The tier preference never outranks capacity: an account whose concurrency
+/// slots are all taken stays behind every account that can start the request
+/// now, free or not, exactly as `candidate_order` sorted it.
+fn free_routing_order(
+    accounts: Vec<Arc<Account>>,
+    routed: bool,
+    free_types: &[String],
+    saturated: impl Fn(&Account) -> bool,
+) -> Vec<Arc<Account>> {
+    if !routed {
+        return accounts;
+    }
+    let (ready, saturated): (Vec<_>, Vec<_>) = accounts.into_iter().partition(|a| !saturated(a));
+    let mut ordered = Vec::new();
+    for group in [ready, saturated] {
+        let (free, rest): (Vec<_>, Vec<_>) = group
+            .into_iter()
+            .partition(|a| is_free_tier(&a.state.lock(), free_types));
+        ordered.extend(free);
+        ordered.extend(rest);
+    }
+    ordered
 }
 
 pub struct Account {
@@ -381,7 +452,10 @@ impl AccountManager {
                         config: entry.clone(),
                         auth: Mutex::new(None),
                         models: Arc::new(ModelInfoCache::new()),
-                        state: Mutex::new(AccountState::default()),
+                        state: Mutex::new(AccountState {
+                            tier: registered_tier(&entry),
+                            ..Default::default()
+                        }),
                         init: tokio::sync::Mutex::new(()),
                         init_retry_at: Mutex::new(None),
                         init_failures: 0.into(),
@@ -514,7 +588,19 @@ impl AccountManager {
         let headroom = store::load_quota_headroom();
         let period = store::load_quota_period();
         let observed = store::load_quota_observed_at();
+        let subscriptions = store::load_subscription_types();
         let inner = self.inner.lock();
+        for (id, subscription_type) in subscriptions {
+            let Some(known) = known_subscription_type(Some(&subscription_type)) else {
+                continue;
+            };
+            if let Some(a) = inner.accounts.get(&id) {
+                let mut state = a.state.lock();
+                if state.login_identity.as_deref() == store::login_identity(&id).as_deref() {
+                    state.tier = Some(known.to_owned());
+                }
+            }
+        }
         for (id, observed_at) in observed {
             if let Some(a) = inner.accounts.get(&id) {
                 let mut state = a.state.lock();
@@ -545,6 +631,7 @@ impl AccountManager {
     fn bind_login_state(&self, a: &Account, identity: Option<&str>) {
         let mut restored = AccountState {
             login_identity: identity.map(str::to_owned),
+            tier: registered_tier(&a.config),
             ..Default::default()
         };
         if let (Some(identity), Some(state)) = (identity, store::load_runtime_state()) {
@@ -1121,6 +1208,15 @@ impl AccountManager {
                 .unwrap_or((false, 0));
             (load.0, support, load.1)
         });
+        let cfg = config::get();
+        let free_types = &cfg.free_tier_subscription_types;
+        let routed = {
+            let everyone: Vec<Arc<Account>> = accounts.iter().chain(&pinned).cloned().collect();
+            is_free_routed(model, &everyone, free_types)
+        };
+        let mut accounts = free_routing_order(accounts, routed, free_types, is_saturated);
+        // A live pin stays first, ahead of free-tier accounts too: moving a
+        // conversation off its account throws away that account's prompt cache.
         if let Some(pinned) = pinned {
             accounts.insert(0, pinned);
         }
@@ -1158,8 +1254,11 @@ impl AccountManager {
         session: Option<u64>,
         last_resort: bool,
     ) -> Option<Arc<Account>> {
+        // A one-account pool is tried even when unhealthy. Measured on the whole
+        // pool, not the candidate list, so free-tier routing narrowing the list
+        // to one account does not bypass its health checks.
+        let single = self.inner.lock().order.len() == 1;
         let candidates = self.candidate_order(model, session);
-        let single = candidates.len() == 1;
         let cfg = config::get();
         let mut unsupported = None;
         for a in candidates {
@@ -1631,6 +1730,25 @@ impl AccountManager {
         }
     }
 
+    /// Records the upstream subscription type from a usage poll so it outranks
+    /// the registered tier hint. Ignored for a replaced login or when upstream
+    /// reports no subscription info.
+    pub fn set_subscription_type(
+        &self,
+        id: &str,
+        login_identity: &str,
+        subscription_type: Option<&str>,
+    ) {
+        let Some(known) = known_subscription_type(subscription_type) else {
+            return;
+        };
+        let Some(a) = self.get(id) else { return };
+        let mut s = a.state.lock();
+        if s.login_identity.as_deref() == Some(login_identity) {
+            s.tier = Some(known.to_owned());
+        }
+    }
+
     pub fn drain_unsaved_observations(&self) -> Vec<RateObservation> {
         std::mem::take(&mut self.inner.lock().unsaved)
     }
@@ -1814,6 +1932,45 @@ mod tests {
     }
 
     #[test]
+    fn free_tier_preference_keeps_a_live_session_pin_first() {
+        assert_eq!(settings::tunables().load_balancing, "session");
+        let pool = AccountManager::new(reqwest::Client::new());
+        let paid = account("paid");
+        paid.state.lock().tier = Some("Pro".into());
+        let free = serving(account("free"), &["claude-sonnet-4.5"]);
+        free.state.lock().tier = Some("Q_DEVELOPER_STANDALONE_FREE".into());
+        {
+            let mut inner = pool.inner.lock();
+            for a in [paid, free] {
+                inner.order.push(a.id.clone());
+                inner.accounts.insert(a.id.clone(), a);
+            }
+            inner.sessions.insert(
+                11,
+                SessionEntry {
+                    account: "paid".into(),
+                    login_identity: None,
+                    touched: store::now_f64(),
+                },
+            );
+        }
+
+        let pinned: Vec<String> = pool
+            .candidate_order("claude-sonnet-4.5", Some(11))
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        assert_eq!(pinned, ["paid", "free"]);
+
+        let unpinned: Vec<String> = pool
+            .candidate_order("claude-sonnet-4.5", None)
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        assert_eq!(unpinned.first().map(String::as_str), Some("free"));
+    }
+
+    #[test]
     fn affinity_lookup_does_not_extend_a_near_expiry_pin() {
         assert_eq!(settings::tunables().load_balancing, "session");
         let pool = AccountManager::new(reqwest::Client::new());
@@ -1911,6 +2068,111 @@ mod tests {
         drop(state);
         assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
         assert!(pool.inner.lock().observations.is_empty());
+    }
+
+    fn tiered(id: &str, tier: Option<&str>) -> Arc<Account> {
+        let a = account(id);
+        a.state.lock().tier = tier.map(str::to_owned);
+        a
+    }
+
+    fn ids(accounts: &[Arc<Account>]) -> Vec<&str> {
+        accounts.iter().map(|a| a.id.as_str()).collect()
+    }
+
+    fn serving(a: Arc<Account>, models: &[&str]) -> Arc<Account> {
+        a.models
+            .update(models.iter().map(|m| json!({"modelId": m})).collect());
+        a
+    }
+
+    #[test]
+    fn free_routing_puts_free_accounts_first_in_strategy_order() {
+        let free = vec!["Free".to_owned()];
+        let pool = vec![
+            serving(tiered("pro-1", Some("Pro")), &["claude-sonnet-4.5"]),
+            serving(tiered("free-1", Some("FREE")), &["claude-sonnet-4.5"]),
+            tiered("unknown", None),
+            tiered("free-2", Some("free")),
+        ];
+
+        for model in ["claude-sonnet-4.5", "claude-sonnet-4-5-20250929"] {
+            let routed = is_free_routed(model, &pool, &free);
+            assert!(routed, "{model}");
+            let preferred = free_routing_order(pool.clone(), routed, &free, |_| false);
+            assert_eq!(
+                ids(&preferred),
+                ["free-1", "free-2", "pro-1", "unknown"],
+                "{model}"
+            );
+        }
+
+        let routed = is_free_routed("claude-opus-4.6", &pool, &free);
+        assert!(!routed, "no free catalog serves it");
+        let other = free_routing_order(pool.clone(), routed, &free, |_| false);
+        assert_eq!(ids(&other), ["pro-1", "free-1", "unknown", "free-2"]);
+    }
+
+    #[test]
+    fn free_routing_follows_free_catalogs_and_waits_for_one() {
+        let free = vec!["Q_DEVELOPER_STANDALONE_FREE".to_owned()];
+        let paid = serving(
+            tiered("pro-1", Some("Pro")),
+            &["claude-haiku-4.5", "claude-opus-4.6"],
+        );
+        let unread = tiered("free-1", Some("Q_DEVELOPER_STANDALONE_FREE"));
+        assert!(
+            !is_free_routed("claude-haiku-4.5", &[paid.clone(), unread.clone()], &free),
+            "no free catalog read yet: the pool keeps its usual order"
+        );
+
+        let pool = vec![paid, serving(unread, &["claude-haiku-4.5"])];
+        assert!(is_free_routed("claude-haiku-4.5", &pool, &free));
+        let ordered = free_routing_order(pool.clone(), true, &free, |_| false);
+        assert_eq!(ids(&ordered), ["free-1", "pro-1"]);
+        assert!(
+            !is_free_routed("claude-opus-4.6", &pool, &free),
+            "a paid-only model keeps the whole pool"
+        );
+    }
+
+    #[test]
+    fn a_saturated_free_account_stays_behind_an_idle_paid_one() {
+        let free = vec!["Free".to_owned()];
+        let pool = vec![
+            tiered("pro-idle", Some("Pro")),
+            tiered("free-full", Some("Free")),
+        ];
+        let ordered = free_routing_order(pool, true, &free, |a| a.id == "free-full");
+        assert_eq!(ids(&ordered), ["pro-idle", "free-full"]);
+    }
+
+    #[test]
+    fn free_routing_without_free_accounts_keeps_the_pool() {
+        let free = vec!["Free".to_owned()];
+        let pool = vec![tiered("pro-1", Some("Pro")), tiered("unknown", None)];
+
+        let ordered = free_routing_order(pool, true, &free, |_| false);
+        assert_eq!(ids(&ordered), ["pro-1", "unknown"]);
+    }
+
+    #[test]
+    fn upstream_subscription_type_overrides_the_registered_tier() {
+        let pool = AccountManager::new(reqwest::Client::new());
+        let a = tiered("a", Some("free"));
+        a.state.lock().login_identity = Some("login".into());
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("a".into());
+            inner.accounts.insert("a".into(), a.clone());
+        }
+
+        pool.set_subscription_type("a", "login", Some("Unknown"));
+        assert_eq!(a.state.lock().tier.as_deref(), Some("free"));
+        pool.set_subscription_type("a", "other-login", Some("Pro"));
+        assert_eq!(a.state.lock().tier.as_deref(), Some("free"));
+        pool.set_subscription_type("a", "login", Some("Pro"));
+        assert_eq!(a.state.lock().tier.as_deref(), Some("Pro"));
     }
 }
 

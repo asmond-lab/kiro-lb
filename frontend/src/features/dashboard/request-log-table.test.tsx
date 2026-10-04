@@ -1,7 +1,18 @@
+import type { ReactNode } from "react";
 import { renderToString } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { RequestLogDetailFields, RequestLogTable } from "./components/request-log-table";
 import type { RequestLogDetail, RequestLogPage } from "./types";
+
+// Radix omits closed portalled menus during SSR. Expose the item values so
+// these tests cover the model options as well as the visible log rows.
+vi.mock("@/components/ui/select", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/components/ui/select")>(),
+  SelectContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+    <span data-select-value={value}>{children}</span>
+  ),
+}));
 
 const emptyHandlers = {
   onLimitChange: () => undefined,
@@ -48,6 +59,24 @@ const solLongContext: RequestLogDetail = {
 };
 
 describe("RequestLogTable", () => {
+  it("omits empty model options without dropping their log rows", () => {
+    const logs = page(null);
+    logs.models = ["", "gpt-5.6-sol", "custom-model"];
+    logs.logs[0].model = "";
+    logs.logs[0].status_code = 400;
+    const html = renderToString(
+      <RequestLogTable page={logs} isLoading={false} model="" order="newest" {...emptyHandlers} />,
+    );
+
+    expect(html).not.toContain('data-select-value=""');
+    expect(html).toContain('data-select-value="__all__"');
+    expect(html).toContain('data-select-value="gpt-5.6-sol"');
+    expect(html).toContain('data-select-value="custom-model"');
+    expect(html).toContain("/v1/chat/completions");
+    expect(html).toContain(">400<");
+    expect(html).toContain("—");
+  });
+
   it("leaves spend and multiplier to the detail view", () => {
     const html = renderToString(
       <RequestLogTable page={page(8.8, 4.4)} isLoading={false} model="" order="newest" {...emptyHandlers} />,

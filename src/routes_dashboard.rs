@@ -388,6 +388,7 @@ fn account_view(a: &pool::Account, deletable: bool, sessions: i64) -> Value {
         "sessions": sessions,
         "usage": ds::cached_usage(&a.id),
         "enabled": true,
+        "tier": s.tier,
     })
 }
 
@@ -502,6 +503,11 @@ pub async fn refresh_account_usage(state: &Shared, a: &pool::Account) -> Value {
                 return json!({"updatedAt": now, "error": "discarded usage for a replaced login"});
             }
             apply_weight(state, &a.id, &login_identity, &u);
+            state.pool.set_subscription_type(
+                &a.id,
+                &login_identity,
+                u["subscriptionType"].as_str(),
+            );
             let mut out = u;
             out["updatedAt"] = json!(now);
             out["error"] = Value::Null;
@@ -886,6 +892,16 @@ fn build_entry(payload: &serde_json::Map<String, Value>) -> Result<Value, String
             entry[key] = json!(v);
         }
     }
+    if let Some(value) = payload.get("tier").filter(|value| !value.is_null()) {
+        let tier = value
+            .as_str()
+            .ok_or("invalid tier: expected a string")?
+            .trim();
+        if tier.is_empty() || tier.chars().count() > 32 || tier.chars().any(char::is_control) {
+            return Err("invalid tier: expected a printable token of at most 32 characters".into());
+        }
+        entry["tier"] = json!(tier);
+    }
     if let Some(credential) = entry.get("credential") {
         if let Some(region) = credential.get("region").filter(|region| !region.is_null()) {
             let region = region.as_str().ok_or(
@@ -1011,6 +1027,45 @@ mod region_tests {
         assert!(entry.get("region").is_none());
         assert!(entry.get("api_region").is_none());
     }
+
+    fn with_tier(tier: Value) -> serde_json::Map<String, Value> {
+        let mut payload = json!({
+            "type": "internal",
+            "id": "account",
+            "credential": {"refreshToken": "a-refresh-token-long-enough"}
+        });
+        payload["tier"] = tier;
+        payload.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn account_registration_accepts_a_short_tier_token() {
+        let entry = build_entry(&with_tier(json!(" free "))).unwrap();
+        assert_eq!(entry["tier"], "free");
+        let entry = build_entry(&with_tier(json!("x".repeat(32)))).unwrap();
+        assert_eq!(entry["tier"], "x".repeat(32));
+        let entry = build_entry(&with_tier(Value::Null)).unwrap();
+        assert!(entry.get("tier").is_none());
+    }
+
+    #[test]
+    fn account_registration_rejects_an_invalid_tier() {
+        for tier in [
+            json!(""),
+            json!("   "),
+            json!("x".repeat(33)),
+            json!("free\nadmin"),
+            json!("fr\u{7f}ee"),
+            json!(1),
+            json!(true),
+            json!(["free"]),
+        ] {
+            assert!(
+                build_entry(&with_tier(tier.clone())).is_err(),
+                "accepted {tier}"
+            );
+        }
+    }
 }
 
 pub async fn register_account(
@@ -1019,7 +1074,87 @@ pub async fn register_account(
     body: Bytes,
 ) -> Response {
     guard!(headers);
-    let payload = match json_object(&body) {
+    register_from_body(&state, &body).await
+}
+
+/// The account factory's credential: the handoff secret, from any host. Unlike
+/// the blue/green controls it is not slot-local, so a factory can address the
+/// stable edge name instead of whichever slot is active; the mutation gate
+/// still holds a registration back during a handoff.
+fn authorize_registration(headers: &HeaderMap) -> Result<(), Response> {
+    use subtle::ConstantTimeEq;
+    let expected = config::get().handoff_secret.as_bytes();
+    let supplied = headers
+        .get("x-handoff-secret")
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    if expected.is_empty()
+        || supplied.len() != expected.len()
+        || !bool::from(supplied.ct_eq(expected))
+    {
+        return Err(detail(
+            403,
+            "account registration requires the handoff secret",
+        ));
+    }
+    Ok(())
+}
+
+/// Programmatic registration for an external account factory. Same payload,
+/// validation and persistence as `POST /api/dashboard/accounts`, authorized by
+/// the handoff secret instead of a dashboard session.
+pub async fn internal_register_account(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = authorize_registration(&headers) {
+        return r;
+    }
+    register_from_body(&state, &body).await
+}
+
+/// Each pool account's last upstream usage reading, for the factory that
+/// created it: email, used and limit of the current allowance, and when it
+/// resets. Same secret as registration. Accounts with no reading, or whose
+/// last persisted refresh failed, are omitted; every reading carries its
+/// `observedAt`, so a consumer can tell a reading that stopped refreshing.
+pub async fn internal_account_quota(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize_registration(&headers) {
+        return r;
+    }
+    let ids: Vec<String> = state.pool.accounts().iter().map(|a| a.id.clone()).collect();
+    let accounts = tokio::task::spawn_blocking(move || {
+        ids.iter()
+            .filter_map(|id| {
+                let u = ds::cached_usage(id);
+                let email = u["email"].as_str()?;
+                if !u["error"].is_null() {
+                    return None;
+                }
+                let resets_at = match &u["nextDateReset"] {
+                    Value::Number(n) => n.as_f64(),
+                    Value::String(s) => s.parse::<f64>().ok(),
+                    _ => None,
+                };
+                Some(json!({
+                    "email": email,
+                    "used": u["currentUsage"].as_f64()?,
+                    "limit": u["usageLimit"].as_f64()?,
+                    "unit": u["unit"],
+                    "resetsAt": resets_at,
+                    "observedAt": u["updatedAt"].as_i64()?,
+                }))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    json_response(200, json!({"accounts": accounts}))
+}
+
+async fn register_from_body(state: &Shared, body: &Bytes) -> Response {
+    let payload = match json_object(body) {
         Ok(m) => m,
         Err(r) => return r,
     };
@@ -1032,7 +1167,7 @@ pub async fn register_account(
         Ok(e) => e,
         Err(e) => return detail(400, e),
     };
-    match register(&state, entry, &requested).await {
+    match register(state, entry, &requested).await {
         Ok(v) => json_response(200, v),
         Err(r) => r,
     }

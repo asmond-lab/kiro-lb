@@ -92,7 +92,7 @@ describe("AccountsPanel", () => {
   });
 });
 
-describe("banned account grouping", () => {
+describe("excluded account grouping", () => {
   const banned: Account = {
     ...deletableAccount,
     id: "acc_banned_first",
@@ -108,55 +108,173 @@ describe("banned account grouping", () => {
       usageLimit: 1000,
     },
   };
+  const authDead: Account = {
+    ...deletableAccount,
+    id: "acc_auth_dead_first",
+    enabled: true,
+    routingState: "auth_dead",
+    requests: 29,
+    failures: 2,
+    sessions: 3,
+    usage: {
+      email: "auth-dead@example.com",
+      subscriptionTitle: "Kiro Free",
+      usagePercent: 12,
+      currentUsage: 6,
+      usageLimit: 50,
+      error: "Credential rejected",
+    },
+  };
   const paused: Account = { ...mockAccount, id: "acc_paused", enabled: false, routingState: "disabled" };
-  const otherStates: Account[] = ["rate_limited", "auth_dead", "quota_depleted", "cooling_down", "quota_exhausted", "uninitialized"].map(
+  const otherStates: Account[] = ["rate_limited", "quota_depleted", "cooling_down", "quota_exhausted", "uninitialized"].map(
     (state) => ({ ...mockAccount, id: `acc_${state}`, routingState: state as Account["routingState"] }),
   );
 
   it("partitions without mutating the input or replacing account objects", () => {
-    const secondBanned = { ...banned, id: "acc_banned_second" };
-    const accounts = Object.freeze([banned, paused, ...otherStates, secondBanned, mockAccount]);
+    const secondBanned = { ...banned, id: "acc_banned_second", enabled: false };
+    const secondAuthDead = { ...authDead, id: "acc_auth_dead_second", enabled: false };
+    const accounts = Object.freeze([banned, authDead, paused, ...otherStates, secondBanned, secondAuthDead, mockAccount]);
     const groups = groupAccounts(accounts);
 
     expect(groups).toEqual({
-      activeAccounts: [...otherStates, mockAccount],
-      pausedAccounts: [paused],
-      bannedAccounts: [banned, secondBanned],
-      displayedAccounts: [...otherStates, mockAccount, paused, banned, secondBanned],
+      activeAccounts: [mockAccount],
+      unavailableAccounts: otherStates,
+      pausedAccounts: [paused, secondBanned, secondAuthDead],
+      authDeadAccounts: [authDead],
+      bannedAccounts: [banned],
+      displayedAccounts: [mockAccount, ...otherStates, paused, secondBanned, secondAuthDead, authDead, banned],
     });
     expect(groups.pausedAccounts[0]).toBe(paused);
+    expect(groups.pausedAccounts[2]).toBe(secondAuthDead);
+    expect(groups.authDeadAccounts[0]).toBe(authDead);
     expect(groups.bannedAccounts[0]).toBe(banned);
   });
 
   it("returns empty groups for an empty pool", () => {
     expect(groupAccounts([])).toEqual({
       activeAccounts: [],
+      unavailableAccounts: [],
       pausedAccounts: [],
+      authDeadAccounts: [],
       bannedAccounts: [],
       displayedAccounts: [],
     });
   });
 
-  it("groups only suspended accounts last in both card and table layouts, preserving order within groups", () => {
+  it.each([true, false, undefined])("partitions every routing state exactly once with enabled=%s", (enabled) => {
+    const expectedGroups = {
+      available: "activeAccounts",
+      rate_limited: "unavailableAccounts",
+      cooling_down: "unavailableAccounts",
+      quota_depleted: "unavailableAccounts",
+      quota_exhausted: "unavailableAccounts",
+      uninitialized: "unavailableAccounts",
+      disabled: "pausedAccounts",
+      auth_dead: "authDeadAccounts",
+      suspended: "bannedAccounts",
+    } as const satisfies Record<Account["routingState"], keyof ReturnType<typeof groupAccounts>>;
+    for (const [state, expectedGroup] of Object.entries(expectedGroups)) {
+      const account = { ...mockAccount, enabled, routingState: state as Account["routingState"] };
+      const groups = groupAccounts([account]);
+      expect(groups[enabled === false ? "pausedAccounts" : expectedGroup]).toEqual([account]);
+      expect(groups.displayedAccounts).toEqual([account]);
+    }
+  });
+
+  it("does not treat an unknown upstream state as ready", () => {
+    const unknown = { ...mockAccount, routingState: "new_exclusion" as Account["routingState"] };
+    const groups = groupAccounts([unknown, mockAccount]);
+    expect(groups.activeAccounts).toEqual([mockAccount]);
+    expect(groups.unavailableAccounts).toEqual([unknown]);
+    expect(groups.displayedAccounts).toEqual([mockAccount, unknown]);
+  });
+
+  it("returns a recovered account to the top only when it is enabled and ready", () => {
+    expect(groupAccounts([{ ...authDead, enabled: false }]).pausedAccounts).toHaveLength(1);
+    expect(groupAccounts([authDead]).authDeadAccounts).toHaveLength(1);
+    expect(groupAccounts([{ ...authDead, enabled: false, routingState: "available" }]).activeAccounts).toEqual([]);
+    const recovered: Account = { ...authDead, routingState: "available" };
+    expect(groupAccounts([banned, recovered]).activeAccounts).toEqual([recovered]);
+  });
+
+  it("orders ready, unavailable, paused, auth-dead and banned accounts in both layouts", () => {
     const secondBanned = { ...banned, id: "acc_banned_second" };
+    const secondAuthDead = { ...authDead, id: "acc_auth_dead_second" };
     const html = renderToString(
-      <AccountsPanel accounts={[banned, paused, ...otherStates, secondBanned, mockAccount]} isLoading={false} />,
+      <AccountsPanel accounts={[banned, authDead, paused, ...otherStates, secondBanned, secondAuthDead, mockAccount]} isLoading={false} />,
     );
     const [cards, table] = html.split("<table");
     for (const layout of [cards, table]) {
+      expect(layout.match(/Unavailable accounts/g)).toHaveLength(1);
       expect(layout.match(/Paused accounts/g)).toHaveLength(1);
+      expect(layout.match(/Auth-dead accounts/g)).toHaveLength(1);
       expect(layout.match(/Banned accounts/g)).toHaveLength(1);
-      for (const account of [...otherStates, mockAccount]) {
+      expect(layout.lastIndexOf(mockAccount.id)).toBeLessThan(layout.indexOf("Unavailable accounts"));
+      for (const account of otherStates) {
         expect(layout).toContain(account.id);
+        expect(layout.indexOf("Unavailable accounts")).toBeLessThan(layout.indexOf(account.id));
         expect(layout.lastIndexOf(account.id)).toBeLessThan(layout.indexOf("Paused accounts"));
       }
       expect(layout.indexOf("Paused accounts")).toBeLessThan(layout.indexOf(paused.id));
-      expect(layout.lastIndexOf(paused.id)).toBeLessThan(layout.indexOf("Banned accounts"));
+      expect(layout.lastIndexOf(paused.id)).toBeLessThan(layout.indexOf("Auth-dead accounts"));
+      expect(layout.indexOf("Auth-dead accounts")).toBeLessThan(layout.indexOf(authDead.id));
+      expect(layout.lastIndexOf(authDead.id)).toBeLessThan(layout.indexOf(secondAuthDead.id));
+      expect(layout.lastIndexOf(secondAuthDead.id)).toBeLessThan(layout.indexOf("Banned accounts"));
       expect(layout.indexOf("Banned accounts")).toBeLessThan(layout.indexOf(banned.id));
       expect(layout.lastIndexOf(banned.id)).toBeLessThan(layout.indexOf(secondBanned.id));
     }
-    expect(cards.match(/<article /g)).toHaveLength(10);
-    expect(table.match(/<tr /g)).toHaveLength(13); // Header, two dividers, ten accounts.
+    expect(cards.match(/<article /g)).toHaveLength(11);
+    expect(table.match(/<tr /g)).toHaveLength(16); // Header, four dividers, eleven accounts.
+  });
+
+  it("shows unavailable accounts even when no account is ready", () => {
+    const html = renderToString(<AccountsPanel accounts={otherStates} isLoading={false} />);
+    const [cards, table] = html.split("<table");
+    for (const layout of [cards, table]) {
+      expect(layout.match(/Unavailable accounts/g)).toHaveLength(1);
+      expect(layout).not.toContain("No accounts registered");
+      expect(layout).not.toContain("Paused accounts");
+      for (const account of otherStates) {
+        expect(layout.indexOf(account.id)).toBeGreaterThan(layout.indexOf("Unavailable accounts"));
+      }
+    }
+  });
+
+  it("does not show empty sections for a ready-only pool", () => {
+    const html = renderToString(<AccountsPanel accounts={[mockAccount]} isLoading={false} />);
+    for (const label of ["Unavailable accounts", "Paused accounts", "Auth-dead accounts", "Banned accounts"]) {
+      expect(html).not.toContain(label);
+    }
+  });
+
+  it.each([true, false, undefined])("shows an auth-dead account under the correct section with enabled=%s, keeping snapshots and actions", (enabled) => {
+    const html = renderToString(
+      <AccountsPanel accounts={[{ ...authDead, enabled }]} isLoading={false} onToggleAccount={() => undefined} />,
+    );
+    const [cards, table] = html.split("<table");
+    for (const layout of [cards, table]) {
+      expect(layout.match(enabled === false ? /Paused accounts/g : /Auth-dead accounts/g)).toHaveLength(1);
+      expect(layout).not.toContain(enabled === false ? "Auth-dead accounts" : "Paused accounts");
+      expect(layout).not.toContain("Unavailable accounts");
+      expect(layout).not.toContain("Banned accounts");
+      expect(layout).not.toContain("No accounts registered");
+      expect(layout).toContain("auth-dead@example.com");
+      expect(layout).toContain("Kiro Free");
+      expect(layout).toContain("12.00%");
+      expect(layout).toContain(">29<");
+      expect(layout).toContain(">2<");
+      expect(layout).toContain(">3<");
+      expect(layout).toContain("Previous reading");
+      expect(layout).not.toContain("last check failed");
+      expect(layout).toContain("re-login required");
+      expect(layout).not.toContain("contact support");
+    }
+    expect(cards).toContain("Delete");
+    expect(table).toContain('aria-label="Delete account acc_auth_dead_first"');
+    if (enabled !== undefined) {
+      expect(cards).toContain(enabled ? ">Pause<" : ">Resume<");
+      expect(table).toContain(`aria-label="${enabled ? "Disable" : "Enable"} account acc_auth_dead_first"`);
+    }
   });
 
   it("shows the section even when every account is banned, keeping snapshots and actions", () => {
@@ -167,6 +285,7 @@ describe("banned account grouping", () => {
     for (const layout of [cards, table]) {
       expect(layout).toContain("Banned accounts");
       expect(layout).not.toContain("Paused accounts");
+      expect(layout).not.toContain("Auth-dead accounts");
       expect(layout).not.toContain("No accounts registered");
       expect(layout).toContain("last known details are kept");
       expect(layout).toContain("banned@example.com");
@@ -181,11 +300,12 @@ describe("banned account grouping", () => {
     expect(table).toContain('aria-label="Delete account acc_banned_first"');
   });
 
-  it("does not create a banned section for other exclusions or paused accounts", () => {
+  it("does not create auth-dead or banned sections for other exclusions or paused accounts", () => {
     const html = renderToString(
       <AccountsPanel accounts={[paused, ...otherStates]} isLoading={false} />,
     );
     expect(html).toContain("Paused accounts");
+    expect(html).not.toContain("Auth-dead accounts");
     expect(html).not.toContain("Banned accounts");
   });
 });
@@ -278,9 +398,14 @@ describe("UsageCell error rendering", () => {
     usage: { error: HTTPX_401 },
   };
 
-  it("still reports the error text", () => {
+  it("shows a compact unavailable label instead of printing the upstream error", () => {
     const html = renderToString(<AccountsPanel accounts={[erroredAccount]} isLoading={false} />);
+    expect(html).toContain(">Unavailable</p>");
     expect(html).toContain("401 Unauthorized");
+    const visibleText = html.replace(/<[^>]*>/g, "");
+    expect(visibleText).not.toContain("401 Unauthorized");
+    expect(visibleText).not.toContain("developer.mozilla.org");
+    expect(html).not.toContain('role="progressbar"');
   });
 
   it("constrains the cell so a long error cannot widen the table", () => {
@@ -295,8 +420,28 @@ describe("UsageCell error rendering", () => {
 
   it("keeps the full message reachable instead of truncating it away", () => {
     const html = renderToString(<AccountsPanel accounts={[erroredAccount]} isLoading={false} />);
-    expect(html).toContain("title=");
-    expect(html).toContain("developer.mozilla.org");
+    expect(html).toMatch(/title="[^"]*developer\.mozilla\.org/);
+  });
+
+  it.each(["available", "auth_dead", "disabled"] as const)("labels stale figures without a duplicate warning for %s accounts", (routingState) => {
+    const stale: Account = {
+      ...erroredAccount,
+      routingState,
+      enabled: routingState !== "disabled",
+      usage: { usagePercent: 0, currentUsage: 0, usageLimit: 50, error: HTTPX_401 },
+    };
+    const html = renderToString(<AccountsPanel accounts={[stale]} isLoading={false} />);
+    const [cards, table] = html.split("<table");
+    for (const layout of [cards, table]) {
+      expect(layout).toContain("0.00%");
+      expect(layout).toContain('role="progressbar"');
+      expect(layout.match(/Previous reading/g)).toHaveLength(1);
+      expect(layout.replaceAll("<!-- -->", "")).toMatch(/title="[^"]*developer\.mozilla\.org[^>]*>· Previous reading<\/span>/);
+      expect(layout).not.toContain("last check failed");
+      expect(layout).not.toContain("text-warning");
+      expect(layout).not.toContain(">Unavailable</p>");
+      expect(layout.replace(/<[^>]*>/g, "")).not.toContain("401 Unauthorized");
+    }
   });
 
   it("renders the usage bar for a healthy account, not the error path", () => {
@@ -306,6 +451,8 @@ describe("UsageCell error rendering", () => {
     };
     const html = renderToString(<AccountsPanel accounts={[healthy]} isLoading={false} />);
     expect(html).toContain("42.00%");
+    expect(html).not.toContain("Previous reading");
+    expect(html).not.toContain(">Unavailable</p>");
     expect(html).not.toContain("line-clamp-2");
   });
 });

@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2, Users } from "lucide-react";
+import { Ban, Check, Clock3, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2, Users } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -145,24 +145,15 @@ function AccountCell({ account }: { account: Account }) {
   );
 }
 
-/**
- * A failed poll reports why, without being able to resize the table.
- *
- * The message is upstream text of unbounded length: an httpx status error is 188
- * characters across two lines, and rendering it bare into a `whitespace-nowrap`
- * cell forced the row wider than the viewport and pushed every later column
- * off-screen. The backend now summarizes these, but the cell must not depend on
- * that: a width cap plus clamped wrapping makes the layout hold for any string,
- * and the full text stays available through the `title` tooltip rather than
- * being truncated away.
- */
+/** Keep unbounded upstream errors in the tooltip, not in the table layout. */
 function UsageErrorCell({ message }: { message: string }) {
+  const { t } = usePreferences();
   return (
     <p
       title={message}
-      className="line-clamp-2 max-w-40 text-xs break-words whitespace-normal text-destructive"
+      className="line-clamp-2 max-w-40 text-xs break-words whitespace-normal text-muted-foreground"
     >
-      {message}
+      {t("accounts.usageUnavailable")}
     </p>
   );
 }
@@ -170,25 +161,22 @@ function UsageErrorCell({ message }: { message: string }) {
 function UsageCell({ account }: { account: Account }) {
   const { t } = usePreferences();
   const usage = account.usage;
-  // A failed poll keeps the previous figures, so showing the error instead of
-  // them hides information that is still useful. The error becomes a warning
-  // above the bar, and only replaces it when there is nothing to show.
+  // Keep the last known figures, but distinguish them from a fresh reading.
+  // Account failures belong in the state column; usage only describes the data.
   const percent = usage?.usagePercent;
   if (usage?.error && percent == null) return <UsageErrorCell message={usage.error} />;
   if (!usage || percent == null) return <span className="text-muted-foreground">—</span>;
   return (
     <div className="min-w-40 space-y-1.5">
-      {usage.error && (
-        <p title={usage.error} className="line-clamp-1 text-xs text-warning">
-          {t("accounts.lastCheckFailed")}
-        </p>
-      )}
       <Progress
         value={Math.min(percent, 100)}
         className="h-1.5"
         indicatorClassName={usageIndicatorClass(percent)}
       />
-      <p className="text-xs tabular-nums text-muted-foreground">{formatUsage(usage)}</p>
+      <p className="flex flex-wrap gap-x-1 text-xs tabular-nums text-muted-foreground">
+        <span>{formatUsage(usage)}</span>
+        {usage.error && <span title={usage.error}>· {t("accounts.previousUsage")}</span>}
+      </p>
     </div>
   );
 }
@@ -206,9 +194,10 @@ function AccountCard({
 }) {
   const { t } = usePreferences();
   const overage = account.usage?.overageStatus;
+  const needsAttention = account.routingState === "suspended" || account.routingState === "auth_dead";
   return (
-    <article className={cn("space-y-4 rounded-lg border p-4", (account.enabled === false || account.routingState === "suspended") && "bg-muted/15 text-muted-foreground")}>
-      <div className={cn("flex min-w-0 items-start justify-between gap-3", account.routingState === "suspended" && "flex-col")}>
+    <article className={cn("space-y-4 rounded-lg border p-4", (account.enabled === false || account.routingState !== "available") && "bg-muted/15 text-muted-foreground")}>
+      <div className={cn("flex min-w-0 items-start justify-between gap-3", needsAttention && "flex-col")}>
         <div className="min-w-0 max-w-full flex-1"><AccountCell account={account} /></div>
         <RoutingStateCell account={account} />
       </div>
@@ -280,7 +269,7 @@ export type AccountsPanelProps = {
 export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
   const { t } = usePreferences();
   const [deleting, setDeleting] = useState<Account | null>(null);
-  const { activeAccounts, pausedAccounts, bannedAccounts, displayedAccounts } = groupAccounts(accounts);
+  const { activeAccounts, unavailableAccounts, pausedAccounts, authDeadAccounts, bannedAccounts, displayedAccounts } = groupAccounts(accounts);
   return (
     <Card>
       <CardHeader>
@@ -300,6 +289,20 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
               {activeAccounts.map((account) => (
                 <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
               ))}
+              {unavailableAccounts.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <div className="rounded-md bg-muted/30 px-3 py-2">
+                    <p className="flex items-center gap-2 font-medium">
+                      <Clock3 size={14} aria-hidden="true" />
+                      {t("accounts.unavailableSection")}
+                    </p>
+                    <p className="text-xs break-keep text-muted-foreground">{t("accounts.unavailableDescription")}</p>
+                  </div>
+                  {unavailableAccounts.map((account) => (
+                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                  ))}
+                </div>
+              )}
               {pausedAccounts.length > 0 && (
                 <div className="space-y-3 pt-2">
                   <div className="rounded-md bg-muted/30 px-3 py-2">
@@ -307,6 +310,20 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                     <p className="text-xs break-keep text-muted-foreground">{t("accounts.pausedDescription")}</p>
                   </div>
                   {pausedAccounts.map((account) => (
+                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                  ))}
+                </div>
+              )}
+              {authDeadAccounts.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <div className="rounded-md bg-destructive/5 px-3 py-2">
+                    <p className="flex items-center gap-2 font-medium text-destructive">
+                      <KeyRound size={14} aria-hidden="true" />
+                      {t("accounts.authDeadSection")}
+                    </p>
+                    <p className="text-xs break-keep text-muted-foreground">{t("accounts.authDeadDescription")}</p>
+                  </div>
+                  {authDeadAccounts.map((account) => (
                     <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
                   ))}
                 </div>
@@ -346,12 +363,38 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
             <TableBody>
               {displayedAccounts.map((account) => (
                 <Fragment key={account.id}>
+                  {account === unavailableAccounts[0] && (
+                    <TableRow className="bg-muted/30 hover:bg-muted/30">
+                      <TableCell colSpan={10} className="whitespace-normal py-3">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="inline-flex items-center gap-2 font-medium text-foreground">
+                            <Clock3 size={14} aria-hidden="true" />
+                            {t("accounts.unavailableSection")}
+                          </span>
+                          <span className="text-xs text-muted-foreground">{t("accounts.unavailableDescription")}</span>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
                   {account === pausedAccounts[0] && (
                     <TableRow className="bg-muted/30 hover:bg-muted/30">
                       <TableCell colSpan={10} className="whitespace-normal py-3">
                         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                           <span className="font-medium text-foreground">{t("accounts.pausedSection")}</span>
                           <span className="text-xs text-muted-foreground">{t("accounts.pausedDescription")}</span>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  {account === authDeadAccounts[0] && (
+                    <TableRow className="bg-destructive/5 hover:bg-destructive/5">
+                      <TableCell colSpan={10} className="whitespace-normal py-3">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="inline-flex items-center gap-2 font-medium text-destructive">
+                            <KeyRound size={14} aria-hidden="true" />
+                            {t("accounts.authDeadSection")}
+                          </span>
+                          <span className="text-xs text-muted-foreground">{t("accounts.authDeadDescription")}</span>
                         </div>
                       </TableCell>
                     </TableRow>
@@ -369,7 +412,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                       </TableCell>
                     </TableRow>
                   )}
-                  <TableRow className={account.enabled === false || account.routingState === "suspended" ? "bg-muted/15 text-muted-foreground hover:bg-muted/25" : undefined}>
+                  <TableRow className={account.enabled === false || account.routingState !== "available" ? "bg-muted/15 text-muted-foreground hover:bg-muted/25" : undefined}>
                     <TableCell className="max-w-56">
                       <AccountCell account={account} />
                     </TableCell>

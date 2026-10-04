@@ -83,7 +83,7 @@ export function RequestLogTable({
             </SelectTrigger>
             <SelectContent>
               <SelectItem value={ALL_MODELS}>{t("logs.allModels")}</SelectItem>
-              {(page.models ?? []).map((name) => (
+              {(page.models ?? []).filter((name) => name !== "").map((name) => (
                 <SelectItem key={name} value={name}>
                   <ModelMark model={name} />
                   {name}
