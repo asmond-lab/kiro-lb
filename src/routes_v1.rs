@@ -418,6 +418,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                 )
             };
             let opts = OpenAIOptions {
+                execute_web_search: true,
                 include_reasoning,
                 parallel_tool_calls: parallel,
                 request_messages: messages,

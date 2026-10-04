@@ -107,7 +107,9 @@ fn router(state: app::Shared) -> Router {
             get(inferx::get_request)
                 .post(inferx::post_request)
                 .delete(inferx::fence_request)
-                .layer(axum::extract::DefaultBodyLimit::max(128 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    kiro_lb::inferx_contract::MAX_BODY,
+                )),
         )
         .route("/api/dashboard/login", post(d::login))
         .route("/api/dashboard/logout", post(d::logout))

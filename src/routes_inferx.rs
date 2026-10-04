@@ -29,7 +29,7 @@ use crate::{
 const MAX_OUTSTANDING: i64 = 1000;
 const MAX_OWNER: usize = 128;
 const MAX_BODY: usize = 4096;
-const MAX_INFERENCE_BODY: usize = 128 * 1024;
+const MAX_INFERENCE_BODY: usize = crate::inferx_contract::MAX_BODY;
 const MAX_INFERENCE_RESPONSE: usize = 1024 * 1024;
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -495,26 +495,33 @@ struct Receipt {
     duration: Option<i64>,
     ttft: Option<f64>,
     generation: Option<f64>,
+    metering: Option<String>,
 }
 
 fn read_receipt(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Receipt>> {
     use rusqlite::OptionalExtension;
     c.query_row(
-        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms FROM inferx_requests WHERE request_id=?1",
+        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json FROM inferx_requests WHERE request_id=?1",
         [id],
-        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)? }),
+        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)? }),
     ).optional()
 }
 
 fn receipt_json(receipt: &Receipt, completion: Option<Value>) -> Value {
     let usage = if receipt.status == "succeeded" {
         Some(
-            json!({"inputTokens":receipt.input.unwrap_or(0).max(0),"outputTokens":receipt.output.unwrap_or(0).max(0),"durationMs":receipt.duration.unwrap_or(0).max(0),"ttftMs":receipt.ttft,"generationMs":receipt.generation}),
+            json!({"inputTokens":receipt.input,"outputTokens":receipt.output,"durationMs":receipt.duration,"ttftMs":receipt.ttft,"generationMs":receipt.generation}),
         )
     } else {
         None
     };
     let mut value = json!({"requestId":receipt.request_id,"status":receipt.status,"usage":usage});
+    if receipt.status == "succeeded" {
+        if let Some(metering) = &receipt.metering {
+            // A corrupt stored contract must not silently become a legacy estimate.
+            value["usage"]["metering"] = serde_json::from_str(metering).unwrap_or(Value::Null);
+        }
+    }
     if let Some(completion) = completion {
         value["response"] = completion;
     }
@@ -546,16 +553,10 @@ fn validate_inference(envelope: &InferenceEnvelope) -> Result<(String, i64), Res
     if !valid_id(&envelope.connection_id) || !valid_field(&envelope.owner_id, MAX_OWNER) {
         return Err(error(400, "invalid_request", "Invalid request"));
     }
-    let Some(request) = envelope.request.as_object() else {
-        return Err(error(400, "invalid_request", "Invalid request"));
-    };
-    if request
-        .keys()
-        .any(|key| !matches!(key.as_str(), "model" | "messages" | "max_tokens" | "stream"))
-        || !request.get("stream").is_some_and(Value::is_boolean)
-    {
+    if !crate::inferx_contract::valid(&envelope.request) {
         return Err(error(400, "unsupported_request", "Unsupported request"));
     }
+    let request = &envelope.request;
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -566,28 +567,6 @@ fn validate_inference(envelope: &InferenceEnvelope) -> Result<(String, i64), Res
         .and_then(Value::as_i64)
         .filter(|v| (1..=4096).contains(v))
         .ok_or_else(|| error(400, "invalid_request", "Invalid request"))?;
-    let messages = request
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| error(400, "invalid_request", "Invalid request"))?;
-    if messages.iter().any(|message| {
-        let Some(message) = message.as_object() else {
-            return true;
-        };
-        message.len() != 2
-            || !matches!(
-                message.get("role").and_then(Value::as_str),
-                Some("system" | "user" | "assistant")
-            )
-            || !message.get("content").is_some_and(Value::is_string)
-    }) {
-        return Err(error(
-            400,
-            "unsupported_request",
-            "Only text chat messages are supported",
-        ));
-    }
     Ok((model.to_owned(), max_tokens))
 }
 
@@ -728,7 +707,10 @@ pub async fn post_request(
         let sid = task_id.clone();
         let owner = task_owner.clone();
         let connection = task_connection.clone();
-        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms()])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}read_receipt(c,&sid)}).await.ok().flatten();
+        let metering = usage
+            .as_ref()
+            .map(|_| crate::inferx_contract::metering().to_string());
+        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}read_receipt(c,&sid)}).await.ok().flatten();
         if let Some(receipt) = saved {
             let _ = tx.send((receipt, completion, delivery_complete));
         }
@@ -860,10 +842,14 @@ async fn execute_inference(
         search_followup: None,
     };
     let opts = OpenAIOptions {
+        execute_web_search: false,
         include_reasoning: true,
-        parallel_tool_calls: false,
+        parallel_tool_calls: request
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         request_messages: request["messages"].as_array().cloned().unwrap_or_default(),
-        request_tools: vec![],
+        request_tools: request["tools"].as_array().cloned().unwrap_or_default(),
     };
     let streaming = stream_tx.is_some();
     let mut delivery_complete = true;

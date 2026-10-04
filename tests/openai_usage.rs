@@ -52,11 +52,63 @@ fn metered(events: EventStream, request: &RequestCtx) -> EventStream {
 
 fn opts() -> OpenAIOptions {
     OpenAIOptions {
+        execute_web_search: true,
         include_reasoning: true,
         parallel_tool_calls: true,
         request_messages: vec![],
         request_tools: vec![],
     }
+}
+
+#[tokio::test]
+async fn inferx_web_search_is_a_client_tool_not_server_side_execution() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let mock = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({"result":{"content":[{"text":"{\"results\":[]}"}]}})) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+    for execute in [false, true] {
+        let (mut context, _) = ctx();
+        let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
+        let mut auth =
+            KiroAuth::from_device_credentials("fixture", &credential, reqwest::Client::new())
+                .unwrap();
+        auth.q_host = host.clone();
+        context.auth = Arc::new(auth);
+        let mut options = opts();
+        options.execute_web_search = execute;
+        let events: EventStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(KiroEvent::ToolUse(
+                json!({"id":"client-search","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"Seoul\"}"}}),
+            )),
+            Ok(KiroEvent::Usage(json!(1))),
+            Ok(KiroEvent::StopReason("tool_use".into())),
+        ]));
+        let result = stream_openai::collect(events, context, options, false)
+            .await
+            .unwrap();
+        if execute {
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(result["choices"][0]["message"]["tool_calls"].is_null());
+        } else {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                result["choices"][0]["message"]["tool_calls"][0]["id"],
+                "client-search"
+            );
+        }
+    }
+    task.abort();
 }
 
 #[tokio::test]

@@ -12,6 +12,226 @@ use tower::ServiceExt;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+const PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5N8AAAAASUVORK5CYII=";
+
+#[tokio::test]
+async fn metering_upgrade_preserves_legacy_receipts_without_inventing_provenance() {
+    let _test_lock = TEST_LOCK.lock().await;
+    let dir = common::data_dir("inferx-metering-migration");
+    common::seed(&[]);
+    std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
+    let id = uuid::Uuid::new_v4().to_string();
+    store::with(|c| {
+        c.execute_batch("ALTER TABLE inferx_requests DROP COLUMN metering_json")?;
+        c.execute("INSERT INTO inferx_requests(request_id,request_hash,owner_id,connection_id,status,input_tokens,output_tokens,duration_ms,created_at,updated_at) VALUES(?1,'hash','seller','connection','succeeded',17,9,50,0,0)", [&id])?;
+        Ok(())
+    }).unwrap();
+    store::initialize().unwrap();
+    store::initialize().unwrap();
+    let app = Router::new().route("/requests/{id}", get(api::get_request));
+    let receipt = call(&app, &id, "seller", "GET", None).await.1;
+    assert_eq!(receipt["usage"]["inputTokens"], 17);
+    assert_eq!(receipt["usage"]["outputTokens"], 9);
+    assert!(receipt["usage"].get("metering").is_none());
+    // Corrupt persisted usage must not become a valid zero-cost success.
+    store::with(|c| c.execute("UPDATE inferx_requests SET input_tokens=-1,output_tokens=NULL,metering_json='broken' WHERE request_id=?1", [&id]).map(|_|())).unwrap();
+    let corrupt = call(&app, &id, "seller", "GET", None).await.1;
+    assert_eq!(corrupt["usage"]["inputTokens"], -1);
+    assert!(corrupt["usage"]["outputTokens"].is_null());
+    assert!(corrupt["usage"]["metering"].is_null());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn images_and_tools_reach_upstream_and_survive_completion_stream_and_recovery() {
+    let _test_lock = TEST_LOCK.lock().await;
+    let dir = common::data_dir("inferx-modalities");
+    common::seed(&[]);
+    let previous_endpoints = kiro_lb::settings::endpoint_settings().as_json();
+    let mut endpoints = previous_endpoints.clone();
+    endpoints["rotation"] = json!(false);
+    store::save_setting("endpoints", &endpoints).unwrap();
+    kiro_lb::settings::load_endpoint_settings();
+    std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
+    let payloads = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let captured = payloads.clone();
+    let runtime = Router::new().route("/", axum::routing::post(move |bytes: axum::body::Bytes| {
+        let captured = captured.clone();
+        async move {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let continuation = body.pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/toolResults").is_some();
+            captured.lock().await.push(body);
+            if continuation {
+                "{\"content\":\"Seoul is sunny\"}{\"usage\":1}{\"stopReason\":\"end_turn\"}"
+            } else {
+                r#"{"name":"weather","toolUseId":"call-1","input":"{\"city\":"}{"input":"\"Seoul\"}","toolUseId":"call-1","stop":true}{"usage":1}{"stopReason":"tool_use"}"#
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    std::env::set_var(
+        "KIRO_TEST_RUNTIME_URL",
+        format!("http://{}/", listener.local_addr().unwrap()),
+    );
+    let runtime_task = tokio::spawn(async move {
+        axum::serve(listener, runtime).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    let state = common::state(common::pool(&http, &[]), &http, false);
+    let app = Router::new()
+        .route(
+            "/requests/{id}",
+            get(api::get_request).post(api::post_request),
+        )
+        .with_state(state);
+    let connection = uuid::Uuid::new_v4().to_string();
+    let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1","profileArn":"arn:aws:codewhisperer:us-east-1:000000000000:profile/test"});
+    store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,created_at,updated_at) VALUES(?1,'seller','github','registered',?2,0,0)", rusqlite::params![connection,credential.to_string()]).map(|_|())).unwrap();
+    let tool_call = json!({"id":"call-1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Seoul\"}"}});
+    let initial = json!({"ownerId":"seller","connectionId":connection,"request":{
+        "model":"claude-sonnet-4","stream":false,"max_tokens":256,
+        "messages":[{"role":"user","content":[{"type":"text","text":"Describe weather"},{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}")}}]}],
+        "tools":[{"type":"function","function":{"name":"weather","description":"Weather by city","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    }});
+    for streaming in [false, true] {
+        let mut body = initial.clone();
+        body["request"]["stream"] = json!(streaming);
+        let id = uuid::Uuid::new_v4().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/requests/{id}"))
+                    .header("Authorization", "Bearer fixture-control")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+        if streaming {
+            let stream = std::str::from_utf8(&bytes).unwrap();
+            let chunks: Vec<Value> = stream
+                .split("\n\n")
+                .filter_map(|frame| frame.strip_prefix("data: "))
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            let call = chunks
+                .iter()
+                .find_map(|v| v.pointer("/choices/0/delta/tool_calls/0"))
+                .unwrap();
+            assert_eq!(call["function"]["name"], "weather");
+            assert_eq!(
+                serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .unwrap(),
+                json!({"city":"Seoul"})
+            );
+            assert!(stream.contains("\"finish_reason\":\"tool_calls\""));
+            assert!(stream.contains("event: inferx.receipt"));
+        } else {
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["status"], "succeeded");
+            assert_eq!(
+                value["response"]["choices"][0]["message"]["tool_calls"][0]["id"],
+                "call-1"
+            );
+        }
+        let receipt = call(&app, &id, "seller", "GET", None).await.1;
+        assert_eq!(
+            receipt["usage"]["metering"],
+            kiro_lb::inferx_contract::metering()
+        );
+        assert!(
+            receipt["usage"]["outputTokens"].as_i64().unwrap() > 0,
+            "tool-only outputs must be metered"
+        );
+        assert_eq!(
+            call(&app, &id, "seller", "POST", Some(body.clone()))
+                .await
+                .1,
+            receipt
+        );
+        store::initialize().unwrap();
+        assert_eq!(call(&app, &id, "seller", "GET", None).await.1, receipt);
+        let input = body["request"]["messages"].as_array_mut().unwrap();
+        input.push(json!({"role":"assistant","content":null,"tool_calls":[tool_call.clone()]}));
+        input.push(json!({"role":"tool","tool_call_id":"call-1","content":"Sunny"}));
+        body["request"]["stream"] = json!(false);
+        let continued = call(
+            &app,
+            &uuid::Uuid::new_v4().to_string(),
+            "seller",
+            "POST",
+            Some(body),
+        )
+        .await
+        .1;
+        assert_eq!(continued["status"], "succeeded");
+        assert_eq!(
+            continued["response"]["choices"][0]["message"]["content"],
+            "Seoul is sunny"
+        );
+    }
+    let payloads = payloads.lock().await;
+    assert_eq!(
+        payloads.len(),
+        4,
+        "replaying a request must not execute again"
+    );
+    for payload in payloads.iter().step_by(2) {
+        let current = &payload["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(current["images"][0]["source"]["bytes"], PNG);
+        assert_eq!(current["images"][0]["format"], "png");
+        assert_eq!(
+            current["userInputMessageContext"]["tools"][0]["toolSpecification"]["name"],
+            "weather"
+        );
+    }
+    for payload in payloads.iter().skip(1).step_by(2) {
+        let state = &payload["conversationState"];
+        assert_eq!(
+            state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["toolResults"]
+                [0]["toolUseId"],
+            "call-1"
+        );
+        assert!(state["history"].as_array().unwrap().iter().any(|v| v
+            .pointer("/assistantResponseMessage/toolUses/0/toolUseId")
+            == Some(&json!("call-1"))));
+    }
+    drop(payloads);
+    // max_tokens is a post-drain accounting ceiling, including tool arguments.
+    // Delivered tool deltas cannot turn an over-limit request into success.
+    for streaming in [false, true] {
+        let mut body = initial.clone();
+        body["request"]["stream"] = json!(streaming);
+        body["request"]["max_tokens"] = json!(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/requests/{id}"))
+                    .header("Authorization", "Bearer fixture-control")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"status\":\"failed\""));
+        assert!(!text.contains("\"status\":\"succeeded\""));
+        let receipt = call(&app, &id, "seller", "GET", None).await.1;
+        assert_eq!(receipt["status"], "failed");
+        assert!(receipt["usage"].is_null());
+    }
+    std::env::remove_var("KIRO_TEST_RUNTIME_URL");
+    store::save_setting("endpoints", &previous_endpoints).unwrap();
+    kiro_lb::settings::load_endpoint_settings();
+    runtime_task.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 async fn successful_upstream() -> (reqwest::Client, String) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

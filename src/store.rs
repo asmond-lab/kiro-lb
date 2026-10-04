@@ -26,6 +26,7 @@ pub(crate) const INFERX_SCHEMA: &str = "
         owner_id TEXT NOT NULL, connection_id TEXT NOT NULL,
         status TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
         duration_ms INTEGER, ttft_ms REAL, generation_ms REAL,
+        metering_json TEXT,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS inferx_requests_owner
@@ -111,6 +112,12 @@ fn columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
 pub fn initialize() -> rusqlite::Result<()> {
     with(|conn| {
         conn.execute_batch(INFERX_SCHEMA)?;
+        if !columns(conn, "inferx_requests")?
+            .iter()
+            .any(|c| c == "metering_json")
+        {
+            conn.execute_batch("ALTER TABLE inferx_requests ADD COLUMN metering_json TEXT")?;
+        }
         // A process cannot know whether an in-flight upstream generation ran
         // before it died. Never make such a request executable again.
         conn.execute(
