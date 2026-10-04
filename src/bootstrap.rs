@@ -29,7 +29,9 @@ pub struct Generated {
 }
 
 fn configured_by_environment() -> bool {
-    std::env::var("PROXY_API_KEY").is_ok_and(|v| !v.trim().is_empty())
+    ["PROXY_API_KEY", "INFERX_CONTROL_TOKEN"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()))
 }
 
 pub fn ensure_env() -> std::io::Result<Option<Generated>> {

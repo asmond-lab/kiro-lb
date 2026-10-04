@@ -38,6 +38,23 @@ pub struct DeviceFlow {
 }
 
 impl DeviceFlow {
+    pub fn expires_at_ms(&self) -> i64 {
+        (self.expires_at * 1000.0) as i64
+    }
+    pub fn interval_seconds(&self) -> u64 {
+        self.interval.max(1.0) as u64
+    }
+    pub fn authorization_url(&self) -> &str {
+        if self.verification_uri_complete.starts_with("https://") {
+            &self.verification_uri_complete
+        } else {
+            &self.verification_uri
+        }
+    }
+    pub fn user_code(&self) -> &str {
+        &self.user_code
+    }
+
     pub fn view(&self) -> Value {
         json!({
             "flowId": self.id, "provider": self.provider, "status": self.status, "detail": self.detail,
@@ -211,6 +228,14 @@ fn get(id: &str) -> Option<DeviceFlow> {
     FLOWS.lock().as_ref().and_then(|f| f.get(id).cloned())
 }
 
+pub fn exists(id: &str) -> bool {
+    get(id).is_some()
+}
+
+pub fn peek(id: &str) -> Option<DeviceFlow> {
+    get(id)
+}
+
 /// Publishes a poll result only while the flow is still registered: a poll
 /// that was in flight when the operator cancelled must not bring it back.
 fn put(flow: DeviceFlow) {
@@ -318,6 +343,13 @@ pub fn internal_credentials(flow: &DeviceFlow) -> Result<Value, String> {
         .token
         .as_ref()
         .ok_or_else(|| format!("{} login is not approved", flow.provider))?;
+    if token
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("approved login returned no refresh token".into());
+    }
     let expires_in = token
         .get("expiresIn")
         .and_then(Value::as_f64)

@@ -511,6 +511,7 @@ fn validate_credential_regions(c: &Creds) -> Result<(), AuthError> {
 
 pub enum Source {
     Internal(String),
+    Ephemeral(String),
     File(String),
     Sqlite(String),
 }
@@ -531,6 +532,44 @@ pub struct KiroAuth {
 }
 
 impl KiroAuth {
+    /// Builds an engine auth object from freshly approved device credentials
+    /// without publishing them as a routable account source.
+    pub fn from_device_credentials(
+        id: &str,
+        document: &Value,
+        http: reqwest::Client,
+    ) -> Result<KiroAuth, AuthError> {
+        let mut auth = Self::new(
+            Source::Ephemeral(id.to_owned()),
+            crate::config::REGION,
+            None,
+            http,
+        )?;
+        auth.creds.lock().replace_document(document);
+        let c = auth.creds.lock().clone();
+        validate_credential_regions(&c)?;
+        auth.auth_type = if c.client_id.is_some() && c.client_secret.is_some() {
+            AuthType::AwsSsoOidc
+        } else {
+            AuthType::KiroDesktop
+        };
+        let region = c
+            .detected_api_region
+            .clone()
+            .or(c.sso_region.clone())
+            .unwrap_or_else(|| crate::config::REGION.to_owned());
+        let builder = auth.auth_type == AuthType::AwsSsoOidc && c.profile_arn.is_none();
+        auth.refresh_url =
+            config::kiro_refresh_url(c.sso_region.as_deref().unwrap_or(crate::config::REGION))
+                .map_err(|e| AuthError::Other(e.to_string()))?;
+        auth.api_host =
+            config::kiro_api_host(&region).map_err(|e| AuthError::Other(e.to_string()))?;
+        auth.q_host =
+            config::kiro_q_host(&region, builder).map_err(|e| AuthError::Other(e.to_string()))?;
+        auth.api_region = region;
+        Ok(auth)
+    }
+
     pub fn new(
         source: Source,
         region: &str,
@@ -615,6 +654,7 @@ impl KiroAuth {
             Source::Internal(id) => {
                 c.replace_document(&store::load_internal_credential(id).unwrap_or(json!({})))
             }
+            Source::Ephemeral(_) => {}
             Source::Sqlite(p) => {
                 if !c.replace_sqlite(p) {
                     return None;
@@ -637,6 +677,7 @@ impl KiroAuth {
     fn source_account_id(source: &Source) -> Option<String> {
         match source {
             Source::Internal(id) => Some(id.clone()),
+            Source::Ephemeral(_) => None,
             Source::File(p) | Source::Sqlite(p) => {
                 let expanded = store::expand_home(p);
                 Some(
@@ -695,10 +736,16 @@ impl KiroAuth {
     }
 
     pub fn machine_id(&self) -> String {
+        if let Source::Ephemeral(id) = &self.source {
+            return crate::utils::account_machine_id(id);
+        }
         crate::utils::account_machine_id(&self.lease_account_id().unwrap_or_default())
     }
 
     pub fn is_current_login(&self) -> bool {
+        if matches!(self.source, Source::Ephemeral(_)) {
+            return true;
+        }
         let Some(current) = Self::read_source(&self.source) else {
             return false;
         };
@@ -729,6 +776,14 @@ impl KiroAuth {
             .filter(|p| !p.is_empty())
     }
 
+    pub fn credential_document(&self) -> Value {
+        let c = self.creds.lock();
+        json!({"accessToken":c.access_token,"refreshToken":c.refresh_token,
+            "expiresAt":c.expires_at.map(iso_from_epoch),"region":self.api_region,
+            "profileArn":c.profile_arn,"clientId":c.client_id,"clientSecret":c.client_secret,
+            "ssoRegion":c.sso_region})
+    }
+
     pub fn request_profile_arn(&self) -> Option<String> {
         self.profile_arn().or_else(|| {
             (self.auth_type == AuthType::AwsSsoOidc)
@@ -737,6 +792,10 @@ impl KiroAuth {
     }
 
     pub fn generation_url(&self) -> String {
+        #[cfg(debug_assertions)]
+        if let Ok(url) = std::env::var("KIRO_TEST_RUNTIME_URL") {
+            return url;
+        }
         format!("{}/", self.api_host)
     }
 
@@ -983,6 +1042,7 @@ impl KiroAuth {
 
     fn reload_persisted_for_login(&self) -> bool {
         match &self.source {
+            Source::Ephemeral(_) => true,
             Source::Internal(id) => {
                 let doc = match self.login_identity.as_deref() {
                     Some(identity) => store::load_internal_credential_for_login(id, identity),
@@ -1142,6 +1202,7 @@ impl KiroAuth {
         let c = self.creds.lock().clone();
         let expires = c.expires_at.map(iso_from_epoch);
         match &self.source {
+            Source::Ephemeral(_) => return Ok(()),
             Source::Internal(id) => {
                 let mut doc = store::load_internal_credential(id).unwrap_or(json!({}));
                 doc["accessToken"] = json!(c.access_token);

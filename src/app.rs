@@ -313,7 +313,9 @@ impl Drop for RequestLogGuard {
 /// route does, so it is gated the same way.
 pub fn is_account_mutation(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
-    (path.starts_with("/api/dashboard/accounts") || path == "/_internal/accounts/register")
+    (path.starts_with("/api/dashboard/accounts")
+        || path.starts_with("/internal/inferx/")
+        || path == "/_internal/accounts/register")
         && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 

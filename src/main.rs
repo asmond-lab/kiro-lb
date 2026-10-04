@@ -17,6 +17,7 @@ use std::time::Duration;
 use kiro_lb::app::{self, cors_preflight, AppState};
 use kiro_lb::pool::AccountManager;
 use kiro_lb::routes_dashboard as d;
+use kiro_lb::routes_inferx as inferx;
 use kiro_lb::routes_v1 as v1;
 use kiro_lb::upstream::http::{self as up, Transport};
 use kiro_lb::{config, dashboard_store, settings, store, tokenizer};
@@ -90,6 +91,26 @@ fn router(state: app::Shared) -> Router {
         .route("/docs", get(kiro_lb::docs::swagger))
         .route("/openapi.json", get(kiro_lb::docs::openapi))
         .route("/metrics", get(d::metrics))
+        .route(
+            "/internal/inferx/v1/connections/{id}",
+            get(inferx::get_connection)
+                .put(inferx::put_connection)
+                .delete(inferx::delete_connection)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/internal/inferx/v1/connections/{id}/poll",
+            post(inferx::poll_connection).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/internal/inferx/v1/requests/{id}",
+            get(inferx::get_request)
+                .post(inferx::post_request)
+                .delete(inferx::fence_request)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    kiro_lb::inferx_contract::MAX_BODY,
+                )),
+        )
         .route("/api/dashboard/login", post(d::login))
         .route("/api/dashboard/logout", post(d::logout))
         .route("/api/dashboard/keys", get(d::list_keys).post(d::create_key))
@@ -327,10 +348,9 @@ fn main() {
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
     print_banner(&addr);
-    if let Some(g) = &generated {
+    if generated.is_some() {
         println!("  No .env found: created .env and .env.example with fresh credentials.");
-        println!("  PROXY_API_KEY:      {}", g.api_key);
-        println!("  DASHBOARD_PASSWORD: {}", g.password);
+        println!("  Read credentials from the private .env file.");
         println!();
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()

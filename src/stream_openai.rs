@@ -18,6 +18,7 @@ use crate::usage_tracking::GenerationTimer;
 use crate::{pyjson, utils, web_search};
 
 pub struct OpenAIOptions {
+    pub execute_web_search: bool,
     pub include_reasoning: bool,
     pub parallel_tool_calls: bool,
     pub request_messages: Vec<Value>,
@@ -75,7 +76,7 @@ pub fn stream(
                 }
                 KiroEvent::ToolUse(tool) => {
                     let name = tool.pointer("/function/name").and_then(Value::as_str).filter(|s| !s.is_empty()).or_else(|| tool.get("name").and_then(Value::as_str)).unwrap_or("").to_owned();
-                    if name == "web_search" {
+                    if opts.execute_web_search && name == "web_search" {
                         let raw = tool.pointer("/function/arguments").cloned().unwrap_or(json!({}));
                         let input: Value = match raw { Value::String(s) => serde_json::from_str(&s).unwrap_or(json!({})), o => o };
                         if let Some(query) = input.get("query").and_then(Value::as_str).filter(|q| !q.is_empty()).map(str::to_owned) {

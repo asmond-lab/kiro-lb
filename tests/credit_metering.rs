@@ -55,6 +55,7 @@ fn context(request: RequestCtx) -> StreamCtx {
 
 fn options() -> OpenAIOptions {
     OpenAIOptions {
+        execute_web_search: true,
         include_reasoning: true,
         parallel_tool_calls: true,
         request_messages: vec![],

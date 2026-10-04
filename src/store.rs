@@ -11,6 +11,27 @@ use crate::model_resolver::normalize_model_name;
 
 pub const DB_FILENAME: &str = "dashboard.sqlite3";
 
+pub(crate) const INFERX_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS inferx_connections (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+        provider TEXT NOT NULL, status TEXT NOT NULL, flow_id TEXT,
+        authorization_json TEXT, credential_json TEXT, upstream_id TEXT,
+        email TEXT, next_poll_at INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS inferx_upstream_owner
+        ON inferx_connections(upstream_id) WHERE upstream_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS inferx_requests (
+        request_id TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
+        owner_id TEXT NOT NULL, connection_id TEXT NOT NULL,
+        status TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
+        duration_ms INTEGER, ttft_ms REAL, generation_ms REAL,
+        metering_json TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS inferx_requests_owner
+        ON inferx_requests(owner_id, request_id);";
+
 struct Db {
     path: PathBuf,
     conn: Mutex<Connection>,
@@ -90,6 +111,19 @@ fn columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
 
 pub fn initialize() -> rusqlite::Result<()> {
     with(|conn| {
+        conn.execute_batch(INFERX_SCHEMA)?;
+        if !columns(conn, "inferx_requests")?
+            .iter()
+            .any(|c| c == "metering_json")
+        {
+            conn.execute_batch("ALTER TABLE inferx_requests ADD COLUMN metering_json TEXT")?;
+        }
+        // A process cannot know whether an in-flight upstream generation ran
+        // before it died. Never make such a request executable again.
+        conn.execute(
+            "UPDATE inferx_requests SET status='indeterminate',updated_at=?1 WHERE status='running'",
+            [now_i64() * 1000],
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS account_sources (
                 account_id TEXT PRIMARY KEY,
