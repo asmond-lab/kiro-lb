@@ -242,7 +242,12 @@ impl Config {
                 .iter()
                 .map(|m| crate::model_resolver::normalize_model_name(m))
                 .collect(),
-            free_tier_subscription_types: env_list("FREE_TIER_SUBSCRIPTION_TYPES", "Free"),
+            // Kiro's free plan reports Q_DEVELOPER_STANDALONE_FREE; "Free" keeps a
+            // registration hint recognised until the first usage refresh replaces it.
+            free_tier_subscription_types: env_list(
+                "FREE_TIER_SUBSCRIPTION_TYPES",
+                "Free,Q_DEVELOPER_STANDALONE_FREE",
+            ),
         }
     }
 }
